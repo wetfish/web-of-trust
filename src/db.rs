@@ -5,6 +5,9 @@
 //! The `files` table records how far each file has been imported, so later
 //! runs only read the lines added since. A file that shrank or whose first
 //! bytes changed was replaced, and is imported again from the start.
+//!
+//! The `identities`, `identity_keys` and `sessions` tables are filled by the
+//! `identity` module.
 
 use std::error::Error;
 use std::fs::{self, File};
@@ -19,13 +22,15 @@ use crate::irssi::{self, DateTracker, Event, Line};
 
 pub type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
-/// Stored in SQLite's `user_version`. Raised whenever the schema changes.
-const SCHEMA_VERSION: i64 = 1;
-
 /// How many bytes from the start of each file are kept to recognize it.
 const HEAD_LEN: u64 = 1024;
 
-const SCHEMA: &str = "
+/// The schema, as the steps that build it. SQLite's `user_version` stores how
+/// many steps a database has had, so an older database is brought up to date
+/// by running the steps it is missing.
+const MIGRATIONS: [&str; 2] = [SCHEMA_V1, SCHEMA_V2];
+
+const SCHEMA_V1: &str = "
 CREATE TABLE files (
     id INTEGER PRIMARY KEY,
     -- Absolute path of the log file.
@@ -67,30 +72,92 @@ CREATE TABLE events (
 CREATE INDEX events_by_file_date ON events (file_id, date);
 ";
 
+const SCHEMA_V2: &str = "
+-- One row per person, as far as the logs can tell.
+CREATE TABLE identities (
+    -- Random, 12 hexadecimal characters.
+    id TEXT PRIMARY KEY,
+    tag TEXT NOT NULL,
+    -- UTC, as YYYY-MM-DD HH:MM:SS. The older id wins when two merge.
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    -- Set when this identity was merged into another.
+    merged_into TEXT REFERENCES identities (id)
+);
+
+-- Which nick and ident@host combinations belong to which identity. This is
+-- what keeps identity ids stable between rebuilds.
+CREATE TABLE identity_keys (
+    tag TEXT NOT NULL,
+    -- Lowercased.
+    nick TEXT NOT NULL,
+    -- Both empty for a nick that never appeared with a host.
+    ident TEXT NOT NULL,
+    host TEXT NOT NULL,
+    identity_id TEXT NOT NULL REFERENCES identities (id),
+    PRIMARY KEY (tag, nick, ident, host)
+);
+
+-- One continuous stretch of a nick being present in one log file.
+CREATE TABLE sessions (
+    id INTEGER PRIMARY KEY,
+    file_id INTEGER NOT NULL REFERENCES files (id),
+    identity_id TEXT NOT NULL REFERENCES identities (id),
+    -- 'host', 'inferred' or 'nick_only'.
+    link TEXT NOT NULL,
+    -- For inferred sessions, the id of the session with a host they were
+    -- attributed from. Deliberately not a foreign key: SQLite checks a
+    -- deferred self-reference by scanning the table on every insert, which
+    -- makes rebuilding hundreds of thousands of sessions take hours.
+    inferred_from INTEGER,
+    -- Space separated, in the order the session used them.
+    nicks TEXT NOT NULL,
+    ident TEXT,
+    host TEXT,
+    -- YYYY-MM-DD HH:MM.
+    start_at TEXT NOT NULL,
+    start_line INTEGER NOT NULL,
+    -- 1 when the session started with a join line, 0 when the nick was
+    -- already present and start_at is when logging started.
+    joined INTEGER NOT NULL,
+    end_at TEXT NOT NULL,
+    end_line INTEGER,
+    end_reason TEXT NOT NULL,
+    minutes INTEGER NOT NULL,
+    -- Messages and actions.
+    spoken INTEGER NOT NULL,
+    -- 1 for the logging client's own session.
+    logger INTEGER NOT NULL
+);
+
+CREATE INDEX sessions_by_identity ON sessions (identity_id);
+";
+
 const INSERT_EVENT: &str = "
 INSERT INTO events (file_id, line, date, time, kind, nick, ident, host, other_nick, text, detail)
 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
 ";
 
-/// Opens the database, creating it and its tables when the file is new.
+/// Opens the database, creating it when the file is new and adding any tables
+/// an older database is missing.
 pub fn open(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path)?;
     conn.execute_batch("PRAGMA foreign_keys = ON;")?;
 
     let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    match version {
-        0 => conn.execute_batch(&format!(
-            "BEGIN; {SCHEMA} PRAGMA user_version = {SCHEMA_VERSION}; COMMIT;"
-        ))?,
-        SCHEMA_VERSION => {}
-        other => {
-            return Err(format!(
-                "it uses database schema version {other}, but this version of wot uses \
-                 {SCHEMA_VERSION}. The database is rebuilt from the logs, so delete it or \
-                 pass a different --db"
-            )
-            .into());
-        }
+    let latest = MIGRATIONS.len() as i64;
+    if !(0..=latest).contains(&version) {
+        return Err(format!(
+            "it uses database schema version {version}, but this version of wot only knows \
+             up to {latest}. The database is rebuilt from the logs, so delete it or pass a \
+             different --db"
+        )
+        .into());
+    }
+    for (step, sql) in MIGRATIONS.iter().enumerate().skip(version as usize) {
+        let version = step + 1;
+        conn.execute_batch(&format!(
+            "BEGIN; {sql} PRAGMA user_version = {version}; COMMIT;"
+        ))?;
     }
     Ok(conn)
 }
@@ -577,6 +644,26 @@ mod tests {
                 "2 2026-11-03 09:00 message bob",
             ]
         );
+    }
+
+    #[test]
+    fn upgrades_an_older_database() {
+        let root = TempDir::new("db-upgrade");
+        let path = root.0.join("wot.sqlite");
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(&format!("{SCHEMA_V1} PRAGMA user_version = 1;"))
+            .unwrap();
+
+        let conn = open(&path).unwrap();
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 2);
+        let sessions: i64 = conn
+            .query_row("SELECT count(*) FROM sessions", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(sessions, 0);
     }
 
     #[test]

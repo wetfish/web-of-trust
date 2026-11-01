@@ -1,5 +1,6 @@
 mod db;
 mod discover;
+mod identity;
 mod irssi;
 mod report;
 mod scan;
@@ -64,8 +65,30 @@ fn analyze(roots: &[PathBuf], channel: Option<&str>, db_path: &Path) -> ExitCode
         }
     };
     let summary = db::import(&mut conn, &inventory.files);
-    // The import summary goes to standard error so the report stays clean.
+    // Summaries go to standard error so the report stays clean.
     let _ = report::import_summary(&mut io::stderr().lock(), db_path, &summary);
+
+    let changed = summary.new_files + summary.grown_files + summary.replaced_files > 0;
+    let rebuild = match identity::is_built(&conn) {
+        Ok(built) => changed || !built,
+        Err(err) => {
+            eprintln!("error: reading identities: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if rebuild {
+        eprintln!("Building sessions and identities...");
+        match identity::rebuild(&mut conn) {
+            Ok(rebuilt) => {
+                let _ = report::identity_summary(&mut io::stderr().lock(), &rebuilt);
+            }
+            Err(err) => {
+                eprintln!("error: building identities: {err}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    eprintln!();
 
     let scan = scan::scan(&inventory, channel);
 

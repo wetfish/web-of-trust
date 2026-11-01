@@ -8,10 +8,11 @@ channels to collect data rather than to take part.
 ## Status
 
 Early development. `wot analyze` currently finds the log files in one or more
-irssi log folders, imports every line into a SQLite database, and prints an
-inventory grouped by network tag and channel, or the day by day activity of one
-channel. The reports still read the log files directly; moving them onto the
-database comes next, followed by identity tracking and the social graph.
+irssi log folders, imports every line into a SQLite database, groups the lines
+into sessions and identities, and prints an inventory grouped by network tag
+and channel, or the day by day activity of one channel. The reports still read
+the log files directly. Identity reports and a trust score based on how long
+people are present compared with how much they contribute come next.
 
 ## Requirements
 
@@ -179,9 +180,10 @@ Each file is imported in its own transaction, so an interrupted run leaves the
 database consistent and the next run carries on. A summary of the import is
 printed to standard error.
 
-The database records its schema version. If a newer version of `wot` changes
-the schema, it refuses to use the old database; delete it and run again to
-rebuild it from the logs.
+The database records its schema version. When a newer version of `wot` adds
+tables, it adds them to an existing database the next time it opens it. A
+database made by a newer version of `wot` than the one running is refused;
+delete it and run again to rebuild it from the logs.
 
 ### Tables
 
@@ -225,3 +227,97 @@ depend on the kind:
 
 `time` is `HH:MM` for events, `HH:MM:SS` for `log_opened` and `log_closed`, and
 empty for `unparsed` lines.
+
+`sessions`, `identities` and `identity_keys` are described under
+[Identities](#identities).
+
+## Identities
+
+After importing, `wot analyze` groups the events into sessions and the
+sessions into identities, one per person as far as the logs can tell. This is
+rebuilt from the events whenever the import added or replaced anything, and
+the first time a database is used. Progress and a summary go to standard
+error:
+
+```text
+Building sessions and identities...
+Identities: 1,234 from 56,789 sessions (12 new, 3 merged)
+Sessions without a host: 4,567 inferred from the same nick, 89 known by nick only
+```
+
+### Sessions
+
+A session is one continuous stretch of a nick being present in one log file.
+It records how long the person was present and how much they spoke, which is
+what a trust score needs.
+
+- It starts at a join line. A nick that speaks, parts, quits or is kicked
+  without a join line since logging started was already present, so its
+  session starts at the `Log opened` line.
+- It ends at a part, quit or kick, at a `Log closed` line, when the log is
+  opened again without having been closed (at the last line before that), when
+  the nick joins again, when another nick changes into it, or at the end of the
+  file.
+- A nick change continues the same session under the new nick.
+- Netsplits do not end sessions, since the same connections come back.
+- irssi writes `#channel: Total of N nicks` right after the logging client's
+  own join, which marks the logger's session. `You're now known as` lines then
+  rename it.
+
+Only join, part and quit lines show `ident@host`, so a session learns its host
+from its join line, or from its part or quit line when it had no join.
+
+Sessions only cover time while irssi was logging. Someone already in a channel
+when irssi joined, who never speaks, parts or quits before irssi stops logging,
+does not appear in that stretch of the log at all.
+
+### Linking sessions into identities
+
+- **`host`:** sessions that showed `ident@host` are linked when they share a
+  nick and `ident@host`. A nick change inside a session links its nicks too.
+- **`inferred`:** a session that never showed a host is attributed to the
+  identity of the nearest session in time that used the same nick with a host,
+  preferring an earlier one. `inferred_from` records which session, for
+  auditing. Private message sessions are always inferred, since queries never
+  show hosts.
+- **`nick_only`:** a nick that never appears with a host gets an identity of
+  its own.
+
+Nothing else links sessions. The same nick from a different host, and
+different nicks from the same `ident@host`, stay separate identities.
+
+Identity ids are 12 random hexadecimal characters. `identity_keys` records
+which nick and `ident@host` combinations belong to which id, so ids stay the
+same between rebuilds. When new evidence links two identities, the one created
+first keeps its id, and the other records `merged_into`. An identity known only
+by nick can later be absorbed when that nick shows a host; its old id is then
+left without sessions.
+
+Identities are separate for each network tag, since hosts on different servers
+are not comparable.
+
+### Identity tables
+
+`identities`: `id`, `tag`, `created_at` (UTC) and `merged_into`.
+
+`identity_keys`: `tag`, `nick` (lowercased), `ident` and `host` (both empty for
+nick-only keys), and `identity_id`.
+
+`sessions`:
+
+| Column | Contents |
+| --- | --- |
+| `file_id` | The log file |
+| `identity_id` | The identity |
+| `link` | `host`, `inferred` or `nick_only` |
+| `inferred_from` | For inferred sessions, the session they were attributed from |
+| `nicks` | Nicks used, space separated, in order |
+| `ident`, `host` | From the session's join, part or quit line, if any |
+| `start_at`, `end_at` | `YYYY-MM-DD HH:MM` |
+| `start_line` | The join line, or the line where the nick first appeared |
+| `joined` | 1 when the session started with a join line |
+| `end_line` | The line that ended the session, if one did |
+| `end_reason` | `part`, `quit`, `kick`, `log_closed`, `log_reopened`, `rejoined`, `nick_taken` or `end_of_log` |
+| `minutes` | Time present |
+| `spoken` | Messages and actions |
+| `logger` | 1 for the logging client's own session |

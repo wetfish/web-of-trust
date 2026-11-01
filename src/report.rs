@@ -8,6 +8,7 @@ use chrono::NaiveDate;
 
 use crate::db::ImportSummary;
 use crate::discover::{Inventory, LogFile, TargetKind};
+use crate::identity::RebuildSummary;
 use crate::scan::{ChannelActivity, FileStats, Scan};
 
 /// A log file with the counts read from it.
@@ -268,7 +269,25 @@ pub fn import_summary(
     for (path, err) in &summary.errors {
         writeln!(out, "Could not import {}: {err}", path.display())?;
     }
-    writeln!(out)
+    Ok(())
+}
+
+/// Summarizes a rebuild of sessions and identities.
+pub fn identity_summary(out: &mut impl Write, summary: &RebuildSummary) -> io::Result<()> {
+    writeln!(
+        out,
+        "Identities: {} from {} ({} new, {} merged)",
+        thousands(summary.identities as u64),
+        count(summary.sessions, "session"),
+        thousands(summary.new_identities as u64),
+        thousands(summary.merged_identities as u64),
+    )?;
+    writeln!(
+        out,
+        "Sessions without a host: {} inferred from the same nick, {} known by nick only",
+        thousands(summary.inferred_sessions as u64),
+        thousands(summary.nick_only_sessions as u64),
+    )
 }
 
 fn undated_note(out: &mut impl Write, activity: &ChannelActivity) -> io::Result<()> {
