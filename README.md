@@ -9,8 +9,8 @@ channels to collect data rather than to take part.
 
 Early development. `wot analyze` currently finds the log files in one or more
 irssi log folders, parses every line, and prints an inventory grouped by network
-tag and channel. Activity statistics, identity tracking and the social graph
-come next.
+tag and channel, or the day by day activity of one channel. Identity tracking
+and the social graph come next.
 
 ## Requirements
 
@@ -42,6 +42,14 @@ The report is plain text on standard output, so it can be saved or paged:
 ```bash
 wot analyze ~/irclogs > inventory.txt
 wot analyze ~/irclogs | less
+```
+
+To see one channel's activity day by day instead of the inventory, name it
+with `--channel`. Quote the name, because the shell treats an unquoted `#` at
+the start of a word as a comment:
+
+```bash
+wot analyze ~/irclogs --channel '#wetfish'
 ```
 
 Run `wot --help` or `wot analyze --help` for the full list of options.
@@ -117,3 +125,21 @@ totals, the report lists:
   `[root] tag/target.log:line: text`. A line that repeats an earlier example,
   apart from its timestamp, is not shown again.
 - **Skipped:** paths that do not fit the expected layout
+
+## Daily activity report
+
+`wot analyze --channel <name>` reads every log file whose name matches the
+channel, ignoring case, in any network tag and log folder. It lists each day
+with at least one spoken line:
+
+- **Spoken:** messages and actions that day
+- **Active users:** distinct nicks that spoke that day, ignoring case. A person
+  who changes nick counts once for each nick, until identity tracking exists.
+
+Days without spoken lines are left out. Below the table are the number of days,
+the date range, the total spoken lines and the distinct nicks over the whole
+range. Spoken lines before the first line giving a date are counted separately.
+
+When several files match, for example the same channel logged by two irssi
+instances, their counts are added together, so a day logged in both is counted
+twice. The report lists the files it read so this is easy to spot.

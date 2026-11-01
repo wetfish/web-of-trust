@@ -1,12 +1,12 @@
 //! Human-readable text reports.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::io::{self, Write};
 
 use chrono::NaiveDate;
 
 use crate::discover::{Inventory, LogFile, TargetKind};
-use crate::scan::{FileStats, Scan};
+use crate::scan::{ChannelActivity, FileStats, Scan};
 
 /// A log file with the counts read from it.
 type Entry<'a> = (&'a LogFile, &'a FileStats);
@@ -176,6 +176,85 @@ pub fn inventory(out: &mut impl Write, inventory: &Inventory, scan: &Scan) -> io
         }
     }
 
+    Ok(())
+}
+
+/// Lists spoken lines and active users for each day one channel had spoken
+/// lines. Active users are distinct nicks, ignoring case.
+pub fn daily_activity(
+    out: &mut impl Write,
+    inventory: &Inventory,
+    channel: &str,
+    activity: &ChannelActivity,
+) -> io::Result<()> {
+    heading(out, &format!("Daily activity: {channel}"), '=')?;
+    writeln!(out, "Log files:")?;
+    for &index in &activity.files {
+        writeln!(out, "  {}", file_label(&inventory.files[index]))?;
+    }
+    if activity.files.len() > 1 {
+        writeln!(
+            out,
+            "Counts from these files are added together, so a day logged by more than one file is counted more than once."
+        )?;
+    }
+    writeln!(out)?;
+
+    let (Some(first), Some(last)) = (
+        activity.days.keys().next(),
+        activity.days.keys().next_back(),
+    ) else {
+        writeln!(out, "No spoken lines.")?;
+        return undated_note(out, activity);
+    };
+
+    let rows: Vec<Vec<String>> = activity
+        .days
+        .iter()
+        .map(|(date, day)| {
+            vec![
+                date.to_string(),
+                thousands(day.spoken),
+                thousands(day.nicks.len() as u64),
+            ]
+        })
+        .collect();
+    table(
+        out,
+        &["Day", "Spoken", "Active users"],
+        &rows,
+        &[false, true, true],
+    )?;
+
+    let spoken: u64 = activity.days.values().map(|day| day.spoken).sum();
+    let nicks: HashSet<&str> = activity
+        .days
+        .values()
+        .flat_map(|day| day.nicks.iter().map(String::as_str))
+        .collect();
+    writeln!(out)?;
+    writeln!(
+        out,
+        "{} with spoken lines, from {first} to {last}",
+        count(activity.days.len(), "day")
+    )?;
+    writeln!(
+        out,
+        "Total: {}, {}",
+        count_u64(spoken, "spoken line"),
+        count(nicks.len(), "distinct nick")
+    )?;
+    undated_note(out, activity)
+}
+
+fn undated_note(out: &mut impl Write, activity: &ChannelActivity) -> io::Result<()> {
+    if activity.undated_spoken > 0 {
+        writeln!(
+            out,
+            "Not shown: {} before the first line giving a date",
+            count_u64(activity.undated_spoken, "spoken line")
+        )?;
+    }
     Ok(())
 }
 
