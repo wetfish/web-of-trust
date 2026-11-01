@@ -1,5 +1,7 @@
 mod discover;
+mod irssi;
 mod report;
+mod scan;
 
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -41,8 +43,10 @@ fn analyze(roots: &[PathBuf]) -> ExitCode {
         }
     };
 
+    let scan = scan::scan(&inventory);
+
     let mut out = io::BufWriter::new(io::stdout().lock());
-    match report::inventory(&mut out, &inventory).and_then(|()| out.flush()) {
+    match report::inventory(&mut out, &inventory, &scan).and_then(|()| out.flush()) {
         Ok(()) => ExitCode::SUCCESS,
         // The reader went away, for example `| head`. Not an error.
         Err(err) if err.kind() == io::ErrorKind::BrokenPipe => ExitCode::SUCCESS,

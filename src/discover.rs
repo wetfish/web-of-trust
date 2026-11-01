@@ -4,7 +4,7 @@
 //! network tag and target, so each root holds `<tag>/<target>.log`.
 
 use std::fs;
-use std::io::{self, BufRead, BufReader};
+use std::io;
 use std::path::{Path, PathBuf};
 
 /// Whether a log file belongs to a channel or a private message target.
@@ -28,11 +28,11 @@ impl TargetKind {
 pub struct LogFile {
     /// Index into `Inventory::roots`.
     pub root: usize,
+    pub path: PathBuf,
     pub tag: String,
     pub target: String,
     pub kind: TargetKind,
     pub bytes: u64,
-    pub lines: u64,
 }
 
 /// A path that was found but not read, and why.
@@ -126,17 +126,14 @@ fn scan_tag_dir(inventory: &mut Inventory, root: usize, dir: &Path) {
             }
         };
 
-        match count_lines(&path) {
-            Ok(lines) => inventory.files.push(LogFile {
-                root,
-                tag: tag.clone(),
-                kind: TargetKind::of(&target),
-                target,
-                bytes: meta.len(),
-                lines,
-            }),
-            Err(err) => inventory.skip(path, format!("cannot read: {err}")),
-        }
+        inventory.files.push(LogFile {
+            root,
+            path,
+            tag: tag.clone(),
+            kind: TargetKind::of(&target),
+            target,
+            bytes: meta.len(),
+        });
     }
 }
 
@@ -154,41 +151,16 @@ fn file_name(path: &Path) -> String {
         .unwrap_or_default()
 }
 
-/// Counts lines without decoding, since old logs may not be valid UTF-8.
-/// A final line without a trailing newline still counts.
-fn count_lines(path: &Path) -> io::Result<u64> {
-    let mut reader = BufReader::with_capacity(64 * 1024, fs::File::open(path)?);
-    let mut lines = 0;
-    let mut last_byte = None;
-
-    loop {
-        let buf = reader.fill_buf()?;
-        if buf.is_empty() {
-            break;
-        }
-        lines += buf.iter().filter(|&&byte| byte == b'\n').count() as u64;
-        last_byte = buf.last().copied();
-        let len = buf.len();
-        reader.consume(len);
-    }
-
-    if last_byte.is_some_and(|byte| byte != b'\n') {
-        lines += 1;
-    }
-    Ok(lines)
-}
-
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
 
     /// A scratch folder that is removed when the test ends.
-    struct TempDir(PathBuf);
+    pub struct TempDir(pub PathBuf);
 
     impl TempDir {
-        fn new(name: &str) -> Self {
-            let path =
-                std::env::temp_dir().join(format!("web-of-trust-{}-{name}", std::process::id()));
+        pub fn new(name: &str) -> Self {
+            let path = std::env::temp_dir().join(format!("wot-test-{}-{name}", std::process::id()));
             let _ = fs::remove_dir_all(&path);
             fs::create_dir_all(&path).unwrap();
             TempDir(path)
@@ -222,14 +194,18 @@ mod tests {
         let found: Vec<(&str, &str, TargetKind, u64)> = inventory
             .files
             .iter()
-            .map(|f| (f.tag.as_str(), f.target.as_str(), f.kind, f.lines))
+            .map(|f| (f.tag.as_str(), f.target.as_str(), f.kind, f.bytes))
             .collect();
         assert_eq!(
             found,
             [
-                ("wetfish", "#analysis", TargetKind::Channel, 3),
-                ("wetfish", "rachel", TargetKind::Query, 1),
+                ("wetfish", "#analysis", TargetKind::Channel, 5),
+                ("wetfish", "rachel", TargetKind::Query, 6),
             ]
+        );
+        assert_eq!(
+            inventory.files[0].path,
+            root.0.join("wetfish/#analysis.log")
         );
         // stray.log, the nested folder and notes.txt
         assert_eq!(inventory.skipped.len(), 3);

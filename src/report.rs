@@ -3,92 +3,169 @@
 use std::collections::BTreeMap;
 use std::io::{self, Write};
 
-use crate::discover::{Inventory, LogFile, TargetKind};
+use chrono::NaiveDate;
 
-/// Lists the log files found, grouped by network tag and channel.
-pub fn inventory(out: &mut impl Write, inventory: &Inventory) -> io::Result<()> {
+use crate::discover::{Inventory, LogFile, TargetKind};
+use crate::scan::{FileStats, Scan};
+
+/// A log file with the counts read from it.
+type Entry<'a> = (&'a LogFile, &'a FileStats);
+
+/// Lists the log files found, grouped by network tag and channel, with what
+/// the parser read from them.
+pub fn inventory(out: &mut impl Write, inventory: &Inventory, scan: &Scan) -> io::Result<()> {
     heading(out, "Log inventory", '=')?;
     writeln!(out, "Log folders:")?;
     for (i, root) in inventory.roots.iter().enumerate() {
         writeln!(out, "  [{}] {}", i + 1, root.display())?;
     }
 
-    let mut by_tag: BTreeMap<&str, Vec<&LogFile>> = BTreeMap::new();
-    for file in &inventory.files {
-        by_tag.entry(file.tag.as_str()).or_default().push(file);
+    let entries: Vec<Entry> = inventory.files.iter().zip(&scan.files).collect();
+
+    let mut by_tag: BTreeMap<&str, Vec<Entry>> = BTreeMap::new();
+    for &entry in &entries {
+        by_tag.entry(entry.0.tag.as_str()).or_default().push(entry);
     }
 
-    for (tag, files) in &by_tag {
+    for (tag, entries) in &by_tag {
         writeln!(out)?;
         heading(out, &format!("Network tag: {tag}"), '-')?;
 
-        let mut channels: BTreeMap<&str, Vec<&LogFile>> = BTreeMap::new();
-        let mut queries: BTreeMap<&str, Vec<&LogFile>> = BTreeMap::new();
-        for &file in files {
-            let group = match file.kind {
+        let mut channels: BTreeMap<&str, Vec<Entry>> = BTreeMap::new();
+        let mut queries: BTreeMap<&str, Vec<Entry>> = BTreeMap::new();
+        for &entry in entries {
+            let group = match entry.0.kind {
                 TargetKind::Channel => &mut channels,
                 TargetKind::Query => &mut queries,
             };
-            group.entry(file.target.as_str()).or_default().push(file);
+            group
+                .entry(entry.0.target.as_str())
+                .or_default()
+                .push(entry);
         }
 
         writeln!(
             out,
             "{}, {}, {}, {}, {}",
-            count(files.len(), "file"),
+            count(entries.len(), "file"),
             count(channels.len(), "channel"),
             count(queries.len(), "private message target"),
-            human_bytes(total_bytes(files)),
-            count_u64(total_lines(files), "line"),
+            human_bytes(total_bytes(entries)),
+            count_u64(sum(entries, |s| s.lines), "line"),
         )?;
 
         if !channels.is_empty() {
             writeln!(out)?;
             let rows: Vec<Vec<String>> = channels
                 .iter()
-                .map(|(name, files)| {
+                .map(|(name, entries)| {
                     vec![
                         name.to_string(),
-                        root_list(files),
-                        human_bytes(total_bytes(files)),
-                        thousands(total_lines(files)),
+                        root_list(entries),
+                        thousands(sum(entries, |s| s.lines)),
+                        thousands(sum(entries, |s| s.spoken)),
+                        thousands(sum(entries, |s| s.joins)),
+                        date_or_dash(first_date(entries)),
+                        date_or_dash(last_date(entries)),
+                        thousands(sum(entries, |s| s.unrecognized)),
                     ]
                 })
                 .collect();
             table(
                 out,
-                &["Channel", "In roots", "Size", "Lines"],
+                &[
+                    "Channel",
+                    "In roots",
+                    "Lines",
+                    "Spoken",
+                    "Joins",
+                    "First day",
+                    "Last day",
+                    "Unparsed",
+                ],
                 &rows,
-                &[false, false, true, true],
+                &[false, false, true, true, true, false, false, true],
             )?;
         }
 
         if !queries.is_empty() {
-            let query_files: Vec<&LogFile> = queries.values().flatten().copied().collect();
+            let query_entries: Vec<Entry> = queries.values().flatten().copied().collect();
             writeln!(out)?;
             writeln!(
                 out,
-                "Private messages: {} in {}, {}, {}",
+                "Private messages: {} in {}, {}, {}, {} spoken, {} unparsed",
                 count(queries.len(), "target"),
-                count(query_files.len(), "file"),
-                human_bytes(total_bytes(&query_files)),
-                count_u64(total_lines(&query_files), "line"),
+                count(query_entries.len(), "file"),
+                human_bytes(total_bytes(&query_entries)),
+                count_u64(sum(&query_entries, |s| s.lines), "line"),
+                thousands(sum(&query_entries, |s| s.spoken)),
+                thousands(sum(&query_entries, |s| s.unrecognized)),
             )?;
         }
     }
 
     writeln!(out)?;
-    if inventory.files.is_empty() {
+    if entries.is_empty() {
         writeln!(out, "No .log files found.")?;
     } else {
         writeln!(
             out,
-            "Total: {} in {}, {}, {}",
-            count(inventory.files.len(), "file"),
+            "Total: {} in {}, {}, {}, {} spoken, {} unparsed",
+            count(entries.len(), "file"),
             count(by_tag.len(), "network tag"),
-            human_bytes(inventory.files.iter().map(|f| f.bytes).sum()),
-            count_u64(inventory.files.iter().map(|f| f.lines).sum(), "line"),
+            human_bytes(total_bytes(&entries)),
+            count_u64(sum(&entries, |s| s.lines), "line"),
+            thousands(sum(&entries, |s| s.spoken)),
+            thousands(sum(&entries, |s| s.unrecognized)),
         )?;
+    }
+
+    let problems: Vec<String> = entries
+        .iter()
+        .flat_map(|&(file, stats)| {
+            let mut found = Vec::new();
+            if let Some(err) = &stats.error {
+                found.push(format!("{}: stopped reading: {err}", file_label(file)));
+            }
+            if stats.undated > 0 {
+                found.push(format!(
+                    "{}: {} before the first line giving a date",
+                    file_label(file),
+                    count_u64(stats.undated, "timestamped line"),
+                ));
+            }
+            found
+        })
+        .collect();
+    if !problems.is_empty() {
+        writeln!(out)?;
+        heading(out, &format!("Read problems ({})", problems.len()), '-')?;
+        for problem in &problems {
+            writeln!(out, "{problem}")?;
+        }
+    }
+
+    if !scan.samples.is_empty() {
+        let total = sum(&entries, |s| s.unrecognized);
+        writeln!(out)?;
+        heading(
+            out,
+            &format!(
+                "Unparsed lines ({} in total, showing {})",
+                thousands(total),
+                scan.samples.len()
+            ),
+            '-',
+        )?;
+        for sample in &scan.samples {
+            writeln!(
+                out,
+                "{}:{}: {}",
+                file_label(&inventory.files[sample.file]),
+                sample.line_number,
+                sample.text
+            )?;
+        }
     }
 
     if !inventory.skipped.is_empty() {
@@ -155,17 +232,41 @@ fn write_row(
     writeln!(out, "{}", line.trim_end())
 }
 
-fn total_bytes(files: &[&LogFile]) -> u64 {
-    files.iter().map(|f| f.bytes).sum()
+/// A file as `[root] tag/target.log`, matching the numbered log folders at
+/// the top of the report.
+fn file_label(file: &LogFile) -> String {
+    format!("[{}] {}/{}.log", file.root + 1, file.tag, file.target)
 }
 
-fn total_lines(files: &[&LogFile]) -> u64 {
-    files.iter().map(|f| f.lines).sum()
+fn total_bytes(entries: &[Entry]) -> u64 {
+    entries.iter().map(|&(file, _)| file.bytes).sum()
+}
+
+fn sum(entries: &[Entry], field: impl Fn(&FileStats) -> u64) -> u64 {
+    entries.iter().map(|&(_, stats)| field(stats)).sum()
+}
+
+fn first_date(entries: &[Entry]) -> Option<NaiveDate> {
+    entries
+        .iter()
+        .filter_map(|&(_, stats)| stats.first_date)
+        .min()
+}
+
+fn last_date(entries: &[Entry]) -> Option<NaiveDate> {
+    entries
+        .iter()
+        .filter_map(|&(_, stats)| stats.last_date)
+        .max()
+}
+
+fn date_or_dash(date: Option<NaiveDate>) -> String {
+    date.map_or_else(|| "-".to_string(), |date| date.to_string())
 }
 
 /// The 1-based log folder numbers a channel appears in, such as "1, 3".
-fn root_list(files: &[&LogFile]) -> String {
-    let mut roots: Vec<usize> = files.iter().map(|f| f.root + 1).collect();
+fn root_list(entries: &[Entry]) -> String {
+    let mut roots: Vec<usize> = entries.iter().map(|&(file, _)| file.root + 1).collect();
     roots.dedup();
     roots
         .iter()
