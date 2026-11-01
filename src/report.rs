@@ -2,9 +2,11 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::io::{self, Write};
+use std::path::Path;
 
 use chrono::NaiveDate;
 
+use crate::db::ImportSummary;
 use crate::discover::{Inventory, LogFile, TargetKind};
 use crate::scan::{ChannelActivity, FileStats, Scan};
 
@@ -245,6 +247,28 @@ pub fn daily_activity(
         count(nicks.len(), "distinct nick")
     )?;
     undated_note(out, activity)
+}
+
+/// Summarizes what an import added to the database.
+pub fn import_summary(
+    out: &mut impl Write,
+    db_path: &Path,
+    summary: &ImportSummary,
+) -> io::Result<()> {
+    writeln!(out, "Database: {}", db_path.display())?;
+    writeln!(
+        out,
+        "Imported {}: {}, {} with new lines, {} replaced, {} unchanged",
+        count_u64(summary.lines, "new line"),
+        count(summary.new_files, "new file"),
+        thousands(summary.grown_files as u64),
+        thousands(summary.replaced_files as u64),
+        thousands(summary.unchanged_files as u64),
+    )?;
+    for (path, err) in &summary.errors {
+        writeln!(out, "Could not import {}: {err}", path.display())?;
+    }
+    writeln!(out)
 }
 
 fn undated_note(out: &mut impl Write, activity: &ChannelActivity) -> io::Result<()> {

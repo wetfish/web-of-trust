@@ -1,1 +1,4 @@
 /target
+
+# The default database, and SQLite's temporary files next to it.
+/wot.sqlite*

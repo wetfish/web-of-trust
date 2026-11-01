@@ -27,8 +27,6 @@ const DATE_FORMAT: &str = "%a %b %d %Y";
 const NICK_MODES: [char; 6] = ['@', '+', '%', '~', '&', '!'];
 
 /// One line of an irssi log file.
-// The event time is read by the activity reports that come next.
-#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Line<'a> {
     LogOpened(NaiveDateTime),
@@ -42,8 +40,6 @@ pub enum Line<'a> {
 }
 
 /// What happened on a timestamped line.
-// Most fields are read by the identity and activity reports that come next.
-#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event<'a> {
     /// `<@nick> text` in a channel, or `<nick> text` in a query.
@@ -158,6 +154,12 @@ pub struct DateTracker {
 }
 
 impl DateTracker {
+    /// Starts from a date already known, such as when resuming partway
+    /// through a file.
+    pub fn starting_at(date: Option<NaiveDate>) -> Self {
+        DateTracker { date }
+    }
+
     pub fn update(&mut self, line: &Line<'_>) {
         match line {
             Line::LogOpened(at) | Line::LogClosed(at) => self.date = Some(at.date()),

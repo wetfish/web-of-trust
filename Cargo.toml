@@ -2,10 +2,11 @@
 name = "wot"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.89"
 description = "Web of trust tools for IRC communities, starting with irssi log analysis"
 repository = "https://github.com/wetfish/web-of-trust"
 
 [dependencies]
 chrono = { version = "0.4.45", default-features = false, features = ["std"] }
 clap = { version = "4.6", features = ["derive"] }
+rusqlite = { version = "0.41", features = ["bundled"] }

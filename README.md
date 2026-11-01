@@ -8,13 +8,16 @@ channels to collect data rather than to take part.
 ## Status
 
 Early development. `wot analyze` currently finds the log files in one or more
-irssi log folders, parses every line, and prints an inventory grouped by network
-tag and channel, or the day by day activity of one channel. Identity tracking
-and the social graph come next.
+irssi log folders, imports every line into a SQLite database, and prints an
+inventory grouped by network tag and channel, or the day by day activity of one
+channel. The reports still read the log files directly; moving them onto the
+database comes next, followed by identity tracking and the social graph.
 
 ## Requirements
 
-- Rust 1.85 or newer (edition 2024)
+- Rust 1.89 or newer (edition 2024)
+- A C compiler. SQLite is compiled into `wot` through rusqlite's `bundled`
+  feature, so no system SQLite library is needed.
 
 ## Building
 
@@ -37,7 +40,9 @@ wot analyze ~/irclogs
 wot analyze /archive/laptop/irclogs /archive/server/irclogs
 ```
 
-The report is plain text on standard output, so it can be saved or paged:
+The report is plain text on standard output, so it can be saved or paged. A
+short summary of the database import goes to standard error, so it stays out
+of saved reports:
 
 ```bash
 wot analyze ~/irclogs > inventory.txt
@@ -50,6 +55,13 @@ the start of a word as a comment:
 
 ```bash
 wot analyze ~/irclogs --channel '#wetfish'
+```
+
+Each run imports the logs into the database first, see [Database](#database).
+To use a different database file:
+
+```bash
+wot analyze ~/irclogs --db /path/to/other.sqlite
 ```
 
 Run `wot --help` or `wot analyze --help` for the full list of options.
@@ -143,3 +155,73 @@ range. Spoken lines before the first line giving a date are counted separately.
 When several files match, for example the same channel logged by two irssi
 instances, their counts are added together, so a day logged in both is counted
 twice. The report lists the files it read so this is easy to spot.
+
+## Database
+
+`wot analyze` imports every log file into a SQLite database before it reports.
+By default this is `wot.sqlite` in the repository folder, which `.gitignore`
+excludes. `--db FILE` uses another file. The database is created when it does
+not exist. You can open it with any SQLite client, such as `sqlite3 wot.sqlite`.
+
+### Importing
+
+The first run imports everything. Later runs only read what changed:
+
+- A file seen before that has grown is read from where the last import
+  stopped. The date in effect at that point is remembered, so lines after a
+  `Day changed` line keep the right date across runs.
+- A file that shrank, or whose first 1024 bytes changed, was replaced. Its old
+  rows are deleted and it is imported again from the start.
+- Only complete lines are imported. A last line without a newline, which irssi
+  may still be writing, waits for the next run.
+
+Each file is imported in its own transaction, so an interrupted run leaves the
+database consistent and the next run carries on. A summary of the import is
+printed to standard error.
+
+The database records its schema version. If a newer version of `wot` changes
+the schema, it refuses to use the old database; delete it and run again to
+rebuild it from the logs.
+
+### Tables
+
+`files` has one row per log file:
+
+| Column | Contents |
+| --- | --- |
+| `path` | Absolute path of the log file |
+| `tag`, `target` | Network tag folder and channel or nick, from the path |
+| `kind` | `channel` or `query` |
+| `bytes_read`, `lines_read` | How far the file has been imported |
+| `date` | The date in effect after the last imported line |
+| `head` | The file's first 1024 bytes, to notice a replaced file |
+| `imported_at` | When the file was last imported, in UTC |
+
+`events` has one row per line, apart from blank lines and `Day changed` lines.
+Every row has `file_id`, `line` (the line number), `date` (`YYYY-MM-DD`, empty
+before the first line giving a date), `time` and `kind`. The other columns
+depend on the kind:
+
+| Kind | `nick` | `ident`, `host` | `other_nick` | `text` | `detail` |
+| --- | --- | --- | --- | --- | --- |
+| `message` | speaker | | | message | channel status, such as `@` |
+| `action` | speaker | | | action | |
+| `notice` | sender | | | notice | |
+| `server_notice` | | | | notice | server |
+| `join` | nick | yes | | | channel |
+| `part` | nick | yes | | reason | channel |
+| `quit` | nick | yes | | reason | |
+| `kick` | kicked nick | | kicked by | reason | channel |
+| `nick_change` | old nick | | new nick | | |
+| `own_nick_change` | | | new nick | | |
+| `topic` | nick | | | topic | channel |
+| `topic_unset` | nick | | | | channel |
+| `mode`, `server_mode` | set by | | | modes | channel |
+| `netsplit` | | | | nicks | servers |
+| `netsplit_over` | | | | nicks | |
+| `client` | | | | irssi's message | |
+| `log_opened`, `log_closed` | | | | | |
+| `unparsed` | | | | the whole line | |
+
+`time` is `HH:MM` for events, `HH:MM:SS` for `log_opened` and `log_closed`, and
+empty for `unparsed` lines.

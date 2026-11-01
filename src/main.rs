@@ -1,13 +1,17 @@
+mod db;
 mod discover;
 mod irssi;
 mod report;
 mod scan;
 
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
+
+/// The default database, in the repository folder. `.gitignore` excludes it.
+const DEFAULT_DB: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/wot.sqlite");
 
 /// Web of trust tools for IRC communities.
 #[derive(Parser)]
@@ -19,7 +23,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Read irssi log folders and report on them
+    /// Import irssi log folders into the database and report on them
     Analyze {
         /// Log folders to read, one per irssi instance, each laid out as
         /// <folder>/<network tag>/<channel or nick>.log
@@ -30,16 +34,20 @@ enum Command {
         /// inventory. Quote it in the shell: --channel '#wetfish'
         #[arg(long)]
         channel: Option<String>,
+
+        /// SQLite database to import into. It is created if it does not exist.
+        #[arg(long, value_name = "FILE", default_value = DEFAULT_DB)]
+        db: PathBuf,
     },
 }
 
 fn main() -> ExitCode {
     match Cli::parse().command {
-        Command::Analyze { roots, channel } => analyze(&roots, channel.as_deref()),
+        Command::Analyze { roots, channel, db } => analyze(&roots, channel.as_deref(), &db),
     }
 }
 
-fn analyze(roots: &[PathBuf], channel: Option<&str>) -> ExitCode {
+fn analyze(roots: &[PathBuf], channel: Option<&str>, db_path: &Path) -> ExitCode {
     let inventory = match discover::discover(roots) {
         Ok(inventory) => inventory,
         Err(err) => {
@@ -47,6 +55,17 @@ fn analyze(roots: &[PathBuf], channel: Option<&str>) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+
+    let mut conn = match db::open(db_path) {
+        Ok(conn) => conn,
+        Err(err) => {
+            eprintln!("error: opening database {}: {err}", db_path.display());
+            return ExitCode::FAILURE;
+        }
+    };
+    let summary = db::import(&mut conn, &inventory.files);
+    // The import summary goes to standard error so the report stays clean.
+    let _ = report::import_summary(&mut io::stderr().lock(), db_path, &summary);
 
     let scan = scan::scan(&inventory, channel);
 
