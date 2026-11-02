@@ -1,4 +1,5 @@
 mod db;
+mod decide;
 mod discover;
 mod identity;
 mod irssi;
@@ -10,7 +11,8 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
+use rusqlite::Connection;
 
 use crate::lookup::Filter;
 
@@ -36,7 +38,7 @@ enum Command {
 
         /// Show day by day activity for this channel instead of the
         /// inventory. Quote it in the shell: --channel '#wetfish'
-        #[arg(long, conflicts_with_all = ["nick", "ident", "host"])]
+        #[arg(long, conflicts_with_all = ["nick", "ident", "host", "person"])]
         channel: Option<String>,
 
         /// Show the identities that used this nick instead of the inventory.
@@ -45,14 +47,18 @@ enum Command {
         nick: Option<String>,
 
         /// Show the identities that connected with this ident. Combines with
-        /// --nick and --host, and `*` matches any characters
+        /// --nick, --host and --person, and `*` matches any characters
         #[arg(long)]
         ident: Option<String>,
 
         /// Show the identities that connected from this host. Combines with
-        /// --nick and --ident, and `*` matches any characters
+        /// --nick, --ident and --person, and `*` matches any characters
         #[arg(long)]
         host: Option<String>,
+
+        /// Show the identities that belong to this person
+        #[arg(long)]
+        person: Option<String>,
 
         /// SQLite database to import into. It is created if it does not exist.
         #[arg(long, value_name = "FILE", default_value = DEFAULT_DB)]
@@ -63,6 +69,165 @@ enum Command {
         #[arg(long)]
         rebuild: bool,
     },
+
+    /// Group hosts that are one bridge or bouncer
+    Hosts {
+        #[command(subcommand)]
+        action: HostsAction,
+
+        /// Network tag the hosts belong to. Needed only when logs from more
+        /// than one tag are imported
+        #[arg(long, global = true)]
+        tag: Option<String>,
+
+        /// SQLite database to use
+        #[arg(long, value_name = "FILE", default_value = DEFAULT_DB, global = true)]
+        db: PathBuf,
+    },
+
+    /// Say which identities belong to which person
+    People {
+        #[command(subcommand)]
+        action: PeopleAction,
+
+        /// SQLite database to use
+        #[arg(long, value_name = "FILE", default_value = DEFAULT_DB, global = true)]
+        db: PathBuf,
+    },
+
+    /// Mark nick changes made by someone else at the keyboard
+    Cuts {
+        #[command(subcommand)]
+        action: CutsAction,
+
+        /// SQLite database to use
+        #[arg(long, value_name = "FILE", default_value = DEFAULT_DB, global = true)]
+        db: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum HostsAction {
+    /// Create a host group
+    AddGroup {
+        name: String,
+
+        #[arg(long, value_enum)]
+        kind: GroupKind,
+
+        /// Do not treat the ident as the person on these hosts, for a
+        /// bouncer that gives everyone the same ident
+        #[arg(long)]
+        no_ident_user: bool,
+
+        #[arg(long)]
+        note: Option<String>,
+    },
+
+    /// Change a host group's kind, ident setting or note
+    EditGroup {
+        name: String,
+
+        #[arg(long, value_enum)]
+        kind: Option<GroupKind>,
+
+        /// Whether the ident identifies the person on these hosts
+        #[arg(long, value_name = "true|false")]
+        ident_is_user: Option<bool>,
+
+        #[arg(long)]
+        note: Option<String>,
+    },
+
+    /// Add hosts to a group, exactly as they appear in the logs
+    Add {
+        group: String,
+
+        #[arg(required = true)]
+        hosts: Vec<String>,
+
+        #[arg(long)]
+        note: Option<String>,
+    },
+
+    /// Take hosts out of their group
+    Remove {
+        #[arg(required = true)]
+        hosts: Vec<String>,
+    },
+
+    /// Delete a host group and take all its hosts out of it
+    RemoveGroup { name: String },
+
+    /// List host groups and their hosts
+    List,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum GroupKind {
+    Bridge,
+    Bouncer,
+}
+
+impl GroupKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            GroupKind::Bridge => "bridge",
+            GroupKind::Bouncer => "bouncer",
+        }
+    }
+}
+
+#[derive(Subcommand)]
+enum PeopleAction {
+    /// Create a person, optionally with identities
+    Create {
+        name: String,
+
+        /// Identity ids, as shown by wot analyze --nick, --ident or --host
+        ids: Vec<String>,
+
+        #[arg(long)]
+        note: Option<String>,
+    },
+
+    /// Add identities to a person
+    Add {
+        name: String,
+
+        #[arg(required = true)]
+        ids: Vec<String>,
+    },
+
+    /// Take identities out of whichever person they belong to
+    Remove {
+        #[arg(required = true)]
+        ids: Vec<String>,
+    },
+
+    /// Delete a person; their identities are kept and belong to no one
+    Delete { name: String },
+
+    /// List people and their identities
+    List,
+}
+
+#[derive(Subcommand)]
+enum CutsAction {
+    /// Cut a session at a nick change line, given as tag/target.log:LINE or
+    /// the full path of the log file and :LINE. Quote it in the shell
+    Add {
+        at: String,
+
+        #[arg(long)]
+        note: Option<String>,
+    },
+
+    /// List cuts, and whether each still applies
+    List,
+
+    /// Delete a cut by its id from wot cuts list
+    Remove { id: i64 },
 }
 
 fn main() -> ExitCode {
@@ -73,13 +238,154 @@ fn main() -> ExitCode {
             nick,
             ident,
             host,
+            person,
             db,
             rebuild,
         } => {
-            let filter = Filter { nick, ident, host };
+            let filter = Filter {
+                nick,
+                ident,
+                host,
+                person,
+            };
             analyze(&roots, channel.as_deref(), &filter, &db, rebuild)
         }
+        Command::Hosts { action, tag, db } => finish(hosts(action, tag.as_deref(), &db)),
+        Command::People { action, db } => finish(people(action, &db)),
+        Command::Cuts { action, db } => finish(cuts(action, &db)),
     }
+}
+
+/// Prints a command's error, if it failed, and gives its exit code.
+fn finish(result: db::Result<()>) -> ExitCode {
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("error: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn open(db_path: &Path) -> db::Result<Connection> {
+    db::open(db_path).map_err(|err| format!("opening database {}: {err}", db_path.display()).into())
+}
+
+/// Rebuilds identities after a decision that changes them, with a summary on
+/// standard error.
+fn rebuild_identities(conn: &mut Connection) -> db::Result<()> {
+    eprintln!("Building sessions and identities...");
+    let summary = identity::rebuild(conn)?;
+    report::identity_summary(&mut io::stderr().lock(), &summary)?;
+    Ok(())
+}
+
+fn hosts(action: HostsAction, tag: Option<&str>, db_path: &Path) -> db::Result<()> {
+    let mut conn = open(db_path)?;
+    if let HostsAction::List = action {
+        let mut out = io::stdout().lock();
+        return decide::list_hosts(&conn, &mut out);
+    }
+    let tag = decide::resolve_tag(&conn, tag)?;
+    match action {
+        HostsAction::AddGroup {
+            name,
+            kind,
+            no_ident_user,
+            note,
+        } => {
+            decide::add_group(
+                &conn,
+                &tag,
+                &name,
+                kind.as_str(),
+                !no_ident_user,
+                note.as_deref(),
+            )?;
+            println!(
+                "Created {} group {name} in {tag}. Add its hosts with: wot hosts add {name} HOST...",
+                kind.as_str()
+            );
+            // An empty group changes nothing, so there is nothing to rebuild.
+            return Ok(());
+        }
+        HostsAction::EditGroup {
+            name,
+            kind,
+            ident_is_user,
+            note,
+        } => {
+            decide::edit_group(
+                &conn,
+                &tag,
+                &name,
+                kind.map(GroupKind::as_str),
+                ident_is_user,
+                note.as_deref(),
+            )?;
+            println!("Updated host group {name}.");
+        }
+        HostsAction::Add { group, hosts, note } => {
+            decide::add_hosts(&mut conn, &tag, &group, &hosts, note.as_deref())?;
+            println!("Added {} to host group {group}.", hosts.join(", "));
+        }
+        HostsAction::Remove { hosts } => {
+            decide::remove_hosts(&mut conn, &tag, &hosts)?;
+            println!("Took {} out of their host group.", hosts.join(", "));
+        }
+        HostsAction::RemoveGroup { name } => {
+            decide::remove_group(&conn, &tag, &name)?;
+            println!("Deleted host group {name}.");
+        }
+        HostsAction::List => unreachable!("handled above"),
+    }
+    rebuild_identities(&mut conn)
+}
+
+fn people(action: PeopleAction, db_path: &Path) -> db::Result<()> {
+    let mut conn = open(db_path)?;
+    match action {
+        PeopleAction::Create { name, ids, note } => {
+            decide::create_person(&mut conn, &name, &ids, note.as_deref())?;
+            println!("Created {name} with {} identities.", ids.len());
+        }
+        PeopleAction::Add { name, ids } => {
+            decide::add_to_person(&mut conn, &name, &ids)?;
+            println!("Added {} to {name}.", ids.join(", "));
+        }
+        PeopleAction::Remove { ids } => {
+            decide::remove_from_person(&mut conn, &ids)?;
+            println!("Took {} out of their person.", ids.join(", "));
+        }
+        PeopleAction::Delete { name } => {
+            decide::delete_person(&conn, &name)?;
+            println!("Deleted {name}. Their identities now belong to no one.");
+        }
+        PeopleAction::List => {
+            let mut out = io::stdout().lock();
+            decide::list_people(&conn, &mut out)?;
+        }
+    }
+    Ok(())
+}
+
+fn cuts(action: CutsAction, db_path: &Path) -> db::Result<()> {
+    let mut conn = open(db_path)?;
+    match action {
+        CutsAction::Add { at, note } => {
+            let change = decide::add_cut(&conn, &at, note.as_deref())?;
+            println!("Cut {at}: {change}");
+        }
+        CutsAction::Remove { id } => {
+            decide::remove_cut(&conn, id)?;
+            println!("Deleted cut {id}.");
+        }
+        CutsAction::List => {
+            let mut out = io::stdout().lock();
+            return decide::list_cuts(&conn, &mut out);
+        }
+    }
+    rebuild_identities(&mut conn)
 }
 
 fn analyze(
@@ -97,10 +403,10 @@ fn analyze(
         }
     };
 
-    let mut conn = match db::open(db_path) {
+    let mut conn = match open(db_path) {
         Ok(conn) => conn,
         Err(err) => {
-            eprintln!("error: opening database {}: {err}", db_path.display());
+            eprintln!("error: {err}");
             return ExitCode::FAILURE;
         }
     };
@@ -117,15 +423,9 @@ fn analyze(
         }
     };
     if rebuild {
-        eprintln!("Building sessions and identities...");
-        match identity::rebuild(&mut conn) {
-            Ok(rebuilt) => {
-                let _ = report::identity_summary(&mut io::stderr().lock(), &rebuilt);
-            }
-            Err(err) => {
-                eprintln!("error: building identities: {err}");
-                return ExitCode::FAILURE;
-            }
+        if let Err(err) = rebuild_identities(&mut conn) {
+            eprintln!("error: building identities: {err}");
+            return ExitCode::FAILURE;
         }
     }
     eprintln!();

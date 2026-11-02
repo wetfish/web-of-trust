@@ -288,7 +288,17 @@ pub fn identity_summary(out: &mut impl Write, summary: &RebuildSummary) -> io::R
         "Sessions without a host: {} inferred from the same nick, {} known by nick only",
         thousands(summary.inferred_sessions as u64),
         thousands(summary.nick_only_sessions as u64),
-    )
+    )?;
+    if summary.cuts_applied + summary.cuts_stale > 0 {
+        writeln!(
+            out,
+            "Cuts: {} applied, starting {}, {} stale (see wot cuts list)",
+            thousands(summary.cuts_applied as u64),
+            count(summary.cut_sessions, "session"),
+            thousands(summary.cuts_stale as u64),
+        )?;
+    }
+    Ok(())
 }
 
 /// Identities are shown in full when at most this many match.
@@ -318,6 +328,7 @@ pub fn identities(out: &mut impl Write, filter: &Filter, views: &[IdentityView])
             let sessions = &view.sessions;
             vec![
                 view.id.clone(),
+                person_label(&view.people),
                 nick_list(sessions, 4),
                 thousands(connections(sessions).len() as u64),
                 thousands(sessions.len() as u64),
@@ -332,6 +343,7 @@ pub fn identities(out: &mut impl Write, filter: &Filter, views: &[IdentityView])
         out,
         &[
             "Identity",
+            "Person",
             "Nicks",
             "Hosts",
             "Sessions",
@@ -341,7 +353,7 @@ pub fn identities(out: &mut impl Write, filter: &Filter, views: &[IdentityView])
             "Last seen",
         ],
         &rows,
-        &[false, false, true, true, true, true, false, false],
+        &[false, false, false, true, true, true, true, false, false],
     )?;
 
     if views.len() > MAX_DETAILED {
@@ -363,6 +375,15 @@ pub fn identities(out: &mut impl Write, filter: &Filter, views: &[IdentityView])
 fn identity_details(out: &mut impl Write, view: &IdentityView) -> io::Result<()> {
     let sessions = &view.sessions;
     heading(out, &format!("Identity {} ({})", view.id, view.tag), '-')?;
+    match view.people.as_slice() {
+        [] => writeln!(out, "Person: not assigned")?,
+        [person] => writeln!(out, "Person: {person}")?,
+        people => writeln!(
+            out,
+            "People: {} (conflict: identities added to different people were merged since)",
+            people.join(", ")
+        )?,
+    }
 
     let linked = |link: &str| sessions.iter().filter(|s| s.link == link).count() as u64;
     let logger = sessions.iter().filter(|s| s.logger).count() as u64;
@@ -373,6 +394,10 @@ fn identity_details(out: &mut impl Write, view: &IdentityView) -> io::Result<()>
         thousands(linked("inferred")),
         thousands(linked("nick_only")),
     );
+    let cut = linked("cut");
+    if cut > 0 {
+        line.push_str(&format!(", {} started by a cut", thousands(cut)));
+    }
     if logger > 0 {
         line.push_str(&format!(", {} as the logging client", thousands(logger)));
     }
@@ -580,6 +605,16 @@ fn identity_details(out: &mut impl Write, view: &IdentityView) -> io::Result<()>
     Ok(())
 }
 
+/// The people an identity belongs to, `-` for none, or the names with a
+/// warning when merges put it in more than one.
+fn person_label(people: &[String]) -> String {
+    match people {
+        [] => "-".to_string(),
+        [person] => person.clone(),
+        people => format!("conflict: {}", people.join(", ")),
+    }
+}
+
 fn examples_title(what: &str, total: usize) -> String {
     if total > MAX_EXAMPLES {
         format!(
@@ -636,6 +671,7 @@ fn link_label(link: &str) -> &str {
         "host" => "nick and host",
         "inferred" => "inferred",
         "nick_only" => "nick only",
+        "cut" => "cut",
         other => other,
     }
 }
@@ -652,7 +688,7 @@ fn spoken<'a>(sessions: impl Iterator<Item = &'a SessionRow>) -> u64 {
 }
 
 /// The `YYYY-MM-DD` part of a `YYYY-MM-DD HH:MM` timestamp.
-fn day(at: &str) -> &str {
+pub(crate) fn day(at: &str) -> &str {
     at.get(..10).unwrap_or(at)
 }
 
@@ -677,7 +713,7 @@ fn undated_note(out: &mut impl Write, activity: &ChannelActivity) -> io::Result<
     Ok(())
 }
 
-fn heading(out: &mut impl Write, title: &str, underline: char) -> io::Result<()> {
+pub(crate) fn heading(out: &mut impl Write, title: &str, underline: char) -> io::Result<()> {
     writeln!(out, "{title}")?;
     writeln!(
         out,
@@ -688,7 +724,7 @@ fn heading(out: &mut impl Write, title: &str, underline: char) -> io::Result<()>
 
 /// Writes an aligned table, indented two spaces. `numeric` columns are
 /// right-aligned.
-fn table(
+pub(crate) fn table(
     out: &mut impl Write,
     header: &[&str],
     rows: &[Vec<String>],
@@ -787,7 +823,7 @@ fn count_u64(n: u64, noun: &str) -> String {
     format!("{} {noun}{suffix}", thousands(n))
 }
 
-fn thousands(n: u64) -> String {
+pub(crate) fn thousands(n: u64) -> String {
     let digits = n.to_string();
     let mut out = String::with_capacity(digits.len() + digits.len() / 3);
     for (i, digit) in digits.chars().enumerate() {

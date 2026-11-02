@@ -7,7 +7,12 @@
 //! bytes changed was replaced, and is imported again from the start.
 //!
 //! The `identities`, `identity_keys` and `sessions` tables are filled by the
-//! `identity` module.
+//! `identity` module, and rebuilt from the events whenever needed.
+//!
+//! The decision tables hold what a person decided by hand, and nothing
+//! rebuilds them: `host_groups` and `host_group_members` for bridges and
+//! bouncers, `people` and `person_identities` for who is who, and
+//! `session_cuts` for nick changes made by someone else at the keyboard.
 
 use std::error::Error;
 use std::fs::{self, File};
@@ -28,7 +33,7 @@ const HEAD_LEN: u64 = 1024;
 /// The schema, as the steps that build it. SQLite's `user_version` stores how
 /// many steps a database has had, so an older database is brought up to date
 /// by running the steps it is missing.
-const MIGRATIONS: [&str; 2] = [SCHEMA_V1, SCHEMA_V2];
+const MIGRATIONS: [&str; 3] = [SCHEMA_V1, SCHEMA_V2, SCHEMA_V3];
 
 const SCHEMA_V1: &str = "
 CREATE TABLE files (
@@ -130,6 +135,70 @@ CREATE TABLE sessions (
 );
 
 CREATE INDEX sessions_by_identity ON sessions (identity_id);
+";
+
+const SCHEMA_V3: &str = "
+-- Hosts that many people connect through, such as a Matrix bridge that moved
+-- between servers, or a bouncer.
+CREATE TABLE host_groups (
+    id INTEGER PRIMARY KEY,
+    tag TEXT NOT NULL,
+    name TEXT NOT NULL,
+    -- 'bridge' or 'bouncer'.
+    kind TEXT NOT NULL CHECK (kind IN ('bridge', 'bouncer')),
+    -- 1 when the ident identifies the person on these hosts, across nicks.
+    ident_is_user INTEGER NOT NULL DEFAULT 1,
+    note TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE (tag, name)
+);
+
+-- The hosts in each group, exactly as they appear in the logs.
+CREATE TABLE host_group_members (
+    group_id INTEGER NOT NULL REFERENCES host_groups (id) ON DELETE CASCADE,
+    tag TEXT NOT NULL,
+    host TEXT NOT NULL COLLATE NOCASE,
+    note TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    -- A host is in at most one group.
+    PRIMARY KEY (tag, host)
+);
+
+CREATE INDEX host_group_members_by_group ON host_group_members (group_id);
+
+-- The humans behind identities, as decided by hand. A person can hold
+-- identities from any network tag.
+CREATE TABLE people (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    note TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- Which identities belong to which person, at most one person each.
+CREATE TABLE person_identities (
+    identity_id TEXT PRIMARY KEY REFERENCES identities (id),
+    person_id INTEGER NOT NULL REFERENCES people (id) ON DELETE CASCADE,
+    note TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX person_identities_by_person ON person_identities (person_id);
+
+-- Nick changes made by someone else at the keyboard. The session ends at the
+-- line, and the new nick starts a session linked to nothing else.
+CREATE TABLE session_cuts (
+    id INTEGER PRIMARY KEY,
+    -- The log file, as in files.path.
+    path TEXT NOT NULL,
+    line INTEGER NOT NULL,
+    -- The nick change on that line, such as 'alice is now known as bob'. A cut
+    -- whose line no longer says this is stale and is not applied.
+    expected TEXT NOT NULL,
+    note TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE (path, line)
+);
 ";
 
 const INSERT_EVENT: &str = "
@@ -659,11 +728,16 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 2);
-        let sessions: i64 = conn
-            .query_row("SELECT count(*) FROM sessions", [], |row| row.get(0))
+        assert_eq!(version, MIGRATIONS.len() as i64);
+        let tables: i64 = conn
+            .query_row(
+                "SELECT (SELECT count(*) FROM sessions) + (SELECT count(*) FROM host_groups)
+                        + (SELECT count(*) FROM people) + (SELECT count(*) FROM session_cuts)",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
-        assert_eq!(sessions, 0);
+        assert_eq!(tables, 0);
     }
 
     #[test]

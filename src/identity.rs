@@ -18,12 +18,22 @@
 //! - A nick that never appears with a host gets its own identity, with the
 //!   link `nick_only`.
 //!
+//! Two kinds of decisions made by hand change this:
+//!
+//! - Hosts in the same host group count as one host. When the group's
+//!   `ident_is_user` is on, sessions with the same ident anywhere in the group
+//!   are linked whatever their nick, since bridges and bouncers give each
+//!   person their own ident.
+//! - A cut on a nick change line ends the session there. The new nick starts
+//!   a session with the link `cut`, which is linked to nothing else and keeps
+//!   no host, so someone using another person's connection is kept apart.
+//!
 //! Everything is rebuilt from the events on each run. Identity ids are random,
 //! and kept stable through `identity_keys`, which records which nick and
 //! `ident@host` combinations belong to which id. When two identities merge,
 //! the older id wins and the other records `merged_into`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime, TimeDelta};
 use rusqlite::{Connection, params};
@@ -43,6 +53,113 @@ pub struct RebuildSummary {
     pub merged_identities: usize,
     pub inferred_sessions: usize,
     pub nick_only_sessions: usize,
+    /// Sessions started by a cut.
+    pub cut_sessions: usize,
+    pub cuts_applied: usize,
+    /// Cuts whose line no longer holds the nick change they were made on.
+    pub cuts_stale: usize,
+}
+
+/// The text of a nick change line, as irssi writes it: `alice is now known as
+/// bob`, or `You're now known as bob` for the logging client. Cuts store this
+/// to notice when their line no longer holds the same nick change.
+pub fn nick_change_text(kind: &str, nick: Option<&str>, new: Option<&str>) -> Option<String> {
+    match kind {
+        "nick_change" => Some(format!("{} is now known as {}", nick?, new?)),
+        "own_nick_change" => Some(format!("You're now known as {}", new?)),
+        _ => None,
+    }
+}
+
+/// Decisions made by hand that change how sessions are built and linked.
+struct Rules {
+    /// By tag and ASCII-lowercased host.
+    groups: HashMap<(String, String), GroupRule>,
+    cuts: Cuts,
+}
+
+#[derive(Clone, Copy)]
+struct GroupRule {
+    id: i64,
+    ident_is_user: bool,
+}
+
+struct Cuts {
+    /// By file id and line: the cut's id and the nick change it expects.
+    at: HashMap<(i64, i64), (i64, String)>,
+    applied: HashSet<i64>,
+    total: usize,
+}
+
+impl Cuts {
+    /// The cut on this event's line, if there is one and the line still holds
+    /// the nick change it was made on.
+    fn take(&mut self, event: &Row) -> Option<i64> {
+        let (id, expected) = self.at.get(&(event.file_id, event.line))?;
+        let actual = nick_change_text(
+            &event.kind,
+            event.nick.as_deref(),
+            event.other_nick.as_deref(),
+        )?;
+        if *expected != actual {
+            return None;
+        }
+        let id = *id;
+        self.applied.insert(id);
+        Some(id)
+    }
+}
+
+fn load_rules(conn: &Connection) -> Result<Rules> {
+    let groups = {
+        let mut stmt = conn.prepare(
+            "SELECT m.tag, lower(m.host), g.id, g.ident_is_user
+             FROM host_group_members m JOIN host_groups g ON g.id = m.group_id",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    (row.get(0)?, row.get(1)?),
+                    GroupRule {
+                        id: row.get(2)?,
+                        ident_is_user: row.get(3)?,
+                    },
+                ))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        rows
+    };
+    let at = {
+        let mut stmt = conn.prepare(
+            "SELECT f.id, c.line, c.id, c.expected
+             FROM session_cuts c JOIN files f ON f.path = c.path",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(((row.get(0)?, row.get(1)?), (row.get(2)?, row.get(3)?)))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        rows
+    };
+    let total: i64 = conn.query_row("SELECT count(*) FROM session_cuts", [], |row| row.get(0))?;
+    Ok(Rules {
+        groups,
+        cuts: Cuts {
+            at,
+            applied: HashSet::new(),
+            total: total as usize,
+        },
+    })
+}
+
+/// The stand-in host that joins the hosts of a group, and the one that keeps
+/// the sessions after a cut together. Real hosts never contain `#`.
+fn group_host(id: i64) -> String {
+    format!("#group:{id}")
+}
+
+fn cut_host(id: i64) -> String {
+    format!("#cut:{id}")
 }
 
 /// Whether sessions have been built at all, for example after upgrading a
@@ -57,13 +174,16 @@ pub fn is_built(conn: &Connection) -> Result<bool> {
 /// Rebuilds all sessions and identities from the events, in one transaction.
 pub fn rebuild(conn: &mut Connection) -> Result<RebuildSummary> {
     let tx = conn.transaction()?;
-    let sessions = replay_events(&tx)?;
+    let mut rules = load_rules(&tx)?;
+    let sessions = replay_events(&tx, &mut rules.cuts)?;
 
     let mut summary = RebuildSummary {
         sessions: sessions.len(),
+        cuts_applied: rules.cuts.applied.len(),
+        cuts_stale: rules.cuts.total.saturating_sub(rules.cuts.applied.len()),
         ..RebuildSummary::default()
     };
-    let links = link_sessions(&sessions);
+    let links = link_sessions(&sessions, &rules.groups);
     let ids = assign_ids(&tx, &links, &mut summary)?;
 
     tx.execute("DELETE FROM sessions", [])?;
@@ -91,6 +211,10 @@ pub fn rebuild(conn: &mut Connection) -> Result<RebuildSummary> {
                 Link::NickOnly(node) => {
                     summary.nick_only_sessions += 1;
                     (&ids[&links.root(node)], "nick_only", None)
+                }
+                Link::Cut(node) => {
+                    summary.cut_sessions += 1;
+                    (&ids[&links.root(node)], "cut", None)
                 }
             };
             let minutes = session
@@ -154,6 +278,8 @@ struct Session {
     spoken: i64,
     /// The logging client's own session.
     logger: bool,
+    /// The cut that started this session, if one did.
+    cut: Option<i64>,
 }
 
 /// One event, as read back from the database.
@@ -171,7 +297,7 @@ struct Row {
 }
 
 /// Replays every file's events in line order and returns their sessions.
-fn replay_events(conn: &Connection) -> Result<Vec<Session>> {
+fn replay_events(conn: &Connection, cuts: &mut Cuts) -> Result<Vec<Session>> {
     let tags: HashMap<i64, String> = {
         let mut stmt = conn.prepare("SELECT id, tag FROM files")?;
         let rows = stmt
@@ -217,7 +343,7 @@ fn replay_events(conn: &Connection) -> Result<Vec<Session>> {
             replay = Some(FileReplay::new(event.file_id, tag));
         }
         if let Some(replay) = replay.as_mut() {
-            replay.event(&event, &mut sessions);
+            replay.event(&event, &mut sessions, cuts);
         }
     }
     if let Some(finished) = replay.take() {
@@ -276,7 +402,7 @@ impl FileReplay {
         }
     }
 
-    fn event(&mut self, event: &Row, sessions: &mut Vec<Session>) {
+    fn event(&mut self, event: &Row, sessions: &mut Vec<Session>, cuts: &mut Cuts) {
         let nick = event.nick.as_deref().unwrap_or_default();
         match event.kind.as_str() {
             "log_opened" => {
@@ -318,18 +444,23 @@ impl FileReplay {
             "nick_change" => {
                 let new = event.other_nick.as_deref().unwrap_or_default();
                 let index = self.session_for(sessions, nick, event);
-                self.rename(sessions, index, nick, new, event);
+                match cuts.take(event) {
+                    Some(cut) => self.cut(sessions, index, nick, new, event, cut),
+                    None => self.rename(sessions, index, nick, new, event),
+                }
             }
             "own_nick_change" => {
                 // Only the logging client's own session is renamed, and only
                 // while it is still open.
                 let new = event.other_nick.as_deref().unwrap_or_default();
-                if let Some(index) = self.own {
-                    let current = sessions[index].nicks.last().map(|nick| nick.to_lowercase());
-                    if let Some(current) = current {
-                        if self.open.get(&current) == Some(&index) {
-                            self.rename(sessions, index, &current, new, event);
-                        }
+                let own = self.own.and_then(|index| {
+                    let current = sessions[index].nicks.last()?.to_lowercase();
+                    (self.open.get(&current) == Some(&index)).then_some((index, current))
+                });
+                if let Some((index, current)) = own {
+                    match cuts.take(event) {
+                        Some(cut) => self.cut(sessions, index, &current, new, event, cut),
+                        None => self.rename(sessions, index, &current, new, event),
                     }
                 }
             }
@@ -433,10 +564,40 @@ impl FileReplay {
             end_reason: "end_of_log",
             spoken: 0,
             logger: false,
+            cut: None,
         });
         let index = sessions.len() - 1;
         self.open.insert(nick.to_lowercase(), index);
         index
+    }
+
+    /// Ends a session at a nick change marked by a cut, and starts a new
+    /// session under the new nick that carries the cut instead of a host.
+    fn cut(
+        &mut self,
+        sessions: &mut Vec<Session>,
+        index: usize,
+        old: &str,
+        new: &str,
+        event: &Row,
+        cut: i64,
+    ) {
+        self.open.remove(&old.to_lowercase());
+        close(&mut sessions[index], event, "cut");
+        if let Some(stale) = self.open.remove(&new.to_lowercase()) {
+            close(&mut sessions[stale], event, "nick_taken");
+        }
+        let logger = sessions[index].logger;
+        // Started as if joined, so it starts at the cut rather than when
+        // logging started.
+        let next = self.start(sessions, new, event, true);
+        let session = &mut sessions[next];
+        session.joined = false;
+        session.cut = Some(cut);
+        session.logger = logger;
+        if self.own == Some(index) {
+            self.own = Some(next);
+        }
     }
 
     /// Moves a session from its old nick to a new one.
@@ -490,9 +651,10 @@ fn close(session: &mut Session, event: &Row, reason: &'static str) {
 }
 
 /// Records the `ident@host` from a join, part or quit line, if the session
-/// does not have one yet.
+/// does not have one yet. Sessions started by a cut keep no host, since the
+/// connection belongs to the person before the cut.
 fn learn_host(session: &mut Session, event: &Row) {
-    if session.host.is_none() {
+    if session.host.is_none() && session.cut.is_none() {
         if let (Some(ident), Some(host)) = (&event.ident, &event.host) {
             session.ident = Some(ident.clone());
             session.host = Some(host.clone());
@@ -501,7 +663,8 @@ fn learn_host(session: &mut Session, event: &Row) {
 }
 
 /// A network tag, lowercased nick, ident and host. Nick-only keys have an
-/// empty ident and host.
+/// empty ident and host. Keys for host groups and cuts use a stand-in host
+/// starting with `#`.
 type Key = (String, String, String, String);
 
 #[derive(Clone, Copy)]
@@ -512,20 +675,27 @@ enum Link {
     Inferred(usize),
     /// The nick never appears with a host. The node is one of its keys.
     NickOnly(usize),
+    /// Started by a cut. The node is one of its keys.
+    Cut(usize),
 }
 
 /// Keys joined into clusters, one cluster per identity.
 struct Links {
     keys: Vec<Key>,
+    /// Whether each key is stored in `identity_keys`. Keys that only join a
+    /// host group's hosts are not, since the real keys they join already
+    /// keep the identity's id stable.
+    stored: Vec<bool>,
     parent: Vec<usize>,
     /// One entry per session.
     of_session: Vec<Link>,
 }
 
 impl Links {
-    fn node(&mut self, index: &mut HashMap<Key, usize>, key: Key) -> usize {
+    fn node(&mut self, index: &mut HashMap<Key, usize>, key: Key, stored: bool) -> usize {
         *index.entry(key).or_insert_with_key(|key| {
             self.keys.push(key.clone());
+            self.stored.push(stored);
             self.parent.push(self.parent.len());
             self.parent.len() - 1
         })
@@ -573,9 +743,10 @@ impl Links {
 
 /// Links every session to a cluster of keys, following the rules in the
 /// module documentation.
-fn link_sessions(sessions: &[Session]) -> Links {
+fn link_sessions(sessions: &[Session], groups: &HashMap<(String, String), GroupRule>) -> Links {
     let mut links = Links {
         keys: Vec::new(),
+        stored: Vec::new(),
         parent: Vec::new(),
         of_session: Vec::with_capacity(sessions.len()),
     };
@@ -588,20 +759,39 @@ fn link_sessions(sessions: &[Session]) -> Links {
         let (Some(ident), Some(host)) = (&session.ident, &session.host) else {
             continue;
         };
-        let mut nodes = Vec::with_capacity(session.nicks.len());
+        let tag = &session.tag;
+        let group = groups.get(&(tag.clone(), host.to_ascii_lowercase()));
+        let mut nodes = Vec::with_capacity(session.nicks.len() + 1);
         for nick in &session.nicks {
             let nick = nick.to_lowercase();
-            let key = (
-                session.tag.clone(),
-                nick.clone(),
-                ident.clone(),
-                host.clone(),
-            );
-            nodes.push(links.node(&mut index, key));
+            let key = (tag.clone(), nick.clone(), ident.clone(), host.clone());
+            nodes.push(links.node(&mut index, key, true));
+            // In a group whose idents do not identify people, the same nick
+            // and ident still link across the group's hosts.
+            if let Some(group) = group.filter(|group| !group.ident_is_user) {
+                let key = (
+                    tag.clone(),
+                    nick.clone(),
+                    ident.clone(),
+                    group_host(group.id),
+                );
+                nodes.push(links.node(&mut index, key, false));
+            }
             with_host
-                .entry((session.tag.clone(), nick))
+                .entry((tag.clone(), nick))
                 .or_default()
                 .push((session.start, i));
+        }
+        // In a group whose idents identify people, the ident links across
+        // the group's hosts whatever the nick.
+        if let Some(group) = group.filter(|group| group.ident_is_user) {
+            let key = (
+                tag.clone(),
+                String::new(),
+                ident.clone(),
+                group_host(group.id),
+            );
+            nodes.push(links.node(&mut index, key, false));
         }
         slots[i] = Some(Link::Host(links.union_all(&nodes)));
     }
@@ -612,6 +802,23 @@ fn link_sessions(sessions: &[Session]) -> Links {
     // Sessions without a host.
     for (i, session) in sessions.iter().enumerate() {
         if slots[i].is_some() {
+            continue;
+        }
+        if let Some(cut) = session.cut {
+            let nodes: Vec<usize> = session
+                .nicks
+                .iter()
+                .map(|nick| {
+                    let key = (
+                        session.tag.clone(),
+                        nick.to_lowercase(),
+                        String::new(),
+                        cut_host(cut),
+                    );
+                    links.node(&mut index, key, true)
+                })
+                .collect();
+            slots[i] = Some(Link::Cut(links.union_all(&nodes)));
             continue;
         }
         let nearest = session.nicks.iter().find_map(|nick| {
@@ -637,7 +844,7 @@ fn link_sessions(sessions: &[Session]) -> Links {
                             String::new(),
                             String::new(),
                         );
-                        links.node(&mut index, key)
+                        links.node(&mut index, key, true)
                     })
                     .collect();
                 Link::NickOnly(links.union_all(&nodes))
@@ -733,7 +940,9 @@ fn assign_ids(
          VALUES (?1, ?2, ?3, ?4, ?5)",
     )?;
     for (node, (tag, nick, ident, host)) in links.keys.iter().enumerate() {
-        insert.execute(params![tag, nick, ident, host, ids[&links.root(node)]])?;
+        if links.stored[node] {
+            insert.execute(params![tag, nick, ident, host, ids[&links.root(node)]])?;
+        }
     }
     Ok(ids)
 }
@@ -1054,5 +1263,142 @@ mod tests {
             )
             .unwrap();
         assert_eq!(merged_into, before[0]);
+    }
+
+    fn add_group(conn: &Connection, ident_is_user: bool, hosts: &[&str]) {
+        conn.execute(
+            "INSERT INTO host_groups (tag, name, kind, ident_is_user)
+             VALUES ('wetfish', 'matrix', 'bridge', ?1)",
+            params![ident_is_user],
+        )
+        .unwrap();
+        let group = conn.last_insert_rowid();
+        for host in hosts {
+            conn.execute(
+                "INSERT INTO host_group_members (group_id, tag, host) VALUES (?1, 'wetfish', ?2)",
+                params![group, host],
+            )
+            .unwrap();
+        }
+    }
+
+    const BRIDGE_LOG: &str = "--- Log opened Sun Nov 01 01:00:00 2026\n\
+                              01:00 -!- marlowe [marlowewet@old.bridge] has joined #analysis\n\
+                              01:05 -!- marlowe [marlowewet@old.bridge] has quit [bye]\n\
+                              02:00 -!- marlowe_m [marlowewet@new.bridge] has joined #analysis\n\
+                              02:01 -!- marlowe [marlowewet@new.bridge] has joined #analysis\n\
+                              02:05 -!- quokka [quokkawet@new.bridge] has joined #analysis\n";
+
+    #[test]
+    fn a_bridge_group_links_sessions_by_ident_across_its_hosts() {
+        let root = TempDir::new("id-bridge");
+        let (mut conn, summary) = build(&root, &[("#analysis.log", BRIDGE_LOG)]);
+        assert_eq!(summary.identities, 4, "without a group nothing links");
+
+        // Host names are matched ignoring case.
+        add_group(&conn, true, &["old.bridge", "NEW.BRIDGE"]);
+        let summary = rebuild(&mut conn).unwrap();
+        let ids = identity_ids(&conn);
+        assert_eq!(ids[0], ids[1], "another nick with the same ident");
+        assert_eq!(
+            ids[0], ids[2],
+            "same nick and ident on another host of the group"
+        );
+        assert_ne!(ids[0], ids[3], "another ident is another person");
+        assert_eq!(summary.identities, 2);
+
+        // Only real nick and ident@host combinations are stored.
+        let stand_ins: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM identity_keys WHERE host LIKE '#%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stand_ins, 0);
+    }
+
+    #[test]
+    fn a_group_without_ident_users_links_only_the_same_nick() {
+        let root = TempDir::new("id-bouncer");
+        let (mut conn, _) = build(&root, &[("#analysis.log", BRIDGE_LOG)]);
+        add_group(&conn, false, &["old.bridge", "new.bridge"]);
+        rebuild(&mut conn).unwrap();
+
+        let ids = identity_ids(&conn);
+        assert_eq!(
+            ids[0], ids[2],
+            "same nick and ident on another host of the group"
+        );
+        assert_ne!(
+            ids[0], ids[1],
+            "another nick with the same ident stays apart"
+        );
+    }
+
+    #[test]
+    fn a_cut_ends_the_session_and_starts_one_linked_to_nothing_else() {
+        let root = TempDir::new("id-cut");
+        let log = format!(
+            "{OPEN}\
+             01:00 -!- quokka [quokkawet@hostQ] has joined #dryfish\n\
+             01:01 <quokka> hi\n\
+             01:02 -!- quokka is now known as rachelaway\n\
+             01:03 <rachelaway> borrowing a friend's computer\n\
+             01:04 -!- rachelaway is now known as rachel\n\
+             01:05 -!- rachel [quokkawet@hostQ] has quit [bye]\n\
+             02:00 -!- quokka [quokkawet@hostQ] has joined #dryfish\n"
+        );
+        let (mut conn, _) = build(&root, &[("#dryfish.log", log.as_str())]);
+        let path: String = conn
+            .query_row("SELECT path FROM files", [], |row| row.get(0))
+            .unwrap();
+        conn.execute(
+            "INSERT INTO session_cuts (path, line, expected)
+             VALUES (?1, 4, 'quokka is now known as rachelaway')",
+            params![path],
+        )
+        .unwrap();
+
+        let summary = rebuild(&mut conn).unwrap();
+        assert_eq!((summary.cuts_applied, summary.cuts_stale), (1, 0));
+        assert_eq!(
+            sessions(&conn),
+            [
+                "quokka quokkawet@hostQ 2026-11-01 01:00 2026-11-01 01:02 cut 1 host 0",
+                "rachelaway rachel - 2026-11-01 01:02 2026-11-01 01:05 quit 1 cut 0",
+                "quokka quokkawet@hostQ 2026-11-01 02:00 2026-11-01 02:00 end_of_log 0 host 0",
+            ]
+        );
+        let ids = identity_ids(&conn);
+        assert_ne!(ids[0], ids[1]);
+        assert_eq!(ids[0], ids[2]);
+
+        // A rebuild keeps the cut's identity id.
+        rebuild(&mut conn).unwrap();
+        assert_eq!(identity_ids(&conn), ids);
+
+        // A cut whose line no longer holds its nick change is stale.
+        conn.execute(
+            "UPDATE session_cuts SET expected = 'someone else is now known as rachelaway'",
+            [],
+        )
+        .unwrap();
+        let summary = rebuild(&mut conn).unwrap();
+        assert_eq!((summary.cuts_applied, summary.cuts_stale), (0, 1));
+        assert_eq!(sessions(&conn).len(), 2);
+    }
+
+    #[test]
+    fn describes_nick_change_lines() {
+        assert_eq!(
+            nick_change_text("nick_change", Some("quokka"), Some("rachel")).as_deref(),
+            Some("quokka is now known as rachel")
+        );
+        assert_eq!(
+            nick_change_text("own_nick_change", None, Some("rachel_")).as_deref(),
+            Some("You're now known as rachel_")
+        );
+        assert_eq!(nick_change_text("join", Some("quokka"), None), None);
     }
 }

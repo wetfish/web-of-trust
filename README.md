@@ -11,9 +11,9 @@ Early development. `wot analyze` currently finds the log files in one or more
 irssi log folders, imports every line into a SQLite database, groups the lines
 into sessions and identities, and prints an inventory grouped by network tag
 and channel, the day by day activity of one channel, or the identities behind a
-nick, ident or host. Manual corrections to identities, and a trust score based
-on how long people are present compared with how much they contribute, come
-next.
+nick, ident, host or person. `wot hosts`, `wot people` and `wot cuts` record
+decisions about who is who. A trust score based on how long people are present
+compared with how much they contribute comes next.
 
 ## Requirements
 
@@ -59,14 +59,26 @@ the start of a word as a comment:
 wot analyze ~/irclogs --channel '#wetfish'
 ```
 
-To see the identities behind a nick, ident or host, use `--nick`, `--ident` or
-`--host`, see [Identity views](#identity-views). `*` matches any characters,
-so quote patterns that use it:
+To see the identities behind a nick, ident, host or person, use `--nick`,
+`--ident`, `--host` or `--person`, see [Identity views](#identity-views). `*`
+matches any characters in the first three, so quote patterns that use it:
 
 ```bash
 wot analyze ~/irclogs --nick rachel
 wot analyze ~/irclogs --host 'Fish-*.chat'
 wot analyze ~/irclogs --ident quokkawet --host bridge.example.net
+wot analyze ~/irclogs --person rachel
+```
+
+Once the logs are imported, record who is who with `wot hosts`, `wot people`
+and `wot cuts`, see [Decisions](#decisions). These work on the database
+alone and need no log folders:
+
+```bash
+wot hosts add-group matrix --kind bridge
+wot hosts add matrix bridge.example.net old-bridge.example.net
+wot people create rachel 1a2b3c4d5e6f 9f8e7d6c5b4a
+wot cuts add 'wetfish/#dryfish.log:2050' --note "rachel on a friend's computer"
 ```
 
 Each run imports the logs into the database first, see [Database](#database).
@@ -303,9 +315,16 @@ does not appear in that stretch of the log at all.
   show hosts.
 - **`nick_only`:** a nick that never appears with a host gets an identity of
   its own.
+- **`cut`:** a session started by a [cut](#cuts). It keeps no host and is
+  linked to nothing else.
 
-Nothing else links sessions. The same nick from a different host, and
-different nicks from the same `ident@host`, stay separate identities.
+[Host groups](#host-groups) change the `host` rule: hosts in one group count
+as one host, and in a group whose ident identifies the person, sessions with
+the same ident anywhere in the group are linked whatever their nick.
+
+Nothing else links sessions. Otherwise the same nick from a different host,
+and different nicks from the same `ident@host`, stay separate identities.
+[People](#people) join identities without changing them.
 
 Identity ids are 12 random hexadecimal characters. `identity_keys` records
 which nick and `ident@host` combinations belong to which id, so ids stay the
@@ -323,22 +342,26 @@ are not comparable.
 the inventory. Matching ignores case and `*` matches any characters. Given
 together, they must all match the same nick and `ident@host` combination, so
 `--ident quokkawet --host bridge.example.net` finds whoever used that ident on
-that host. They cannot be combined with `--channel`.
+that host. `--person` shows the identities of a person, and combines with the
+others. None of them can be combined with `--channel`.
 
 The report starts with a table of the matching identities, most recently seen
-first: their nicks, how many `ident@host` combinations they used, sessions,
+first: their person, nicks, how many `ident@host` combinations they used, sessions,
 channel time, spoken lines, and first and last seen. Channel time adds up the
 time in each channel, so time spent in two channels at once counts twice.
 Private messages add no time.
 
 When 10 or fewer identities match, each one follows in full:
 
+- **Person:** who the identity belongs to, if anyone. Two names mean
+  identities added to different people were merged by a rebuild since, which
+  needs sorting out.
 - **Totals:** sessions by how they were linked, sessions as the logging
   client, and the date range, channel time and spoken lines.
 - **Nicks:** each nick with its sessions and first and last seen.
 - **Connections:** each `ident@host` with how its sessions were linked
-  (`nick and host`), plus sessions without a host, as `inferred` or
-  `nick only`.
+  (`nick and host`), plus sessions without a host, as `inferred`,
+  `nick only` or `cut`.
 - **Channels and private messages:** sessions, time, spoken lines and last
   seen for each.
 - **Nick changes:** the sessions that changed nick, which is what links
@@ -354,7 +377,8 @@ the lines behind any link.
 `identities`: `id`, `tag`, `created_at` (UTC) and `merged_into`.
 
 `identity_keys`: `tag`, `nick` (lowercased), `ident` and `host` (both empty for
-nick-only keys), and `identity_id`.
+nick-only keys), and `identity_id`. Sessions started by a cut have an empty
+`ident` and a `host` of `#cut:` and the cut's id.
 
 `sessions`:
 
@@ -362,7 +386,7 @@ nick-only keys), and `identity_id`.
 | --- | --- |
 | `file_id` | The log file |
 | `identity_id` | The identity |
-| `link` | `host`, `inferred` or `nick_only` |
+| `link` | `host`, `inferred`, `nick_only` or `cut` |
 | `inferred_from` | For inferred sessions, the session they were attributed from |
 | `nicks` | Nicks used, space separated, in order |
 | `ident`, `host` | From the session's join, part or quit line, if any |
@@ -370,7 +394,102 @@ nick-only keys), and `identity_id`.
 | `start_line` | The join line, or the line where the nick first appeared |
 | `joined` | 1 when the session started with a join line |
 | `end_line` | The line that ended the session, if one did |
-| `end_reason` | `part`, `quit`, `kick`, `log_closed`, `log_reopened`, `rejoined`, `nick_taken` or `end_of_log` |
+| `end_reason` | `part`, `quit`, `kick`, `log_closed`, `log_reopened`, `rejoined`, `nick_taken`, `cut` or `end_of_log` |
 | `minutes` | Time present |
 | `spoken` | Messages and actions |
 | `logger` | 1 for the logging client's own session |
+
+## Decisions
+
+Identities are built from what the logs show. Decisions record what only a
+person can know: which hosts are one bridge or bouncer, who is behind which
+identities, and when someone else was at the keyboard. They live in their own
+tables, which rebuilds and imports never change, so they last as long as the
+database. Deleting `wot.sqlite` deletes them too.
+
+Decisions refer to things the logs have shown, so import the logs first. Each
+command takes `--db FILE` like `wot analyze`.
+
+### Host groups
+
+A host group says that several hosts are one bridge or bouncer, for example a
+Matrix bridge that has moved between servers. Hosts are added exactly as they
+appear in the logs, ignoring case, with no wildcards, and each host can be in
+one group only.
+
+```bash
+wot hosts add-group matrix --kind bridge --note "Matrix bridge"
+wot hosts add matrix bridge.example.net old-bridge.example.net
+wot hosts add-group znc --kind bouncer --no-ident-user
+wot hosts edit-group znc --ident-is-user true
+wot hosts remove old-bridge.example.net
+wot hosts remove-group znc
+wot hosts list
+```
+
+The kind is `bridge` or `bouncer`. Bridges and bouncers usually give each
+person their own ident, so by default the ident identifies the person on a
+group's hosts: sessions with the same ident anywhere in the group are linked,
+whatever their nick. `--no-ident-user`, or `edit-group --ident-is-user false`,
+turns this off for a group whose idents are shared, such as a bouncer that
+gives everyone the same ident. Its hosts still count as one host, so the same
+nick and ident are linked across them.
+
+`wot hosts add` refuses a host that has not been seen in the logs, to catch
+typos. When logs from several network tags are imported, choose the tag with
+`--tag`. Changes rebuild identities straight away.
+
+### People
+
+A person is a human behind one or more identities, named as you like. A
+person can hold identities from any network tag, and each identity belongs to
+at most one person. Identity ids come from the identity views of
+`wot analyze`.
+
+```bash
+wot people create rachel 1a2b3c4d5e6f 9f8e7d6c5b4a --note "the logs' owner"
+wot people add rachel 0a1b2c3d4e5f
+wot people remove 0a1b2c3d4e5f
+wot people delete rachel
+wot people list
+```
+
+People do not change identities, so nothing is rebuilt. When a rebuild merges
+an identity into another, its person follows it. If that puts one identity in
+two people, the identity views show both names as a conflict.
+
+### Cuts
+
+A cut marks a nick change made by someone else at the keyboard, such as
+someone using a friend's computer. The session ends at the nick change, and
+the new nick starts a session that keeps no host and is linked to nothing
+else, so the two people stay apart. Add the session after the cut to a person
+if you know who it was.
+
+```bash
+wot cuts add 'wetfish/#dryfish.log:2050' --note "rachel on a friend's computer"
+wot cuts list
+wot cuts remove 1
+```
+
+The line is given as `tag/target.log:LINE`, or as the full path of the log
+file and `:LINE` when the same file name is in more than one log folder. Line
+numbers are shown in the nick changes of the identity views. The line must be
+a nick change. A cut stores the nick change it was made on; if the file is
+replaced and that line no longer holds it, the cut is stale and not applied,
+and `wot cuts list` says so. Changes rebuild identities straight away.
+
+### Decision tables
+
+`host_groups`: `id`, `tag`, `name`, `kind` (`bridge` or `bouncer`),
+`ident_is_user` (1 when the ident identifies the person), `note` and
+`created_at`.
+
+`host_group_members`: `group_id`, `tag`, `host`, `note` and `created_at`.
+
+`people`: `id`, `name`, `note` and `created_at`.
+
+`person_identities`: `identity_id`, `person_id`, `note` and `created_at`.
+
+`session_cuts`: `id`, `path` (the log file), `line`, `expected` (the nick
+change on that line), `note` and `created_at`.

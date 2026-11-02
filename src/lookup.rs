@@ -1,25 +1,33 @@
-//! Finds identities by nick, ident or host, and loads their sessions for the
-//! identity views of `wot analyze`.
+//! Finds identities by nick, ident, host or person, and loads their sessions
+//! for the identity views of `wot analyze`. Also follows identity merges, so
+//! that people keep their identities when a rebuild merges them.
 
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 
 use rusqlite::{Connection, params};
 
 use crate::db::Result;
 
-/// What to look up. Each part may use `*` to match any characters, and
-/// matching ignores case. An identity matches when one of its nick and
-/// `ident@host` combinations matches every part given.
+/// What to look up. `nick`, `ident` and `host` may use `*` to match any
+/// characters, and matching ignores case. An identity matches when one of its
+/// nick and `ident@host` combinations matches every one of those given, and
+/// it belongs to `person` if that is given.
 #[derive(Default)]
 pub struct Filter {
     pub nick: Option<String>,
     pub ident: Option<String>,
     pub host: Option<String>,
+    pub person: Option<String>,
 }
 
 impl Filter {
     pub fn is_empty(&self) -> bool {
-        self.nick.is_none() && self.ident.is_none() && self.host.is_none()
+        self.nick.is_none() && self.ident.is_none() && self.host.is_none() && self.person.is_none()
+    }
+
+    fn matches_keys(&self) -> bool {
+        self.nick.is_some() || self.ident.is_some() || self.host.is_some()
     }
 
     /// The filter in words, such as `nick "rachel", host "Fish-*"`.
@@ -29,6 +37,7 @@ impl Filter {
             ("nick", &self.nick),
             ("ident", &self.ident),
             ("host", &self.host),
+            ("person", &self.person),
         ] {
             if let Some(value) = value {
                 parts.push(format!("{name} \"{value}\""));
@@ -43,7 +52,7 @@ pub struct SessionRow {
     pub nicks: Vec<String>,
     pub ident: Option<String>,
     pub host: Option<String>,
-    /// `host`, `inferred` or `nick_only`.
+    /// `host`, `inferred`, `nick_only` or `cut`.
     pub link: String,
     /// `YYYY-MM-DD HH:MM`.
     pub start_at: String,
@@ -67,6 +76,9 @@ pub struct SessionRow {
 pub struct IdentityView {
     pub id: String,
     pub tag: String,
+    /// The people this identity belongs to. More than one means identities
+    /// added to different people were merged by a rebuild since.
+    pub people: Vec<String>,
     /// In order of when they started.
     pub sessions: Vec<SessionRow>,
 }
@@ -82,15 +94,64 @@ impl IdentityView {
     }
 }
 
+/// Which identity each merged identity was merged into.
+pub fn merges(conn: &Connection) -> Result<HashMap<String, String>> {
+    let mut stmt =
+        conn.prepare("SELECT id, merged_into FROM identities WHERE merged_into IS NOT NULL")?;
+    let rows = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(rows)
+}
+
+/// The identity an id stands for now, following merges.
+pub fn current_id(merges: &HashMap<String, String>, id: &str) -> String {
+    let mut id: &str = id;
+    // A merge chain is short; the limit only guards against a loop.
+    for _ in 0..100 {
+        match merges.get(id) {
+            Some(next) => id = next.as_str(),
+            None => break,
+        }
+    }
+    id.to_string()
+}
+
+/// The people each current identity belongs to, sorted by name.
+pub fn people_by_identity(
+    conn: &Connection,
+    merges: &HashMap<String, String>,
+) -> Result<HashMap<String, Vec<String>>> {
+    let mut stmt = conn.prepare(
+        "SELECT pi.identity_id, p.name
+         FROM person_identities pi JOIN people p ON p.id = pi.person_id
+         ORDER BY p.name",
+    )?;
+    let rows: Vec<(String, String)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut people: HashMap<String, Vec<String>> = HashMap::new();
+    for (id, name) in rows {
+        let names = people.entry(current_id(merges, &id)).or_default();
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    Ok(people)
+}
+
 /// The identities matching the filter, most recently seen first.
 pub fn find(conn: &Connection, filter: &Filter) -> Result<Vec<IdentityView>> {
-    let ids: Vec<(String, String)> = {
+    let merges = merges(conn)?;
+    let people = people_by_identity(conn, &merges)?;
+
+    let mut ids: Option<Vec<String>> = None;
+    if filter.matches_keys() {
         let mut stmt = conn.prepare(
-            r"SELECT DISTINCT k.identity_id, i.tag
-              FROM identity_keys k JOIN identities i ON i.id = k.identity_id
-              WHERE (?1 IS NULL OR k.nick LIKE ?1 ESCAPE '\')
-                AND (?2 IS NULL OR k.ident LIKE ?2 ESCAPE '\')
-                AND (?3 IS NULL OR k.host LIKE ?3 ESCAPE '\')",
+            r"SELECT DISTINCT identity_id FROM identity_keys
+              WHERE (?1 IS NULL OR nick LIKE ?1 ESCAPE '\')
+                AND (?2 IS NULL OR ident LIKE ?2 ESCAPE '\')
+                AND (?3 IS NULL OR host LIKE ?3 ESCAPE '\')",
         )?;
         let rows = stmt
             .query_map(
@@ -102,12 +163,28 @@ pub fn find(conn: &Connection, filter: &Filter) -> Result<Vec<IdentityView>> {
                     filter.ident.as_deref().map(like_pattern),
                     filter.host.as_deref().map(like_pattern),
                 ],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| row.get(0),
             )?
             .collect::<rusqlite::Result<_>>()?;
-        rows
-    };
+        ids = Some(rows);
+    }
+    if let Some(person) = &filter.person {
+        let of_person: HashSet<&String> = people
+            .iter()
+            .filter(|(_, names)| names.iter().any(|name| name.eq_ignore_ascii_case(person)))
+            .map(|(id, _)| id)
+            .collect();
+        ids = Some(match ids {
+            Some(ids) => ids
+                .into_iter()
+                .filter(|id| of_person.contains(id))
+                .collect(),
+            None => of_person.into_iter().cloned().collect(),
+        });
+    }
+    let ids = ids.unwrap_or_default();
 
+    let mut tag_of = conn.prepare("SELECT tag FROM identities WHERE id = ?1")?;
     let mut stmt = conn.prepare(
         "SELECT s.nicks, s.ident, s.host, s.link, s.start_at, s.end_at, s.minutes, s.spoken,
                 s.logger, f.kind, f.tag, f.target, s.start_line, s.end_line,
@@ -121,7 +198,8 @@ pub fn find(conn: &Connection, filter: &Filter) -> Result<Vec<IdentityView>> {
     )?;
 
     let mut views = Vec::with_capacity(ids.len());
-    for (id, tag) in ids {
+    for id in ids {
+        let tag: String = tag_of.query_row(params![id], |row| row.get(0))?;
         let sessions = stmt
             .query_map(params![id], |row| {
                 let nicks: String = row.get(0)?;
@@ -157,7 +235,13 @@ pub fn find(conn: &Connection, filter: &Filter) -> Result<Vec<IdentityView>> {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         if !sessions.is_empty() {
-            views.push(IdentityView { id, tag, sessions });
+            let people = people.get(&id).cloned().unwrap_or_default();
+            views.push(IdentityView {
+                id,
+                tag,
+                people,
+                sessions,
+            });
         }
     }
 
@@ -271,5 +355,47 @@ mod tests {
             .map(|session| session.inferred_from.as_deref())
             .collect();
         assert_eq!(inferred, [None, Some("wetfish/#analysis.log:2")]);
+
+        // A person holds identities, including one merged since it was added.
+        let rachel_id = rachel[0].id.clone();
+        conn.execute_batch(&format!(
+            "INSERT INTO identities (id, tag, merged_into) VALUES ('0ld1d', 'wetfish', '{rachel_id}');
+             INSERT INTO people (name) VALUES ('rachel');
+             INSERT INTO person_identities (identity_id, person_id) VALUES ('0ld1d', 1);"
+        ))
+        .unwrap();
+        let found = find(
+            &conn,
+            &Filter {
+                person: Some("RACHEL".into()),
+                ..Filter::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, rachel_id);
+        assert_eq!(found[0].people, ["rachel"]);
+
+        // Combined with a nick that is not the person's, nothing matches.
+        let none = find(
+            &conn,
+            &Filter {
+                nick: Some("quokka".into()),
+                person: Some("rachel".into()),
+                ..Filter::default()
+            },
+        )
+        .unwrap();
+        assert!(none.is_empty());
+    }
+
+    #[test]
+    fn follows_merge_chains() {
+        let merges: HashMap<String, String> = [("a", "b"), ("b", "c")]
+            .into_iter()
+            .map(|(from, to)| (from.to_string(), to.to_string()))
+            .collect();
+        assert_eq!(current_id(&merges, "a"), "c");
+        assert_eq!(current_id(&merges, "c"), "c");
     }
 }
