@@ -235,9 +235,10 @@ empty for `unparsed` lines.
 
 After importing, `wot analyze` groups the events into sessions and the
 sessions into identities, one per person as far as the logs can tell. This is
-rebuilt from the events whenever the import added or replaced anything, and
-the first time a database is used. Progress and a summary go to standard
-error:
+rebuilt from the events whenever the import added or replaced anything, the
+first time a database is used, and when `--rebuild` is given. Use `--rebuild`
+after upgrading `wot`, since a new version may group sessions differently.
+Progress and a summary go to standard error:
 
 ```text
 Building sessions and identities...
@@ -260,9 +261,18 @@ what a trust score needs.
   file.
 - A nick change continues the same session under the new nick.
 - Netsplits do not end sessions, since the same connections come back.
-- irssi writes `#channel: Total of N nicks` right after the logging client's
-  own join, which marks the logger's session. `You're now known as` lines then
-  rename it.
+- The logging client's own session is recognized from two `Irssi:` lines that
+  irssi writes after its own join:
+  1. `#channel: Total of N nicks` on the very next line, within a minute, as
+     soon as the server's names list arrives. irssi also writes this for
+     `/names` at any time, so on its own it is not enough.
+  2. `Join to #channel was synced in N secs`, once irssi has finished querying
+     the channel. `/names` never writes this. The join must have been about N
+     seconds before this line, within a minute.
+
+  `You're now known as` lines rename the logger's session, and nothing else.
+  irssi only writes the sync line while its `channel_sync` setting is on,
+  which is the default. With it off, no session is marked as the logger's.
 
 Only join, part and quit lines show `ident@host`, so a session learns its host
 from its join line, or from its part or quit line when it had no join.

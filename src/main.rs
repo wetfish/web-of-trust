@@ -39,16 +39,26 @@ enum Command {
         /// SQLite database to import into. It is created if it does not exist.
         #[arg(long, value_name = "FILE", default_value = DEFAULT_DB)]
         db: PathBuf,
+
+        /// Rebuild sessions and identities even when no log file changed,
+        /// for example after upgrading wot to a version with new rules
+        #[arg(long)]
+        rebuild: bool,
     },
 }
 
 fn main() -> ExitCode {
     match Cli::parse().command {
-        Command::Analyze { roots, channel, db } => analyze(&roots, channel.as_deref(), &db),
+        Command::Analyze {
+            roots,
+            channel,
+            db,
+            rebuild,
+        } => analyze(&roots, channel.as_deref(), &db, rebuild),
     }
 }
 
-fn analyze(roots: &[PathBuf], channel: Option<&str>, db_path: &Path) -> ExitCode {
+fn analyze(roots: &[PathBuf], channel: Option<&str>, db_path: &Path, force: bool) -> ExitCode {
     let inventory = match discover::discover(roots) {
         Ok(inventory) => inventory,
         Err(err) => {
@@ -70,7 +80,7 @@ fn analyze(roots: &[PathBuf], channel: Option<&str>, db_path: &Path) -> ExitCode
 
     let changed = summary.new_files + summary.grown_files + summary.replaced_files > 0;
     let rebuild = match identity::is_built(&conn) {
-        Ok(built) => changed || !built,
+        Ok(built) => force || changed || !built,
         Err(err) => {
             eprintln!("error: reading identities: {err}");
             return ExitCode::FAILURE;

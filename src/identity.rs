@@ -25,7 +25,7 @@
 
 use std::collections::HashMap;
 
-use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
+use chrono::{NaiveDate, NaiveDateTime, NaiveTime, TimeDelta};
 use rusqlite::{Connection, params};
 
 use crate::db::Result;
@@ -167,6 +167,7 @@ struct Row {
     host: Option<String>,
     other_nick: Option<String>,
     text: Option<String>,
+    detail: Option<String>,
 }
 
 /// Replays every file's events in line order and returns their sessions.
@@ -180,7 +181,7 @@ fn replay_events(conn: &Connection) -> Result<Vec<Session>> {
     };
 
     let mut stmt = conn.prepare(&format!(
-        "SELECT file_id, line, date, time, kind, nick, ident, host, other_nick, text
+        "SELECT file_id, line, date, time, kind, nick, ident, host, other_nick, text, detail
          FROM events
          WHERE kind IN ({SESSION_KINDS}) AND date IS NOT NULL AND time IS NOT NULL
          ORDER BY file_id, line"
@@ -205,6 +206,7 @@ fn replay_events(conn: &Connection) -> Result<Vec<Session>> {
             host: row.get(7)?,
             other_nick: row.get(8)?,
             text: row.get(9)?,
+            detail: row.get(10)?,
         };
 
         if replay.as_ref().is_none_or(|r| r.file_id != event.file_id) {
@@ -243,8 +245,21 @@ struct FileReplay {
     visible_since: Option<NaiveDateTime>,
     /// The time of the previous event.
     last_seen: Option<NaiveDateTime>,
-    /// The lowercased nick of the most recent join.
-    last_join: Option<String>,
+    /// The most recent join, kept to recognize the logging client's own.
+    last_join: Option<RecentJoin>,
+    /// A join followed by irssi's names line, waiting for irssi's sync line
+    /// to confirm it was the logging client's own.
+    candidate: Option<RecentJoin>,
+    /// The logging client's own session, once recognized.
+    own: Option<usize>,
+}
+
+struct RecentJoin {
+    line: i64,
+    at: NaiveDateTime,
+    session: usize,
+    /// Lowercased.
+    channel: String,
 }
 
 impl FileReplay {
@@ -256,6 +271,8 @@ impl FileReplay {
             visible_since: None,
             last_seen: None,
             last_join: None,
+            candidate: None,
+            own: None,
         }
     }
 
@@ -276,7 +293,12 @@ impl FileReplay {
                 }
                 let index = self.start(sessions, nick, event, true);
                 learn_host(&mut sessions[index], event);
-                self.last_join = Some(nick.to_lowercase());
+                self.last_join = Some(RecentJoin {
+                    line: event.line,
+                    at: event.at,
+                    session: index,
+                    channel: event.detail.as_deref().unwrap_or_default().to_lowercase(),
+                });
             }
             "message" | "action" => {
                 let index = self.session_for(sessions, nick, event);
@@ -299,30 +321,74 @@ impl FileReplay {
                 self.rename(sessions, index, nick, new, event);
             }
             "own_nick_change" => {
+                // Only the logging client's own session is renamed, and only
+                // while it is still open.
                 let new = event.other_nick.as_deref().unwrap_or_default();
-                let own = self
-                    .open
-                    .iter()
-                    .find(|&(_, &index)| sessions[index].logger)
-                    .map(|(old, &index)| (old.clone(), index));
-                if let Some((old, index)) = own {
-                    self.rename(sessions, index, &old, new, event);
+                if let Some(index) = self.own {
+                    let current = sessions[index].nicks.last().map(|nick| nick.to_lowercase());
+                    if let Some(current) = current {
+                        if self.open.get(&current) == Some(&index) {
+                            self.rename(sessions, index, &current, new, event);
+                        }
+                    }
                 }
             }
             "client" => {
-                // irssi writes "#channel: Total of N nicks ..." right after
-                // the logging client's own join.
-                let text = event.text.as_deref().unwrap_or_default();
-                if text.contains(": Total of ") {
-                    let own = self.last_join.as_ref().and_then(|nick| self.open.get(nick));
-                    if let Some(&index) = own {
-                        sessions[index].logger = true;
-                    }
-                }
+                let text = event.text.as_deref().unwrap_or_default().to_lowercase();
+                self.recognize_own_join(&text, event, sessions);
             }
             _ => {}
         }
         self.last_seen = Some(event.at);
+    }
+
+    /// Recognizes the logging client's own join from two `Irssi:` lines that
+    /// irssi only writes for its own joins:
+    ///
+    /// 1. `#channel: Total of N nicks ...` on the line right after the join,
+    ///    within a minute, as soon as the server's names list arrives. irssi
+    ///    also writes this for `/names` at any time, so on its own it is only
+    ///    a candidate.
+    /// 2. `Join to #channel was synced in N secs`, once irssi has finished
+    ///    querying the channel. `/names` never writes this. The join must
+    ///    have happened about N seconds earlier, within a minute.
+    fn recognize_own_join(&mut self, text: &str, event: &Row, sessions: &mut [Session]) {
+        if let Some(join) = self.last_join.take() {
+            let total = format!("{}: total of ", join.channel);
+            let minutes = event.at.signed_duration_since(join.at).num_minutes();
+            if event.line == join.line + 1 && (0..=1).contains(&minutes) && text.starts_with(&total)
+            {
+                self.candidate = Some(join);
+                return;
+            }
+            self.last_join = Some(join);
+        }
+
+        let Some((channel, secs)) = parse_synced(text) else {
+            return;
+        };
+        let Some(join) = self.candidate.take() else {
+            return;
+        };
+        if join.channel != channel {
+            self.candidate = Some(join);
+            return;
+        }
+        let Some(joined_at) =
+            TimeDelta::try_seconds(secs).and_then(|secs| event.at.checked_sub_signed(secs))
+        else {
+            return;
+        };
+        let minutes = joined_at.signed_duration_since(join.at).num_minutes().abs();
+        let index = join.session;
+        let still_open = sessions[index]
+            .nicks
+            .last()
+            .is_some_and(|nick| self.open.get(&nick.to_lowercase()) == Some(&index));
+        if minutes <= 1 && still_open {
+            sessions[index].logger = true;
+            self.own = Some(index);
+        }
     }
 
     /// Closes the sessions still open when the file ends.
@@ -403,7 +469,18 @@ impl FileReplay {
             session.end_line = line;
             session.end_reason = reason;
         }
+        self.last_join = None;
+        self.candidate = None;
     }
+}
+
+/// Reads irssi's `Join to #channel was synced in N secs` line, lowercased,
+/// as the channel and N.
+fn parse_synced(text: &str) -> Option<(&str, i64)> {
+    let rest = text.strip_prefix("join to ")?;
+    let (channel, rest) = rest.split_once(" was synced in ")?;
+    let secs = rest.strip_suffix(" secs")?.parse().ok()?;
+    Some((channel, secs))
 }
 
 fn close(session: &mut Session, event: &Row, reason: &'static str) {
@@ -841,6 +918,7 @@ mod tests {
             "{OPEN}\
              01:00 -!- rachel [rachel@NETADMIN.VHOST] has joined #analysis\n\
              01:00 -!- Irssi: #analysis: Total of 1 nicks [1 ops, 0 halfops, 0 voices, 0 normal]\n\
+             01:00 -!- Irssi: Join to #analysis was synced in 0 secs\n\
              01:05 -!- You're now known as rachel_\n\
              01:06 <@rachel_> still me\n"
         );
@@ -850,6 +928,77 @@ mod tests {
             sessions(&conn),
             [
                 "rachel rachel_ rachel@NETADMIN.VHOST 2026-11-01 01:00 2026-11-01 01:06 end_of_log 1 host 1"
+            ]
+        );
+    }
+
+    #[test]
+    fn names_output_does_not_mark_someone_else_as_the_logger() {
+        let root = TempDir::new("id-names");
+        let log = format!(
+            "{OPEN}\
+             01:00 -!- rachel [rachel@hostR] has joined #analysis\n\
+             01:00 -!- Irssi: #analysis: Total of 1 nicks [1 ops, 0 halfops, 0 voices, 0 normal]\n\
+             01:00 -!- Irssi: Join to #analysis was synced in 0 secs\n\
+             01:05 -!- meleeman [meleemanwe@bridge] has joined #analysis\n\
+             01:05 < meleeman> hi\n\
+             01:06 -!- Irssi: #analysis: Total of 2 nicks [1 ops, 0 halfops, 0 voices, 1 normal]\n\
+             01:07 -!- You're now known as rachelhome\n\
+             01:08 <@rachelhome> still me\n"
+        );
+        let (conn, _) = build(&root, &[("#analysis.log", log.as_str())]);
+
+        assert_eq!(
+            sessions(&conn),
+            [
+                "rachel rachelhome rachel@hostR 2026-11-01 01:00 2026-11-01 01:08 end_of_log 1 host 1",
+                "meleeman meleemanwe@bridge 2026-11-01 01:05 2026-11-01 01:08 end_of_log 1 host 0",
+            ]
+        );
+    }
+
+    #[test]
+    fn names_hours_after_a_join_does_not_mark_the_joiner_as_the_logger() {
+        let root = TempDir::new("id-names-later");
+        let log = format!(
+            "{OPEN}\
+             01:00 -!- rachel [rachel@hostR] has joined #anime\n\
+             01:00 -!- Irssi: #anime: Total of 1 nicks [1 ops, 0 halfops, 0 voices, 0 normal]\n\
+             01:00 -!- Irssi: Join to #anime was synced in 1 secs\n\
+             14:06 -!- lao-tzu [lao-tzu@hostL] has joined #anime\n\
+             20:03 -!- Irssi: #anime: Total of 37 nicks [3 ops, 0 halfops, 0 voices, 34 normal]\n\
+             20:04 -!- You're now known as rachel_\n"
+        );
+        let (conn, _) = build(&root, &[("#anime.log", log.as_str())]);
+
+        assert_eq!(
+            sessions(&conn),
+            [
+                "rachel rachel_ rachel@hostR 2026-11-01 01:00 2026-11-01 20:04 end_of_log 0 host 1",
+                "lao-tzu lao-tzu@hostL 2026-11-01 14:06 2026-11-01 20:04 end_of_log 0 host 0",
+            ]
+        );
+    }
+
+    #[test]
+    fn names_in_the_same_minute_as_a_join_needs_irssis_sync_line() {
+        let root = TempDir::new("id-names-same-minute");
+        let log = format!(
+            "{OPEN}\
+             01:00 -!- rachel [rachel@hostR] has joined #botspam\n\
+             01:00 -!- Irssi: #botspam: Total of 1 nicks [1 ops, 0 halfops, 0 voices, 0 normal]\n\
+             01:00 -!- Irssi: Join to #botspam was synced in 0 secs\n\
+             21:48 -!- eevee [eevee@hostE] has joined #botspam\n\
+             21:48 -!- Irssi: #botspam: Total of 25 nicks [0 ops, 0 halfops, 0 voices, 25 normal]\n\
+             21:50 -!- You're now known as rachel_\n"
+        );
+        let (conn, _) = build(&root, &[("#botspam.log", log.as_str())]);
+
+        assert_eq!(
+            sessions(&conn),
+            [
+                "rachel rachel_ rachel@hostR 2026-11-01 01:00 2026-11-01 21:50 end_of_log 0 host 1",
+                "eevee eevee@hostE 2026-11-01 21:48 2026-11-01 21:50 end_of_log 0 host 0",
             ]
         );
     }
