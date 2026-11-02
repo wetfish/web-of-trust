@@ -2,6 +2,7 @@ mod db;
 mod discover;
 mod identity;
 mod irssi;
+mod lookup;
 mod report;
 mod scan;
 
@@ -10,6 +11,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
+
+use crate::lookup::Filter;
 
 /// The default database, in the repository folder. `.gitignore` excludes it.
 const DEFAULT_DB: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/wot.sqlite");
@@ -33,8 +36,23 @@ enum Command {
 
         /// Show day by day activity for this channel instead of the
         /// inventory. Quote it in the shell: --channel '#wetfish'
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["nick", "ident", "host"])]
         channel: Option<String>,
+
+        /// Show the identities that used this nick instead of the inventory.
+        /// `*` matches any characters; quote it in the shell: --nick 'rachel*'
+        #[arg(long)]
+        nick: Option<String>,
+
+        /// Show the identities that connected with this ident. Combines with
+        /// --nick and --host, and `*` matches any characters
+        #[arg(long)]
+        ident: Option<String>,
+
+        /// Show the identities that connected from this host. Combines with
+        /// --nick and --ident, and `*` matches any characters
+        #[arg(long)]
+        host: Option<String>,
 
         /// SQLite database to import into. It is created if it does not exist.
         #[arg(long, value_name = "FILE", default_value = DEFAULT_DB)]
@@ -52,13 +70,25 @@ fn main() -> ExitCode {
         Command::Analyze {
             roots,
             channel,
+            nick,
+            ident,
+            host,
             db,
             rebuild,
-        } => analyze(&roots, channel.as_deref(), &db, rebuild),
+        } => {
+            let filter = Filter { nick, ident, host };
+            analyze(&roots, channel.as_deref(), &filter, &db, rebuild)
+        }
     }
 }
 
-fn analyze(roots: &[PathBuf], channel: Option<&str>, db_path: &Path, force: bool) -> ExitCode {
+fn analyze(
+    roots: &[PathBuf],
+    channel: Option<&str>,
+    filter: &Filter,
+    db_path: &Path,
+    force: bool,
+) -> ExitCode {
     let inventory = match discover::discover(roots) {
         Ok(inventory) => inventory,
         Err(err) => {
@@ -100,18 +130,32 @@ fn analyze(roots: &[PathBuf], channel: Option<&str>, db_path: &Path, force: bool
     }
     eprintln!();
 
-    let scan = scan::scan(&inventory, channel);
-
     let mut out = io::BufWriter::new(io::stdout().lock());
-    let written = match (channel, &scan.activity) {
-        (Some(channel), Some(activity)) => {
-            if activity.files.is_empty() {
-                eprintln!("error: no log files found for {channel}");
+    let written = if !filter.is_empty() {
+        let views = match lookup::find(&conn, filter) {
+            Ok(views) => views,
+            Err(err) => {
+                eprintln!("error: looking up identities: {err}");
                 return ExitCode::FAILURE;
             }
-            report::daily_activity(&mut out, &inventory, channel, activity)
+        };
+        if views.is_empty() {
+            eprintln!("error: no identities match {}", filter.describe());
+            return ExitCode::FAILURE;
         }
-        _ => report::inventory(&mut out, &inventory, &scan),
+        report::identities(&mut out, filter, &views)
+    } else {
+        let scan = scan::scan(&inventory, channel);
+        match (channel, &scan.activity) {
+            (Some(channel), Some(activity)) => {
+                if activity.files.is_empty() {
+                    eprintln!("error: no log files found for {channel}");
+                    return ExitCode::FAILURE;
+                }
+                report::daily_activity(&mut out, &inventory, channel, activity)
+            }
+            _ => report::inventory(&mut out, &inventory, &scan),
+        }
     };
 
     match written.and_then(|()| out.flush()) {

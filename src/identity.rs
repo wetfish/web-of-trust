@@ -940,19 +940,19 @@ mod tests {
              01:00 -!- rachel [rachel@hostR] has joined #analysis\n\
              01:00 -!- Irssi: #analysis: Total of 1 nicks [1 ops, 0 halfops, 0 voices, 0 normal]\n\
              01:00 -!- Irssi: Join to #analysis was synced in 0 secs\n\
-             01:05 -!- meleeman [meleemanwe@bridge] has joined #analysis\n\
-             01:05 < meleeman> hi\n\
+             01:05 -!- marlowe [marlowewet@bridge] has joined #analysis\n\
+             01:05 < marlowe> hi\n\
              01:06 -!- Irssi: #analysis: Total of 2 nicks [1 ops, 0 halfops, 0 voices, 1 normal]\n\
-             01:07 -!- You're now known as rachelhome\n\
-             01:08 <@rachelhome> still me\n"
+             01:07 -!- You're now known as rachelaway\n\
+             01:08 <@rachelaway> still me\n"
         );
         let (conn, _) = build(&root, &[("#analysis.log", log.as_str())]);
 
         assert_eq!(
             sessions(&conn),
             [
-                "rachel rachelhome rachel@hostR 2026-11-01 01:00 2026-11-01 01:08 end_of_log 1 host 1",
-                "meleeman meleemanwe@bridge 2026-11-01 01:05 2026-11-01 01:08 end_of_log 1 host 0",
+                "rachel rachelaway rachel@hostR 2026-11-01 01:00 2026-11-01 01:08 end_of_log 1 host 1",
+                "marlowe marlowewet@bridge 2026-11-01 01:05 2026-11-01 01:08 end_of_log 1 host 0",
             ]
         );
     }
@@ -965,7 +965,7 @@ mod tests {
              01:00 -!- rachel [rachel@hostR] has joined #anime\n\
              01:00 -!- Irssi: #anime: Total of 1 nicks [1 ops, 0 halfops, 0 voices, 0 normal]\n\
              01:00 -!- Irssi: Join to #anime was synced in 1 secs\n\
-             14:06 -!- lao-tzu [lao-tzu@hostL] has joined #anime\n\
+             14:06 -!- tamsin [tamsin@hostL] has joined #anime\n\
              20:03 -!- Irssi: #anime: Total of 37 nicks [3 ops, 0 halfops, 0 voices, 34 normal]\n\
              20:04 -!- You're now known as rachel_\n"
         );
@@ -975,7 +975,7 @@ mod tests {
             sessions(&conn),
             [
                 "rachel rachel_ rachel@hostR 2026-11-01 01:00 2026-11-01 20:04 end_of_log 0 host 1",
-                "lao-tzu lao-tzu@hostL 2026-11-01 14:06 2026-11-01 20:04 end_of_log 0 host 0",
+                "tamsin tamsin@hostL 2026-11-01 14:06 2026-11-01 20:04 end_of_log 0 host 0",
             ]
         );
     }
@@ -988,7 +988,7 @@ mod tests {
              01:00 -!- rachel [rachel@hostR] has joined #botspam\n\
              01:00 -!- Irssi: #botspam: Total of 1 nicks [1 ops, 0 halfops, 0 voices, 0 normal]\n\
              01:00 -!- Irssi: Join to #botspam was synced in 0 secs\n\
-             21:48 -!- eevee [eevee@hostE] has joined #botspam\n\
+             21:48 -!- oriel [oriel@hostO] has joined #botspam\n\
              21:48 -!- Irssi: #botspam: Total of 25 nicks [0 ops, 0 halfops, 0 voices, 25 normal]\n\
              21:50 -!- You're now known as rachel_\n"
         );
@@ -998,7 +998,7 @@ mod tests {
             sessions(&conn),
             [
                 "rachel rachel_ rachel@hostR 2026-11-01 01:00 2026-11-01 21:50 end_of_log 0 host 1",
-                "eevee eevee@hostE 2026-11-01 21:48 2026-11-01 21:50 end_of_log 0 host 0",
+                "oriel oriel@hostO 2026-11-01 21:48 2026-11-01 21:50 end_of_log 0 host 0",
             ]
         );
     }

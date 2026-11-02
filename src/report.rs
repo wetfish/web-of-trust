@@ -9,6 +9,7 @@ use chrono::NaiveDate;
 use crate::db::ImportSummary;
 use crate::discover::{Inventory, LogFile, TargetKind};
 use crate::identity::RebuildSummary;
+use crate::lookup::{Filter, IdentityView, SessionRow};
 use crate::scan::{ChannelActivity, FileStats, Scan};
 
 /// A log file with the counts read from it.
@@ -290,6 +291,381 @@ pub fn identity_summary(out: &mut impl Write, summary: &RebuildSummary) -> io::R
     )
 }
 
+/// Identities are shown in full when at most this many match.
+const MAX_DETAILED: usize = 10;
+/// Examples of nick changes and inferred sessions shown per identity.
+const MAX_EXAMPLES: usize = 10;
+
+/// Lists the identities matching a lookup, most recently seen first, and
+/// shows each in full when only a few match.
+pub fn identities(out: &mut impl Write, filter: &Filter, views: &[IdentityView]) -> io::Result<()> {
+    heading(
+        out,
+        &format!("Identities matching {}", filter.describe()),
+        '=',
+    )?;
+    writeln!(
+        out,
+        "{}, most recently seen first. Channel time adds up time in each channel, so time \
+         in two channels at once counts twice. Private messages add no time.",
+        count_plural(views.len() as u64, "identity", "identities")
+    )?;
+    writeln!(out)?;
+
+    let rows: Vec<Vec<String>> = views
+        .iter()
+        .map(|view| {
+            let sessions = &view.sessions;
+            vec![
+                view.id.clone(),
+                nick_list(sessions, 4),
+                thousands(connections(sessions).len() as u64),
+                thousands(sessions.len() as u64),
+                duration(channel_minutes(sessions.iter())),
+                thousands(spoken(sessions.iter())),
+                day(&sessions[0].start_at).to_string(),
+                day(view.last_seen()).to_string(),
+            ]
+        })
+        .collect();
+    table(
+        out,
+        &[
+            "Identity",
+            "Nicks",
+            "Hosts",
+            "Sessions",
+            "Channel time",
+            "Spoken",
+            "First seen",
+            "Last seen",
+        ],
+        &rows,
+        &[false, false, true, true, true, true, false, false],
+    )?;
+
+    if views.len() > MAX_DETAILED {
+        writeln!(out)?;
+        writeln!(
+            out,
+            "Details are shown when {MAX_DETAILED} or fewer identities match. Narrow the \
+             search, for example by adding --nick, --ident or --host."
+        )?;
+        return Ok(());
+    }
+    for view in views {
+        writeln!(out)?;
+        identity_details(out, view)?;
+    }
+    Ok(())
+}
+
+fn identity_details(out: &mut impl Write, view: &IdentityView) -> io::Result<()> {
+    let sessions = &view.sessions;
+    heading(out, &format!("Identity {} ({})", view.id, view.tag), '-')?;
+
+    let linked = |link: &str| sessions.iter().filter(|s| s.link == link).count() as u64;
+    let logger = sessions.iter().filter(|s| s.logger).count() as u64;
+    let mut line = format!(
+        "{}: {} with a host, {} inferred, {} known by nick only",
+        count_u64(sessions.len() as u64, "session"),
+        thousands(linked("host")),
+        thousands(linked("inferred")),
+        thousands(linked("nick_only")),
+    );
+    if logger > 0 {
+        line.push_str(&format!(", {} as the logging client", thousands(logger)));
+    }
+    writeln!(out, "{line}")?;
+    writeln!(
+        out,
+        "Seen {} to {}, channel time {}, {}",
+        day(&sessions[0].start_at),
+        day(view.last_seen()),
+        duration(channel_minutes(sessions.iter())),
+        count_u64(spoken(sessions.iter()), "spoken line"),
+    )?;
+
+    // Nicks, by when they were last used.
+    let mut nicks: BTreeMap<String, (String, u64, &str, &str)> = BTreeMap::new();
+    for session in sessions {
+        for nick in &session.nicks {
+            let entry = nicks.entry(nick.to_lowercase()).or_insert((
+                nick.clone(),
+                0,
+                session.start_at.as_str(),
+                session.end_at.as_str(),
+            ));
+            entry.1 += 1;
+            entry.2 = entry.2.min(session.start_at.as_str());
+            entry.3 = entry.3.max(session.end_at.as_str());
+        }
+    }
+    let mut nicks: Vec<_> = nicks.into_values().collect();
+    nicks.sort_by(|a, b| b.3.cmp(a.3));
+    let rows: Vec<Vec<String>> = nicks
+        .iter()
+        .map(|(nick, count, first, last)| {
+            vec![
+                nick.clone(),
+                thousands(*count),
+                day(first).to_string(),
+                day(last).to_string(),
+            ]
+        })
+        .collect();
+    writeln!(out)?;
+    table(
+        out,
+        &["Nick", "Sessions", "First seen", "Last seen"],
+        &rows,
+        &[false, true, false, false],
+    )?;
+
+    // Connections: ident@host and how the sessions were linked.
+    let mut groups: BTreeMap<(String, &str), (u64, u64, &str, &str)> = BTreeMap::new();
+    for session in sessions {
+        let entry = groups
+            .entry((connection_label(session), session.link.as_str()))
+            .or_insert((0, 0, session.start_at.as_str(), session.end_at.as_str()));
+        entry.0 += 1;
+        entry.1 += session.spoken.max(0) as u64;
+        entry.2 = entry.2.min(session.start_at.as_str());
+        entry.3 = entry.3.max(session.end_at.as_str());
+    }
+    let mut groups: Vec<_> = groups.into_iter().collect();
+    groups.sort_by(|a, b| b.1.3.cmp(a.1.3));
+    let rows: Vec<Vec<String>> = groups
+        .iter()
+        .map(|((label, link), (count, spoken, first, last))| {
+            vec![
+                label.clone(),
+                link_label(link).to_string(),
+                thousands(*count),
+                thousands(*spoken),
+                day(first).to_string(),
+                day(last).to_string(),
+            ]
+        })
+        .collect();
+    writeln!(out)?;
+    table(
+        out,
+        &[
+            "Connection",
+            "Linked by",
+            "Sessions",
+            "Spoken",
+            "First seen",
+            "Last seen",
+        ],
+        &rows,
+        &[false, false, true, true, false, false],
+    )?;
+
+    // Channels and private messages.
+    let mut targets: BTreeMap<&str, (bool, u64, i64, u64, &str)> = BTreeMap::new();
+    for session in sessions {
+        let entry = targets.entry(session.target.as_str()).or_insert((
+            session.channel,
+            0,
+            0,
+            0,
+            session.end_at.as_str(),
+        ));
+        entry.1 += 1;
+        if session.channel {
+            entry.2 += session.minutes;
+        }
+        entry.3 += session.spoken.max(0) as u64;
+        entry.4 = entry.4.max(session.end_at.as_str());
+    }
+    let mut targets: Vec<_> = targets.into_iter().collect();
+    targets.sort_by(|a, b| b.1.4.cmp(a.1.4));
+    let rows: Vec<Vec<String>> = targets
+        .iter()
+        .map(|(target, (channel, count, minutes, spoken, last))| {
+            vec![
+                target.to_string(),
+                if *channel { "channel" } else { "private" }.to_string(),
+                thousands(*count),
+                if *channel {
+                    duration(*minutes)
+                } else {
+                    "-".to_string()
+                },
+                thousands(*spoken),
+                day(last).to_string(),
+            ]
+        })
+        .collect();
+    writeln!(out)?;
+    table(
+        out,
+        &[
+            "Channel or nick",
+            "Kind",
+            "Sessions",
+            "Time",
+            "Spoken",
+            "Last seen",
+        ],
+        &rows,
+        &[false, false, true, true, true, false],
+    )?;
+
+    // Evidence: the nick changes that linked nicks, most recent first.
+    let changes: Vec<_> = sessions
+        .iter()
+        .rev()
+        .filter(|s| s.nicks.len() > 1)
+        .collect();
+    if !changes.is_empty() {
+        writeln!(out)?;
+        writeln!(out, "{}", examples_title("Nick changes", changes.len()))?;
+        let rows: Vec<Vec<String>> = changes
+            .iter()
+            .take(MAX_EXAMPLES)
+            .map(|session| {
+                let end = session
+                    .end_line
+                    .map_or_else(|| "end".to_string(), |line| line.to_string());
+                vec![
+                    day(&session.start_at).to_string(),
+                    format!("{}:{}-{end}", session.file, session.start_line),
+                    session.nicks.join(" -> "),
+                ]
+            })
+            .collect();
+        table(
+            out,
+            &["Day", "Lines", "Nicks"],
+            &rows,
+            &[false, false, false],
+        )?;
+    }
+
+    // Audit trail for sessions attributed by nick alone.
+    let inferred: Vec<_> = sessions
+        .iter()
+        .rev()
+        .filter(|s| s.link == "inferred")
+        .collect();
+    if !inferred.is_empty() {
+        writeln!(out)?;
+        writeln!(
+            out,
+            "{}",
+            examples_title("Inferred sessions", inferred.len())
+        )?;
+        let rows: Vec<Vec<String>> = inferred
+            .iter()
+            .take(MAX_EXAMPLES)
+            .map(|session| {
+                vec![
+                    day(&session.start_at).to_string(),
+                    format!("{}:{}", session.file, session.start_line),
+                    session.nicks.join(" -> "),
+                    session.inferred_from.clone().unwrap_or_default(),
+                ]
+            })
+            .collect();
+        table(
+            out,
+            &["Day", "Line", "Nicks", "Inferred from"],
+            &rows,
+            &[false, false, false, false],
+        )?;
+    }
+    Ok(())
+}
+
+fn examples_title(what: &str, total: usize) -> String {
+    if total > MAX_EXAMPLES {
+        format!(
+            "{what} ({}, showing the {MAX_EXAMPLES} most recent):",
+            thousands(total as u64)
+        )
+    } else {
+        format!("{what}:")
+    }
+}
+
+/// The distinct nicks of some sessions, most recently used first, at most
+/// `limit` of them followed by how many more there are.
+fn nick_list(sessions: &[SessionRow], limit: usize) -> String {
+    let mut seen = HashSet::new();
+    let mut nicks = Vec::new();
+    for session in sessions.iter().rev() {
+        for nick in session.nicks.iter().rev() {
+            if seen.insert(nick.to_lowercase()) {
+                nicks.push(nick.as_str());
+            }
+        }
+    }
+    let mut list = nicks
+        .iter()
+        .take(limit)
+        .copied()
+        .collect::<Vec<_>>()
+        .join(", ");
+    if nicks.len() > limit {
+        list.push_str(&format!(" +{}", nicks.len() - limit));
+    }
+    list
+}
+
+/// The distinct `ident@host` combinations of some sessions.
+fn connections(sessions: &[SessionRow]) -> HashSet<String> {
+    sessions
+        .iter()
+        .filter(|session| session.host.is_some())
+        .map(connection_label)
+        .collect()
+}
+
+fn connection_label(session: &SessionRow) -> String {
+    match &session.host {
+        Some(host) => format!("{}@{host}", session.ident.as_deref().unwrap_or_default()),
+        None => "(no host seen)".to_string(),
+    }
+}
+
+fn link_label(link: &str) -> &str {
+    match link {
+        "host" => "nick and host",
+        "inferred" => "inferred",
+        "nick_only" => "nick only",
+        other => other,
+    }
+}
+
+fn channel_minutes<'a>(sessions: impl Iterator<Item = &'a SessionRow>) -> i64 {
+    sessions
+        .filter(|session| session.channel)
+        .map(|session| session.minutes)
+        .sum()
+}
+
+fn spoken<'a>(sessions: impl Iterator<Item = &'a SessionRow>) -> u64 {
+    sessions.map(|session| session.spoken.max(0) as u64).sum()
+}
+
+/// The `YYYY-MM-DD` part of a `YYYY-MM-DD HH:MM` timestamp.
+fn day(at: &str) -> &str {
+    at.get(..10).unwrap_or(at)
+}
+
+/// Minutes as `45m` below an hour, otherwise whole hours such as `1,234h`.
+fn duration(minutes: i64) -> String {
+    let minutes = minutes.max(0) as u64;
+    if minutes < 60 {
+        format!("{minutes}m")
+    } else {
+        format!("{}h", thousands(minutes / 60))
+    }
+}
+
 fn undated_note(out: &mut impl Write, activity: &ChannelActivity) -> io::Result<()> {
     if activity.undated_spoken > 0 {
         writeln!(
@@ -401,6 +777,11 @@ fn count(n: usize, noun: &str) -> String {
     count_u64(n as u64, noun)
 }
 
+fn count_plural(n: u64, one: &str, many: &str) -> String {
+    let noun = if n == 1 { one } else { many };
+    format!("{} {noun}", thousands(n))
+}
+
 fn count_u64(n: u64, noun: &str) -> String {
     let suffix = if n == 1 { "" } else { "s" };
     format!("{} {noun}{suffix}", thousands(n))
@@ -456,5 +837,15 @@ mod tests {
         assert_eq!(count(1, "file"), "1 file");
         assert_eq!(count(2, "file"), "2 files");
         assert_eq!(count_u64(12_000, "line"), "12,000 lines");
+        assert_eq!(count_plural(1, "identity", "identities"), "1 identity");
+        assert_eq!(count_plural(3, "identity", "identities"), "3 identities");
+    }
+
+    #[test]
+    fn formats_durations_and_days() {
+        assert_eq!(duration(45), "45m");
+        assert_eq!(duration(90), "1h");
+        assert_eq!(duration(60 * 1_500), "1,500h");
+        assert_eq!(day("2026-11-01 19:32"), "2026-11-01");
     }
 }

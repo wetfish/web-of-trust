@@ -465,13 +465,11 @@ mod tests {
             }
         );
         assert_eq!(
-            event(
-                "02:00 -!- ircfiber [~ircfiber@Fish-1nj.el8.202.109.IP] has quit [Quit: bye [now]]"
-            ),
+            event("02:00 -!- juniper [~juniper@Fish-3qz.k4m.10.20.IP] has quit [Quit: bye [now]]"),
             Event::Quit {
-                nick: "ircfiber",
-                ident: "~ircfiber",
-                host: "Fish-1nj.el8.202.109.IP",
+                nick: "juniper",
+                ident: "~juniper",
+                host: "Fish-3qz.k4m.10.20.IP",
                 reason: "Quit: bye [now]"
             }
         );

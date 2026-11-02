@@ -10,9 +10,10 @@ channels to collect data rather than to take part.
 Early development. `wot analyze` currently finds the log files in one or more
 irssi log folders, imports every line into a SQLite database, groups the lines
 into sessions and identities, and prints an inventory grouped by network tag
-and channel, or the day by day activity of one channel. The reports still read
-the log files directly. Identity reports and a trust score based on how long
-people are present compared with how much they contribute come next.
+and channel, the day by day activity of one channel, or the identities behind a
+nick, ident or host. Manual corrections to identities, and a trust score based
+on how long people are present compared with how much they contribute, come
+next.
 
 ## Requirements
 
@@ -56,6 +57,16 @@ the start of a word as a comment:
 
 ```bash
 wot analyze ~/irclogs --channel '#wetfish'
+```
+
+To see the identities behind a nick, ident or host, use `--nick`, `--ident` or
+`--host`, see [Identity views](#identity-views). `*` matches any characters,
+so quote patterns that use it:
+
+```bash
+wot analyze ~/irclogs --nick rachel
+wot analyze ~/irclogs --host 'Fish-*.chat'
+wot analyze ~/irclogs --ident quokkawet --host bridge.example.net
 ```
 
 Each run imports the logs into the database first, see [Database](#database).
@@ -305,6 +316,38 @@ left without sessions.
 
 Identities are separate for each network tag, since hosts on different servers
 are not comparable.
+
+### Identity views
+
+`--nick`, `--ident` and `--host` print the identities matching them instead of
+the inventory. Matching ignores case and `*` matches any characters. Given
+together, they must all match the same nick and `ident@host` combination, so
+`--ident quokkawet --host bridge.example.net` finds whoever used that ident on
+that host. They cannot be combined with `--channel`.
+
+The report starts with a table of the matching identities, most recently seen
+first: their nicks, how many `ident@host` combinations they used, sessions,
+channel time, spoken lines, and first and last seen. Channel time adds up the
+time in each channel, so time spent in two channels at once counts twice.
+Private messages add no time.
+
+When 10 or fewer identities match, each one follows in full:
+
+- **Totals:** sessions by how they were linked, sessions as the logging
+  client, and the date range, channel time and spoken lines.
+- **Nicks:** each nick with its sessions and first and last seen.
+- **Connections:** each `ident@host` with how its sessions were linked
+  (`nick and host`), plus sessions without a host, as `inferred` or
+  `nick only`.
+- **Channels and private messages:** sessions, time, spoken lines and last
+  seen for each.
+- **Nick changes:** the sessions that changed nick, which is what links
+  different nicks, as `tag/target.log:start-end`, up to the 10 most recent.
+- **Inferred sessions:** sessions attributed by nick alone, with the session
+  they were inferred from, up to the 10 most recent.
+
+Line numbers point into the log files, so `sed -n 'START,ENDp' FILE` shows
+the lines behind any link.
 
 ### Identity tables
 
