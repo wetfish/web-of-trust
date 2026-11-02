@@ -12,11 +12,10 @@ irssi log folders, imports every line into a SQLite database, groups the lines
 into sessions and identities, and prints an inventory grouped by network tag
 and channel, the day by day activity of one channel, or the identities behind a
 nick, ident, host or person. `wot hosts`, `wot people` and `wot cuts` record
-decisions about who is who. `wot review` is the start of a web interface for
-reviewing the imported data, with an overview and a page per channel. The
-rest of the reports and decisions move into it next, followed by a trust
-score based on how long people are present compared with how much they
-contribute.
+decisions about who is who. `wot review` serves a web interface on this
+computer for reviewing the imported data and making the same decisions in a
+browser. A trust score based on how long people are present compared with how
+much they contribute comes next.
 
 ## Requirements
 
@@ -423,8 +422,17 @@ wot review --port 8080 --db /path/to/other.sqlite
 It only listens on 127.0.0.1, so it can only be opened from the same
 computer, and it has no login. It reads the database and never the log files,
 so import new lines with `wot analyze` first; reloading a page then shows
-them. The pages are built on the server as plain HTML with no JavaScript, and
-follow the system's light or dark mode.
+them. Importing stays on the command line. The pages are built on the server
+as plain HTML with no JavaScript, and follow the system's light or dark mode.
+
+Decisions are made with ordinary forms. Each action changes the database the
+same way as the matching `wot hosts`, `wot people` or `wot cuts` command, then
+returns to the page with a notice or an error, so reloading never repeats it.
+Changes to host groups and cuts rebuild identities, and the notice summarizes
+the rebuild. Deleting a person or a host group needs a confirmation box
+ticked.
+
+### Pages
 
 - **Overview** (`/`): for each network tag, the number of identities, people,
   host groups and cuts, and a table of channels with their log files, lines,
@@ -436,10 +444,53 @@ follow the system's light or dark mode.
   each day with spoken lines, most recent first, with a bar comparing each
   day with the busiest one. The log files read for the channel are listed at
   the end.
+- **Identities** (`/identities`): a search by nick, ident, host and person,
+  matched the same way as `wot analyze --nick`, `--ident`, `--host` and
+  `--person`. Results show the identity, its person, nicks, number of
+  `ident@host` combinations, sessions, channel time, spoken lines, and first
+  and last seen, most recently seen first, up to 500. Each result has a
+  checkbox: the ticked identities can be made into a new person, added to an
+  existing one, or taken out of their person, all at once and without
+  leaving the search. Adding an identity to the person it already belongs to
+  changes nothing, and taking out identities that belong to no one skips
+  them. A search by host also
+  lists the matching hosts, up to 50, each with its host group: an ungrouped
+  host can be added to an existing group, a grouped one taken out, and a new
+  group can be created for the ungrouped hosts. These actions come back to
+  the same search, so the identities on a host can be checked before and
+  after grouping it.
+- **Identity** (`/identity?id=ID`): one identity in full: its person, nicks,
+  connections with their host group, channels and private messages, nick
+  changes and inferred sessions. Nicks, idents, hosts and channels link to
+  their own searches and pages. From here an identity can be added to an
+  existing person, to a new one, or removed from its person, and a session
+  can be cut at any of its nick changes. Connections on hosts that are not in
+  a group link to a search by that host, where it can be grouped. An id
+  merged into another identity leads to that identity.
+- **People** (`/people`): everyone with their identities, nicks and last
+  seen, and a form to create a person, optionally with identity ids.
+- **Person** (`/person?name=NAME`): a person's identities with their totals,
+  with checkboxes to remove several at once, and forms to add identities by
+  id or delete the person.
+- **Host groups** (`/hosts`): each group with its hosts, how many identities
+  used each, and forms to add and remove hosts, change the kind, ident
+  setting and note, or delete the group; a form to create a group; and the
+  shared hosts not in any group, used by the most identities first. Shared
+  hosts with many identities and different idents are likely bridges or
+  bouncers, and link to a search by that host, to review its identities and
+  group it.
+- **Cuts** (`/cuts`): every cut with its nick change and whether it still
+  applies, with forms to remove one or add one by line.
 
-The code is in `src/review/`: `mod.rs` sets up the server and routes,
-`layout.rs` the page frame, `pages.rs` the pages and `style.css` the styles.
-The statistics come from `src/stats.rs`.
+### Code
+
+The code is in `src/review/`. `mod.rs` sets up the server, the routes and
+what the pages share: errors, database access, notices and redirects.
+`layout.rs` has the page frame and helpers, and `style.css` the styles. Each
+area has its own module with its pages and actions: `pages.rs` for the
+overview and channels, then `identities.rs`, `people.rs`, `hosts.rs` and
+`cuts.rs`. The data comes from `src/stats.rs` and `src/lookup.rs`, and the
+actions call the same functions in `src/decide.rs` as the commands.
 
 ## Decisions
 
@@ -495,6 +546,10 @@ wot people remove 0a1b2c3d4e5f
 wot people delete rachel
 wot people list
 ```
+
+Adding an identity to the person it already belongs to changes nothing.
+`wot people remove` with several ids skips those that belong to no one, and
+only fails when none of them belong to a person.
 
 People do not change identities, so nothing is rebuilt. When a rebuild merges
 an identity into another, its person follows it. If that puts one identity in

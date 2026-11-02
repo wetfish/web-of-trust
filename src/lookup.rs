@@ -5,7 +5,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::db::Result;
 
@@ -64,8 +64,11 @@ pub struct SessionRow {
     pub channel: bool,
     /// The channel or private message target.
     pub target: String,
+    pub file_id: i64,
     /// The file as `tag/target.log`.
     pub file: String,
+    /// The file's full path.
+    pub path: String,
     pub start_line: i64,
     pub end_line: Option<i64>,
     /// For inferred sessions, the session they were attributed from, as
@@ -91,6 +94,54 @@ impl IdentityView {
             .map(|session| session.end_at.as_str())
             .max()
             .unwrap_or_default()
+    }
+
+    /// When the identity was first seen, as `YYYY-MM-DD HH:MM`.
+    pub fn first_seen(&self) -> &str {
+        self.sessions
+            .first()
+            .map(|session| session.start_at.as_str())
+            .unwrap_or_default()
+    }
+
+    /// The distinct nicks, most recently used first.
+    pub fn nicks(&self) -> Vec<&str> {
+        let mut seen = HashSet::new();
+        let mut nicks = Vec::new();
+        for session in self.sessions.iter().rev() {
+            for nick in session.nicks.iter().rev() {
+                if seen.insert(nick.to_lowercase()) {
+                    nicks.push(nick.as_str());
+                }
+            }
+        }
+        nicks
+    }
+
+    /// The number of distinct `ident@host` combinations.
+    pub fn connections(&self) -> usize {
+        self.sessions
+            .iter()
+            .filter_map(|session| Some((session.ident.as_deref()?, session.host.as_deref()?)))
+            .collect::<HashSet<_>>()
+            .len()
+    }
+
+    /// Minutes present in channels, added up over channels.
+    pub fn channel_minutes(&self) -> i64 {
+        self.sessions
+            .iter()
+            .filter(|session| session.channel)
+            .map(|session| session.minutes.max(0))
+            .sum()
+    }
+
+    /// Messages and actions.
+    pub fn spoken(&self) -> i64 {
+        self.sessions
+            .iter()
+            .map(|session| session.spoken.max(0))
+            .sum()
     }
 }
 
@@ -182,13 +233,35 @@ pub fn find(conn: &Connection, filter: &Filter) -> Result<Vec<IdentityView>> {
             None => of_person.into_iter().cloned().collect(),
         });
     }
-    let ids = ids.unwrap_or_default();
+    let mut views = load_views(conn, ids.unwrap_or_default(), &people)?;
+    views.sort_by(|a, b| {
+        b.last_seen()
+            .cmp(a.last_seen())
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    Ok(views)
+}
 
+/// One identity by id. An id that was merged into another gives that one;
+/// `None` when there is no such identity or it has no sessions.
+pub fn by_id(conn: &Connection, id: &str) -> Result<Option<IdentityView>> {
+    let merges = merges(conn)?;
+    let people = people_by_identity(conn, &merges)?;
+    let current = current_id(&merges, id);
+    Ok(load_views(conn, vec![current], &people)?.into_iter().next())
+}
+
+/// The identities with these ids that have sessions, in the same order.
+fn load_views(
+    conn: &Connection,
+    ids: Vec<String>,
+    people: &HashMap<String, Vec<String>>,
+) -> Result<Vec<IdentityView>> {
     let mut tag_of = conn.prepare("SELECT tag FROM identities WHERE id = ?1")?;
     let mut stmt = conn.prepare(
         "SELECT s.nicks, s.ident, s.host, s.link, s.start_at, s.end_at, s.minutes, s.spoken,
                 s.logger, f.kind, f.tag, f.target, s.start_line, s.end_line,
-                sf.tag, sf.target, src.start_line
+                sf.tag, sf.target, src.start_line, s.file_id, f.path
          FROM sessions s
          JOIN files f ON f.id = s.file_id
          LEFT JOIN sessions src ON src.id = s.inferred_from
@@ -199,7 +272,12 @@ pub fn find(conn: &Connection, filter: &Filter) -> Result<Vec<IdentityView>> {
 
     let mut views = Vec::with_capacity(ids.len());
     for id in ids {
-        let tag: String = tag_of.query_row(params![id], |row| row.get(0))?;
+        let Some(tag) = tag_of
+            .query_row(params![id], |row| row.get::<_, String>(0))
+            .optional()?
+        else {
+            continue;
+        };
         let sessions = stmt
             .query_map(params![id], |row| {
                 let nicks: String = row.get(0)?;
@@ -228,6 +306,8 @@ pub fn find(conn: &Connection, filter: &Filter) -> Result<Vec<IdentityView>> {
                     channel: kind == "channel",
                     file: format!("{file_tag}/{target}.log"),
                     target,
+                    file_id: row.get(17)?,
+                    path: row.get(18)?,
                     start_line: row.get(12)?,
                     end_line: row.get(13)?,
                     inferred_from,
@@ -244,18 +324,12 @@ pub fn find(conn: &Connection, filter: &Filter) -> Result<Vec<IdentityView>> {
             });
         }
     }
-
-    views.sort_by(|a, b| {
-        b.last_seen()
-            .cmp(a.last_seen())
-            .then_with(|| a.id.cmp(&b.id))
-    });
     Ok(views)
 }
 
 /// Turns a pattern with `*` wildcards into a SQL `LIKE` pattern, escaping
-/// `LIKE`'s own wildcards with a backslash.
-fn like_pattern(pattern: &str) -> String {
+/// `LIKE`'s own wildcards with a backslash. Use it with `ESCAPE '\'`.
+pub fn like_pattern(pattern: &str) -> String {
     let mut out = String::with_capacity(pattern.len());
     for c in pattern.chars() {
         match c {
@@ -375,6 +449,15 @@ mod tests {
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].id, rachel_id);
         assert_eq!(found[0].people, ["rachel"]);
+
+        // Looking up the merged id gives the identity it was merged into.
+        let view = by_id(&conn, "0ld1d").unwrap().unwrap();
+        assert_eq!(view.id, rachel_id);
+        assert_eq!(view.nicks(), ["rachel"]);
+        assert_eq!((view.connections(), view.spoken()), (1, 2));
+        assert_eq!(view.first_seen(), "2026-11-01 01:00");
+        assert!(view.sessions[0].path.ends_with("#analysis.log"));
+        assert!(by_id(&conn, "nope").unwrap().is_none());
 
         // Combined with a nick that is not the person's, nothing matches.
         let none = find(

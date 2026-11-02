@@ -18,6 +18,7 @@ use crate::db::Result;
 use crate::identity;
 use crate::lookup::{self, current_id};
 use crate::report::{day, heading, table, thousands};
+use crate::stats;
 
 /// The network tag to use: the one given, or the only one imported.
 pub fn resolve_tag(conn: &Connection, tag: Option<&str>) -> Result<String> {
@@ -98,6 +99,8 @@ pub fn edit_group(
         )?;
     }
     if let Some(note) = note {
+        // An empty note clears it.
+        let note = Some(note.trim()).filter(|note| !note.is_empty());
         conn.execute(
             "UPDATE host_groups SET note = ?1 WHERE id = ?2",
             params![note, id],
@@ -178,33 +181,7 @@ pub fn remove_group(conn: &Connection, tag: &str, name: &str) -> Result<()> {
 }
 
 pub fn list_hosts(conn: &Connection, out: &mut impl Write) -> Result<()> {
-    struct Group {
-        id: i64,
-        tag: String,
-        name: String,
-        kind: String,
-        ident_is_user: bool,
-        note: Option<String>,
-    }
-    let groups: Vec<Group> = {
-        let mut stmt = conn.prepare(
-            "SELECT id, tag, name, kind, ident_is_user, note FROM host_groups ORDER BY tag, name",
-        )?;
-        let rows = stmt
-            .query_map([], |row| {
-                Ok(Group {
-                    id: row.get(0)?,
-                    tag: row.get(1)?,
-                    name: row.get(2)?,
-                    kind: row.get(3)?,
-                    ident_is_user: row.get(4)?,
-                    note: row.get(5)?,
-                })
-            })?
-            .collect::<rusqlite::Result<_>>()?;
-        rows
-    };
-
+    let groups = stats::host_groups(conn)?;
     heading(out, "Host groups", '=')?;
     if groups.is_empty() {
         writeln!(
@@ -213,10 +190,6 @@ pub fn list_hosts(conn: &Connection, out: &mut impl Write) -> Result<()> {
         )?;
         return Ok(());
     }
-    let mut members = conn.prepare(
-        "SELECT host, ifnull(note, ''), created_at FROM host_group_members
-         WHERE group_id = ?1 ORDER BY host",
-    )?;
     for group in groups {
         writeln!(out)?;
         heading(
@@ -235,30 +208,36 @@ pub fn list_hosts(conn: &Connection, out: &mut impl Write) -> Result<()> {
                 "These hosts count as one host; nick and ident must both match."
             )?;
         }
-        if let Some(note) = group.note {
+        if let Some(note) = &group.note {
             writeln!(out, "Note: {note}")?;
         }
-        let rows: Vec<Vec<String>> = members
-            .query_map(params![group.id], |row| {
-                let added: String = row.get(2)?;
-                Ok(vec![row.get(0)?, day(&added).to_string(), row.get(1)?])
-            })?
-            .collect::<rusqlite::Result<_>>()?;
         writeln!(out)?;
-        if rows.is_empty() {
+        if group.members.is_empty() {
             writeln!(
                 out,
                 "  No hosts yet. Add them with wot hosts add {}.",
                 group.name
             )?;
-        } else {
-            table(
-                out,
-                &["Host", "Added", "Note"],
-                &rows,
-                &[false, false, false],
-            )?;
+            continue;
         }
+        let rows: Vec<Vec<String>> = group
+            .members
+            .iter()
+            .map(|member| {
+                vec![
+                    member.host.clone(),
+                    thousands(member.identities as u64),
+                    day(&member.created_at).to_string(),
+                    member.note.clone().unwrap_or_default(),
+                ]
+            })
+            .collect();
+        table(
+            out,
+            &["Host", "Identities", "Added", "Note"],
+            &rows,
+            &[false, true, false, false],
+        )?;
     }
     Ok(())
 }
@@ -307,7 +286,7 @@ pub fn create_person(
         return Err(format!("a person named {name} already exists").into());
     }
     // Check the identities before creating anything.
-    check_unassigned(conn, ids)?;
+    check_unassigned(conn, ids, None)?;
     conn.execute(
         "INSERT INTO people (name, note) VALUES (?1, ?2)",
         params![name, note],
@@ -315,13 +294,26 @@ pub fn create_person(
     add_to_person(conn, name, ids)
 }
 
-/// Fails when an identity does not exist or already belongs to a person.
-fn check_unassigned(conn: &Connection, ids: &[String]) -> Result<()> {
+/// Fails when an identity does not exist or belongs to a person other than
+/// `person`. Returns the ids, as they are now, that do not belong to `person`
+/// yet.
+fn check_unassigned(
+    conn: &Connection,
+    ids: &[String],
+    person: Option<&str>,
+) -> Result<Vec<String>> {
     let merges = lookup::merges(conn)?;
     let people = lookup::people_by_identity(conn, &merges)?;
+    let mut missing = Vec::new();
     for id in ids {
         let current = existing_identity(conn, &merges, id)?;
-        if let Some(names) = people.get(&current) {
+        let Some(names) = people.get(&current) else {
+            missing.push(current);
+            continue;
+        };
+        let theirs =
+            person.is_some_and(|person| names.iter().any(|name| name.eq_ignore_ascii_case(person)));
+        if !theirs {
             return Err(format!(
                 "identity {id} already belongs to {}; remove it first with wot people remove {id}",
                 names.join(", ")
@@ -329,19 +321,19 @@ fn check_unassigned(conn: &Connection, ids: &[String]) -> Result<()> {
             .into());
         }
     }
-    Ok(())
+    Ok(missing)
 }
 
+/// Adds identities to a person. Identities that already belong to them are
+/// left as they are, so adding them again changes nothing.
 pub fn add_to_person(conn: &mut Connection, name: &str, ids: &[String]) -> Result<()> {
     let person = person_id(conn, name)?;
-    check_unassigned(conn, ids)?;
-    let merges = lookup::merges(conn)?;
+    let missing = check_unassigned(conn, ids, Some(name))?;
     let tx = conn.transaction()?;
-    for id in ids {
-        let current = current_id(&merges, id);
+    for id in missing {
         tx.execute(
             "INSERT OR IGNORE INTO person_identities (identity_id, person_id) VALUES (?1, ?2)",
-            params![current, person],
+            params![id, person],
         )?;
     }
     tx.commit()?;
@@ -350,6 +342,8 @@ pub fn add_to_person(conn: &mut Connection, name: &str, ids: &[String]) -> Resul
 
 /// Takes identities out of whichever person they belong to, including
 /// memberships recorded under an id that has since been merged into them.
+/// Identities that belong to no one are skipped; it fails only when none of
+/// them belonged to a person.
 pub fn remove_from_person(conn: &mut Connection, ids: &[String]) -> Result<()> {
     let merges = lookup::merges(conn)?;
     let members: Vec<String> = {
@@ -360,9 +354,9 @@ pub fn remove_from_person(conn: &mut Connection, ids: &[String]) -> Result<()> {
         rows
     };
     let tx = conn.transaction()?;
+    let mut removed = 0;
     for id in ids {
         let current = existing_identity(&tx, &merges, id)?;
-        let mut removed = 0;
         for member in members
             .iter()
             .filter(|member| current_id(&merges, member) == current)
@@ -372,9 +366,13 @@ pub fn remove_from_person(conn: &mut Connection, ids: &[String]) -> Result<()> {
                 params![member],
             )?;
         }
-        if removed == 0 {
-            return Err(format!("identity {id} does not belong to a person").into());
+    }
+    if removed == 0 {
+        return Err(match ids {
+            [id] => format!("identity {id} does not belong to a person"),
+            _ => "none of these identities belong to a person".to_string(),
         }
+        .into());
     }
     tx.commit()?;
     Ok(())
@@ -388,64 +386,48 @@ pub fn delete_person(conn: &Connection, name: &str) -> Result<()> {
 }
 
 pub fn list_people(conn: &Connection, out: &mut impl Write) -> Result<()> {
-    let merges = lookup::merges(conn)?;
-    let people: Vec<(i64, String, Option<String>)> = {
-        let mut stmt = conn.prepare("SELECT id, name, note FROM people ORDER BY name")?;
-        let rows = stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
-            .collect::<rusqlite::Result<_>>()?;
-        rows
-    };
-
+    let people = stats::people(conn)?;
     heading(out, "People", '=')?;
     if people.is_empty() {
         writeln!(out, "No people yet. Create one with wot people create.")?;
         return Ok(());
     }
-    let mut members =
-        conn.prepare("SELECT identity_id FROM person_identities WHERE person_id = ?1 ORDER BY 1")?;
-    let mut nicks = conn.prepare(
-        "SELECT group_concat(nick, ', ') FROM (SELECT DISTINCT nick FROM identity_keys
-                                             WHERE identity_id = ?1 ORDER BY nick)",
-    )?;
-    let mut seen = conn.prepare(
-        "SELECT i.tag, max(s.end_at) FROM identities i LEFT JOIN sessions s ON s.identity_id = i.id
-         WHERE i.id = ?1",
-    )?;
-    for (id, name, note) in people {
+    for person in people {
         writeln!(out)?;
-        heading(out, &name, '-')?;
-        if let Some(note) = note {
+        heading(out, &person.name, '-')?;
+        if let Some(note) = &person.note {
             writeln!(out, "Note: {note}")?;
         }
-        let ids: Vec<String> = members
-            .query_map(params![id], |row| row.get(0))?
-            .collect::<rusqlite::Result<_>>()?;
-        if ids.is_empty() {
+        if person.identities.is_empty() {
             writeln!(
                 out,
-                "No identities yet. Add them with wot people add {name} ID..."
+                "No identities yet. Add them with wot people add {} ID...",
+                person.name
             )?;
             continue;
         }
-        let mut rows = Vec::new();
-        for member in ids {
-            let current = current_id(&merges, &member);
-            let label = if current == member {
-                member
-            } else {
-                format!("{member} (now {current})")
-            };
-            let nick_list: Option<String> = nicks.query_row(params![current], |row| row.get(0))?;
-            let (tag, last): (Option<String>, Option<String>) =
-                seen.query_row(params![current], |row| Ok((row.get(0)?, row.get(1)?)))?;
-            rows.push(vec![
-                label,
-                tag.unwrap_or_default(),
-                nick_list.unwrap_or_default(),
-                last.as_deref().map(day).unwrap_or("-").to_string(),
-            ]);
-        }
+        let rows: Vec<Vec<String>> = person
+            .identities
+            .iter()
+            .map(|identity| {
+                let label = if identity.current == identity.recorded {
+                    identity.current.clone()
+                } else {
+                    format!("{} (now {})", identity.recorded, identity.current)
+                };
+                vec![
+                    label,
+                    identity.tag.clone().unwrap_or_default(),
+                    identity.nicks.join(", "),
+                    identity
+                        .last_seen
+                        .as_deref()
+                        .map(day)
+                        .unwrap_or("-")
+                        .to_string(),
+                ]
+            })
+            .collect();
         writeln!(out)?;
         table(
             out,
@@ -541,62 +523,33 @@ pub fn remove_cut(conn: &Connection, id: i64) -> Result<()> {
 }
 
 pub fn list_cuts(conn: &Connection, out: &mut impl Write) -> Result<()> {
-    let mut stmt = conn.prepare(
-        "SELECT c.id, c.path, f.tag, f.target, c.line, c.expected, ifnull(c.note, ''),
-                c.created_at, e.kind, e.nick, e.other_nick
-         FROM session_cuts c
-         LEFT JOIN files f ON f.path = c.path
-         LEFT JOIN events e ON e.file_id = f.id AND e.line = c.line
-         ORDER BY c.id",
-    )?;
-    let rows: Vec<Vec<String>> = stmt
-        .query_map([], |row| {
-            let id: i64 = row.get(0)?;
-            let path: String = row.get(1)?;
-            let tag: Option<String> = row.get(2)?;
-            let target: Option<String> = row.get(3)?;
-            let line: i64 = row.get(4)?;
-            let expected: String = row.get(5)?;
-            let created: String = row.get(7)?;
-            let kind: Option<String> = row.get(8)?;
-            let nick: Option<String> = row.get(9)?;
-            let new: Option<String> = row.get(10)?;
-            let file = match (tag, target) {
-                (Some(tag), Some(target)) => format!("{tag}/{target}.log"),
-                _ => path,
-            };
-            let actual = kind.and_then(|kind| {
-                identity::nick_change_text(&kind, nick.as_deref(), new.as_deref())
-            });
-            let status = if actual.as_deref() == Some(expected.as_str()) {
-                "applied"
-            } else {
-                "stale"
-            };
-            Ok(vec![
-                id.to_string(),
-                format!("{file}:{line}"),
-                expected,
-                status.to_string(),
-                day(&created).to_string(),
-                row.get(6)?,
-            ])
-        })?
-        .collect::<rusqlite::Result<_>>()?;
-
+    let cuts = stats::cuts(conn)?;
     heading(out, "Cuts", '=')?;
-    if rows.is_empty() {
+    if cuts.is_empty() {
         writeln!(out, "No cuts yet. Make one with wot cuts add FILE:LINE.")?;
         return Ok(());
     }
-    let noun = if rows.len() == 1 { "cut" } else { "cuts" };
+    let noun = if cuts.len() == 1 { "cut" } else { "cuts" };
     writeln!(
         out,
         "{} {noun}. A stale cut's line no longer holds the nick change it was made on, \
          so it is not applied.",
-        thousands(rows.len() as u64)
+        thousands(cuts.len() as u64)
     )?;
     writeln!(out)?;
+    let rows: Vec<Vec<String>> = cuts
+        .iter()
+        .map(|cut| {
+            vec![
+                cut.id.to_string(),
+                format!("{}:{}", cut.file, cut.line),
+                cut.expected.clone(),
+                if cut.applied { "applied" } else { "stale" }.to_string(),
+                day(&cut.created_at).to_string(),
+                cut.note.clone().unwrap_or_default(),
+            ]
+        })
+        .collect();
     table(
         out,
         &["Id", "Line", "Nick change", "Status", "Added", "Note"],
@@ -706,10 +659,8 @@ mod tests {
             create_person(&mut conn, "RACHEL", &[], None).is_err(),
             "names ignore case"
         );
-        assert!(
-            add_to_person(&mut conn, "rachel", &ids[..1]).is_err(),
-            "already assigned"
-        );
+        // Adding an identity to the person it belongs to changes nothing.
+        add_to_person(&mut conn, "RACHEL", &ids[..1]).unwrap();
         assert!(add_to_person(&mut conn, "rachel", &["nope".into()]).is_err());
 
         create_person(&mut conn, "marlowe", &ids[1..], None).unwrap();
@@ -718,8 +669,11 @@ mod tests {
             "belongs to marlowe"
         );
 
+        // Identities that belong to no one are skipped, unless none of
+        // them belong to anyone.
         remove_from_person(&mut conn, &ids[..1]).unwrap();
         assert!(remove_from_person(&mut conn, &ids[..1]).is_err());
+        remove_from_person(&mut conn, &ids).unwrap();
         delete_person(&conn, "marlowe").unwrap();
         let left: i64 = conn
             .query_row("SELECT count(*) FROM person_identities", [], |row| {

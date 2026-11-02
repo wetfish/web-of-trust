@@ -1,27 +1,35 @@
-//! `wot review`: a web interface for reviewing the imported data, served on
-//! this computer only. Importing stays with `wot analyze`.
+//! `wot review`: a web interface for reviewing the imported data and making
+//! decisions about it, served on this computer only. Importing stays with
+//! `wot analyze`.
 //!
-//! Pages are built on the server with maud and use plain HTML, with no
-//! JavaScript. Each request opens the database on a blocking thread, since
-//! SQLite calls block.
+//! Pages are built on the server with maud and use plain HTML forms, with no
+//! JavaScript. A form posts to an action, which changes the database and
+//! redirects back to a page with a notice or an error in the address, so
+//! reloading a page never repeats an action. Each request opens the database
+//! on a blocking thread, since SQLite calls block.
 
+mod cuts;
+mod hosts;
+mod identities;
 mod layout;
 mod pages;
+mod people;
 
+use std::fmt::Display;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use axum::Router;
-use axum::extract::{Query, State};
 use axum::http::{StatusCode, header};
-use axum::response::{IntoResponse, Response};
+use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::get;
 use maud::Markup;
 use rusqlite::Connection;
 use serde::Deserialize;
 
-use crate::{db, stats};
+use crate::db;
+use crate::identity::{self, RebuildSummary};
 
 const STYLE: &str = include_str!("style.css");
 
@@ -46,8 +54,11 @@ pub fn run(db_path: &Path, port: u16) -> db::Result<()> {
         db: Arc::new(db_path.to_path_buf()),
     };
     let router = Router::new()
-        .route("/", get(overview))
-        .route("/channel", get(channel))
+        .merge(pages::routes())
+        .merge(identities::routes())
+        .merge(people::routes())
+        .merge(hosts::routes())
+        .merge(cuts::routes())
         .route("/style.css", get(style))
         .fallback(not_found)
         .with_state(app);
@@ -98,64 +109,116 @@ impl IntoResponse for PageError {
         } else {
             "Error"
         };
-        (
-            self.status,
-            layout::page(title, pages::error(&self.message)),
-        )
-            .into_response()
+        let page = layout::page(title, &Flash::default(), pages::error(&self.message));
+        (self.status, page).into_response()
     }
 }
 
 type PageResult = Result<Markup, PageError>;
 
-/// Runs a page's database work on a blocking thread with its own connection.
-async fn with_db<F>(app: &App, build: F) -> PageResult
+/// Runs database work on a blocking thread with its own connection.
+async fn with_db<T, F>(app: &App, work: F) -> Result<T, PageError>
 where
-    F: FnOnce(&Connection) -> PageResult + Send + 'static,
+    T: Send + 'static,
+    F: FnOnce(&mut Connection) -> Result<T, PageError> + Send + 'static,
 {
     let path = Arc::clone(&app.db);
     tokio::task::spawn_blocking(move || {
-        let conn = db::open(&path)
+        let mut conn = db::open(&path)
             .map_err(|err| PageError::internal(format!("opening the database: {err}")))?;
-        build(&conn)
+        work(&mut conn)
     })
     .await
     .map_err(|err| PageError::internal(format!("the page failed to build: {err}")))?
 }
 
 /// Turns a database error into an error page.
-fn internal(err: impl std::fmt::Display) -> PageError {
+fn internal(err: impl Display) -> PageError {
     PageError::internal(format!("reading the database: {err}"))
 }
 
-async fn overview(State(app): State<App>) -> PageResult {
-    with_db(&app, |conn| {
-        let overview = stats::overview(conn).map_err(internal)?;
-        Ok(layout::page("Overview", pages::overview(&overview)))
-    })
-    .await
+/// A notice or error carried in the address after an action, shown at the
+/// top of the page it redirected to.
+#[derive(Default, Deserialize)]
+struct Flash {
+    notice: Option<String>,
+    error: Option<String>,
 }
 
-#[derive(Deserialize)]
-struct ChannelQuery {
-    tag: String,
-    name: String,
+/// A page to send the browser back to after an action. Only paths on this
+/// site are allowed, so a form cannot redirect elsewhere.
+fn back_to(back: Option<&str>, default: &str) -> String {
+    match back {
+        Some(back) if back.starts_with('/') && !back.starts_with("//") => back.to_string(),
+        _ => default.to_string(),
+    }
 }
 
-async fn channel(State(app): State<App>, Query(query): Query<ChannelQuery>) -> PageResult {
-    with_db(&app, move |conn| {
-        let channel = stats::channel_days(conn, &query.tag, &query.name)
-            .map_err(internal)?
-            .ok_or_else(|| {
-                PageError::not_found(format!(
-                    "No log files for {} in network tag {} have been imported.",
-                    query.name, query.tag
-                ))
-            })?;
-        let title = format!("{} ({})", channel.name, channel.tag);
-        Ok(layout::page(&title, pages::channel(&channel)))
-    })
-    .await
+/// Redirects to `back` with a notice.
+fn done(back: &str, notice: &str) -> Redirect {
+    flash(back, "notice", notice)
+}
+
+/// Redirects to `back` with an error.
+fn failed(back: &str, error: impl Display) -> Redirect {
+    flash(back, "error", &error.to_string())
+}
+
+fn flash(back: &str, key: &str, message: &str) -> Redirect {
+    // Drop an earlier notice or error from the address.
+    let base = back.split(['?', '#']).next().unwrap_or(back);
+    let query: Vec<&str> = back
+        .split_once('?')
+        .map(|(_, query)| query.split('#').next().unwrap_or(query))
+        .unwrap_or("")
+        .split('&')
+        .filter(|pair| {
+            !pair.is_empty() && !pair.starts_with("notice=") && !pair.starts_with("error=")
+        })
+        .collect();
+    let mut url = base.to_string();
+    url.push('?');
+    for pair in query {
+        url.push_str(pair);
+        url.push('&');
+    }
+    url.push_str(key);
+    url.push('=');
+    url.push_str(&layout::url_encode(message));
+    Redirect::to(&url)
+}
+
+/// A form field, or `None` when it was left blank.
+fn filled(value: &Option<String>) -> Option<&str> {
+    value
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+/// Rebuilds identities after a decision that changes them, and describes the
+/// result for a notice.
+fn rebuild(conn: &mut Connection) -> Result<String, PageError> {
+    let summary = identity::rebuild(conn)
+        .map_err(|err| PageError::internal(format!("rebuilding identities: {err}")))?;
+    Ok(rebuild_text(&summary))
+}
+
+fn rebuild_text(summary: &RebuildSummary) -> String {
+    let mut text = format!(
+        "Identities rebuilt: {} identities from {} sessions, {} new, {} merged.",
+        layout::number(summary.identities as i64),
+        layout::number(summary.sessions as i64),
+        layout::number(summary.new_identities as i64),
+        layout::number(summary.merged_identities as i64),
+    );
+    if summary.cuts_stale > 0 {
+        text.push_str(&format!(
+            " {} cuts are stale.",
+            layout::number(summary.cuts_stale as i64)
+        ));
+    }
+    text
 }
 
 async fn style() -> impl IntoResponse {
@@ -164,4 +227,42 @@ async fn style() -> impl IntoResponse {
 
 async fn not_found() -> PageError {
     PageError::not_found("There is no page here.")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn location(redirect: Redirect) -> String {
+        let response = redirect.into_response();
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        response.headers()[header::LOCATION]
+            .to_str()
+            .unwrap()
+            .to_string()
+    }
+
+    #[test]
+    fn redirects_only_within_the_site() {
+        assert_eq!(back_to(Some("/people"), "/"), "/people");
+        assert_eq!(back_to(Some("//elsewhere.example"), "/"), "/");
+        assert_eq!(back_to(Some("https://elsewhere.example"), "/"), "/");
+        assert_eq!(back_to(None, "/hosts"), "/hosts");
+    }
+
+    #[test]
+    fn carries_one_message_in_the_address() {
+        assert_eq!(location(done("/people", "Saved.")), "/people?notice=Saved.");
+        assert_eq!(
+            location(failed("/person?name=rachel&notice=Old", "no such identity")),
+            "/person?name=rachel&error=no%20such%20identity"
+        );
+    }
+
+    #[test]
+    fn treats_blank_fields_as_missing() {
+        assert_eq!(filled(&Some("  ".into())), None);
+        assert_eq!(filled(&Some(" x ".into())), Some("x"));
+        assert_eq!(filled(&None), None);
+    }
 }

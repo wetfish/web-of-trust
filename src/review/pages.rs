@@ -1,9 +1,54 @@
-//! The contents of each review page.
+//! The overview and channel pages, and the error page.
 
+use axum::Router;
+use axum::extract::{Query, State};
+use axum::routing::get;
 use maud::{Markup, html};
+use serde::Deserialize;
 
-use super::layout::{channel_href, day, number};
-use crate::stats::{ChannelDays, Overview, TagSummary};
+use super::layout::{self, channel_href, day, number};
+use super::{App, Flash, PageError, PageResult, internal, with_db};
+use crate::stats::{self, ChannelDays, Overview, TagSummary};
+
+pub(super) fn routes() -> Router<App> {
+    Router::new()
+        .route("/", get(overview_page))
+        .route("/channel", get(channel_page))
+}
+
+async fn overview_page(State(app): State<App>, Query(flash): Query<Flash>) -> PageResult {
+    with_db(&app, move |conn| {
+        let overview = stats::overview(conn).map_err(internal)?;
+        Ok(layout::page("Overview", &flash, self::overview(&overview)))
+    })
+    .await
+}
+
+#[derive(Deserialize)]
+struct ChannelQuery {
+    tag: String,
+    name: String,
+}
+
+async fn channel_page(
+    State(app): State<App>,
+    Query(query): Query<ChannelQuery>,
+    Query(flash): Query<Flash>,
+) -> PageResult {
+    with_db(&app, move |conn| {
+        let channel = stats::channel_days(conn, &query.tag, &query.name)
+            .map_err(internal)?
+            .ok_or_else(|| {
+                PageError::not_found(format!(
+                    "No log files for {} in network tag {} have been imported.",
+                    query.name, query.tag
+                ))
+            })?;
+        let title = format!("{} ({})", channel.name, channel.tag);
+        Ok(layout::page(&title, &flash, self::channel(&channel)))
+    })
+    .await
+}
 
 pub fn error(message: &str) -> Markup {
     html! {
@@ -37,10 +82,10 @@ fn tag_section(tag: &TagSummary) -> Markup {
         section {
             h2 { "Network tag " (tag.tag) }
             ul.stats {
-                li { strong { (number(tag.identities)) } " identities" }
-                li { strong { (number(tag.people)) } " people" }
-                li { strong { (number(tag.host_groups)) } " host groups" }
-                li { strong { (number(tag.cuts)) } " cuts" }
+                li { a href="/identities" { strong { (number(tag.identities)) } " identities" } }
+                li { a href="/people" { strong { (number(tag.people)) } " people" } }
+                li { a href="/hosts" { strong { (number(tag.host_groups)) } " host groups" } }
+                li { a href="/cuts" { strong { (number(tag.cuts)) } " cuts" } }
             }
             @if tag.channels.is_empty() {
                 p { "No channel logs." }
