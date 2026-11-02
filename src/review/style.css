@@ -1,0 +1,182 @@
+/* wot review: plain, functional styles with light and dark modes. */
+
+:root {
+    --background: #ffffff;
+    --surface: #f4f5f7;
+    --text: #1d2125;
+    --muted: #5e6670;
+    --border: #d8dce1;
+    --link: #0b5cad;
+    --accent: #2f7d6d;
+    color-scheme: light dark;
+}
+
+@media (prefers-color-scheme: dark) {
+    :root {
+        --background: #15181b;
+        --surface: #1e2226;
+        --text: #e3e6e9;
+        --muted: #9aa3ad;
+        --border: #343a40;
+        --link: #79b4f2;
+        --accent: #5fbfa9;
+    }
+}
+
+* {
+    box-sizing: border-box;
+}
+
+body {
+    margin: 0;
+    background: var(--background);
+    color: var(--text);
+    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+a {
+    color: var(--link);
+}
+
+code {
+    font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+    font-size: 0.9em;
+}
+
+header {
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+}
+
+nav {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.25rem 1.25rem;
+    align-items: baseline;
+    max-width: 72rem;
+    margin: 0 auto;
+    padding: 0.75rem 1rem;
+}
+
+nav a {
+    text-decoration: none;
+}
+
+nav a:hover {
+    text-decoration: underline;
+}
+
+nav .brand {
+    color: var(--text);
+    font-weight: 700;
+    margin-right: 0.5rem;
+}
+
+main {
+    max-width: 72rem;
+    margin: 0 auto;
+    padding: 1rem 1rem 3rem;
+}
+
+h1 {
+    font-size: 1.6rem;
+    margin: 0.5rem 0;
+}
+
+h2 {
+    font-size: 1.25rem;
+    margin: 2rem 0 0.5rem;
+    padding-bottom: 0.25rem;
+    border-bottom: 1px solid var(--border);
+}
+
+.lead {
+    font-size: 1.05rem;
+}
+
+.note,
+.crumbs {
+    color: var(--muted);
+    font-size: 0.9rem;
+}
+
+.crumbs {
+    margin: 0;
+}
+
+.stats {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem 1.5rem;
+    list-style: none;
+    margin: 0.5rem 0 1rem;
+    padding: 0;
+}
+
+/* Wide tables scroll sideways instead of widening the page. */
+.scroll {
+    overflow-x: auto;
+}
+
+table {
+    border-collapse: collapse;
+    width: 100%;
+}
+
+th,
+td {
+    padding: 0.35rem 0.6rem;
+    border-bottom: 1px solid var(--border);
+    text-align: left;
+    white-space: nowrap;
+}
+
+th {
+    color: var(--muted);
+    font-weight: 600;
+    font-size: 0.85rem;
+}
+
+th[title] {
+    text-decoration: underline dotted;
+    cursor: help;
+}
+
+tbody tr:hover {
+    background: var(--surface);
+}
+
+.num {
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+}
+
+.bar-cell {
+    width: 40%;
+    min-width: 8rem;
+}
+
+.bar {
+    display: block;
+    height: 0.7rem;
+    background: var(--accent);
+    border-radius: 2px;
+}
+
+details {
+    margin-top: 2rem;
+}
+
+summary {
+    cursor: pointer;
+    color: var(--muted);
+}
+
+.visually-hidden {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip: rect(0 0 0 0);
+    white-space: nowrap;
+}

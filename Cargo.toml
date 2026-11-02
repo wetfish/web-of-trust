@@ -7,6 +7,10 @@ description = "Web of trust tools for IRC communities, starting with irssi log a
 repository = "https://github.com/wetfish/web-of-trust"
 
 [dependencies]
+axum = "0.8.9"
 chrono = { version = "0.4.45", default-features = false, features = ["std"] }
 clap = { version = "4.6", features = ["derive"] }
+maud = { version = "0.27", features = ["axum"] }
 rusqlite = { version = "0.41", features = ["bundled"] }
+serde = { version = "1.0", features = ["derive"] }
+tokio = { version = "1.54", features = ["rt", "net"] }

@@ -5,7 +5,9 @@ mod identity;
 mod irssi;
 mod lookup;
 mod report;
+mod review;
 mod scan;
+mod stats;
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -102,6 +104,17 @@ enum Command {
 
         /// SQLite database to use
         #[arg(long, value_name = "FILE", default_value = DEFAULT_DB, global = true)]
+        db: PathBuf,
+    },
+
+    /// Review the imported data in a web browser, on this computer only
+    Review {
+        /// Port to serve on, at http://127.0.0.1:PORT/
+        #[arg(long, default_value_t = 7171)]
+        port: u16,
+
+        /// SQLite database to review
+        #[arg(long, value_name = "FILE", default_value = DEFAULT_DB)]
         db: PathBuf,
     },
 }
@@ -253,6 +266,7 @@ fn main() -> ExitCode {
         Command::Hosts { action, tag, db } => finish(hosts(action, tag.as_deref(), &db)),
         Command::People { action, db } => finish(people(action, &db)),
         Command::Cuts { action, db } => finish(cuts(action, &db)),
+        Command::Review { port, db } => finish(review::run(&db, port)),
     }
 }
 

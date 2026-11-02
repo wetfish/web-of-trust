@@ -12,8 +12,11 @@ irssi log folders, imports every line into a SQLite database, groups the lines
 into sessions and identities, and prints an inventory grouped by network tag
 and channel, the day by day activity of one channel, or the identities behind a
 nick, ident, host or person. `wot hosts`, `wot people` and `wot cuts` record
-decisions about who is who. A trust score based on how long people are present
-compared with how much they contribute comes next.
+decisions about who is who. `wot review` is the start of a web interface for
+reviewing the imported data, with an overview and a page per channel. The
+rest of the reports and decisions move into it next, followed by a trust
+score based on how long people are present compared with how much they
+contribute.
 
 ## Requirements
 
@@ -86,6 +89,13 @@ To use a different database file:
 
 ```bash
 wot analyze ~/irclogs --db /path/to/other.sqlite
+```
+
+To review the imported data in a web browser instead, see
+[Reviewing in a browser](#reviewing-in-a-browser):
+
+```bash
+wot review
 ```
 
 Run `wot --help` or `wot analyze --help` for the full list of options.
@@ -398,6 +408,38 @@ nick-only keys), and `identity_id`. Sessions started by a cut have an empty
 | `minutes` | Time present |
 | `spoken` | Messages and actions |
 | `logger` | 1 for the logging client's own session |
+
+## Reviewing in a browser
+
+`wot review` serves a web interface for reviewing the imported data, then
+keeps running until you press Ctrl+C. Open the address it prints, by default
+<http://127.0.0.1:7171/>.
+
+```bash
+wot review
+wot review --port 8080 --db /path/to/other.sqlite
+```
+
+It only listens on 127.0.0.1, so it can only be opened from the same
+computer, and it has no login. It reads the database and never the log files,
+so import new lines with `wot analyze` first; reloading a page then shows
+them. The pages are built on the server as plain HTML with no JavaScript, and
+follow the system's light or dark mode.
+
+- **Overview** (`/`): for each network tag, the number of identities, people,
+  host groups and cuts, and a table of channels with their log files, lines,
+  spoken lines and joins. Identities counts the identities with a session in
+  the channel, apart from the logging client; Spoke counts those that said
+  anything; Silent is the share that never did. Private messages are
+  summarized in one line.
+- **Channel** (`/channel?tag=TAG&name=CHANNEL`): spoken lines and nicks for
+  each day with spoken lines, most recent first, with a bar comparing each
+  day with the busiest one. The log files read for the channel are listed at
+  the end.
+
+The code is in `src/review/`: `mod.rs` sets up the server and routes,
+`layout.rs` the page frame, `pages.rs` the pages and `style.css` the styles.
+The statistics come from `src/stats.rs`.
 
 ## Decisions
 
