@@ -521,3 +521,56 @@ tr.flagged:hover {
     border-radius: 6px;
     background: var(--error-background);
 }
+
+/* An identity's name and id in its heading. */
+.id-label {
+    color: var(--muted);
+    font-size: 0.55em;
+    font-weight: 400;
+}
+
+/* Who an identity is, at a glance, before anything else on its page. */
+dl.summary {
+    display: grid;
+    grid-template-columns: max-content 1fr;
+    gap: 0.35rem 1.2rem;
+    margin: 0.5rem 0 1rem;
+    padding: 0.8rem 1rem;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--surface);
+}
+
+dl.summary dt {
+    color: var(--muted);
+}
+
+dl.summary dd {
+    margin: 0;
+    overflow-wrap: anywhere;
+}
+
+/* Links to the sections of a long page. */
+nav.on-page {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.3rem 1rem;
+    margin: 0 0 1rem;
+    font-size: 0.9rem;
+}
+
+/* Sections reached by those links keep their heading in view. */
+section[id],
+h2[id] {
+    scroll-margin-top: 1rem;
+}
+
+@media (max-width: 40rem) {
+    dl.summary {
+        grid-template-columns: 1fr;
+    }
+
+    dl.summary dd {
+        margin-bottom: 0.4rem;
+    }
+}

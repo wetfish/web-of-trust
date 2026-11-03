@@ -40,6 +40,8 @@ use rusqlite::{Connection, params};
 
 use crate::activity;
 use crate::db::Result;
+use crate::progress::{Progress, Unit};
+use crate::report::thousands;
 
 /// The event kinds that open, change or close sessions.
 const SESSION_KINDS: &str = "'log_opened', 'log_closed', 'join', 'part', 'quit', 'kick', \
@@ -172,11 +174,26 @@ pub fn is_built(conn: &Connection) -> Result<bool> {
     Ok(built)
 }
 
-/// Rebuilds all sessions and identities from the events, in one transaction.
+/// Rebuilds all sessions and identities from the events, in one transaction,
+/// quietly, for tests.
+#[cfg(test)]
 pub fn rebuild(conn: &mut Connection) -> Result<RebuildSummary> {
+    rebuild_with_progress(conn, &mut Progress::quiet())
+}
+
+/// Events between progress reports while events are replayed, and sessions
+/// between reports while they are saved.
+const PROGRESS_EVENTS: u64 = 100_000;
+const PROGRESS_SESSIONS: usize = 10_000;
+
+/// Rebuilds all sessions and identities, reporting each stage as it goes.
+pub fn rebuild_with_progress(
+    conn: &mut Connection,
+    progress: &mut Progress,
+) -> Result<RebuildSummary> {
     let tx = conn.transaction()?;
     let mut rules = load_rules(&tx)?;
-    let (sessions, day_marks) = replay_events(&tx, &mut rules.cuts)?;
+    let (sessions, day_marks) = replay_events(&tx, &mut rules.cuts, progress)?;
 
     let mut summary = RebuildSummary {
         sessions: sessions.len(),
@@ -184,8 +201,24 @@ pub fn rebuild(conn: &mut Connection) -> Result<RebuildSummary> {
         cuts_stale: rules.cuts.total.saturating_sub(rules.cuts.applied.len()),
         ..RebuildSummary::default()
     };
+    progress.stage(
+        "Linking sessions into identities",
+        0,
+        Unit::Items("sessions"),
+    );
     let links = link_sessions(&sessions, &rules.groups);
     let ids = assign_ids(&tx, &links, &mut summary)?;
+    progress.done(&format!(
+        "{} identities, {} of them new",
+        thousands(summary.identities as u64),
+        thousands(summary.new_identities as u64)
+    ));
+
+    progress.stage(
+        "Saving sessions",
+        sessions.len() as u64,
+        Unit::Items("sessions"),
+    );
 
     tx.execute("DELETE FROM sessions", [])?;
     tx.execute("DELETE FROM session_nicks", [])?;
@@ -204,6 +237,9 @@ pub fn rebuild(conn: &mut Connection) -> Result<RebuildSummary> {
                      ?18)",
         )?;
         for (index, session) in sessions.iter().enumerate() {
+            if index % PROGRESS_SESSIONS == 0 {
+                progress.update(index as u64, String::new);
+            }
             let (identity, link, inferred_from) = match links.of_session[index] {
                 Link::Host(node) => (&ids[&links.root(node)], "host", None),
                 Link::Inferred(target) => {
@@ -260,6 +296,8 @@ pub fn rebuild(conn: &mut Connection) -> Result<RebuildSummary> {
         }
     }
 
+    progress.done(&format!("{} sessions", thousands(sessions.len() as u64)));
+
     // Channel activity, leaving out private messages and the logging client.
     let presences: Vec<activity::Presence> = sessions
         .iter()
@@ -279,9 +317,16 @@ pub fn rebuild(conn: &mut Connection) -> Result<RebuildSummary> {
             spoken_days: &session.spoken_days,
         })
         .collect();
+    progress.stage("Building channel activity", 0, Unit::Items("sessions"));
     activity::rebuild(&tx, &presences)?;
+    progress.done(&format!(
+        "from {} channel sessions",
+        thousands(presences.len() as u64)
+    ));
 
+    progress.stage("Writing to the database", 0, Unit::Bytes);
     tx.commit()?;
+    progress.done("saved");
     Ok(summary)
 }
 
@@ -369,7 +414,11 @@ type DayMarks = HashMap<i64, Vec<(NaiveDate, i64)>>;
 
 /// Replays every file's events in line order and returns their sessions, and
 /// each file's day marks.
-fn replay_events(conn: &Connection, cuts: &mut Cuts) -> Result<(Vec<Session>, DayMarks)> {
+fn replay_events(
+    conn: &Connection,
+    cuts: &mut Cuts,
+    progress: &mut Progress,
+) -> Result<(Vec<Session>, DayMarks)> {
     let files: HashMap<i64, (String, bool, String)> = {
         let mut stmt = conn.prepare("SELECT id, tag, kind = 'channel', target FROM files")?;
         let rows = stmt
@@ -380,6 +429,11 @@ fn replay_events(conn: &Connection, cuts: &mut Cuts) -> Result<(Vec<Session>, Da
         rows
     };
     let mut day_marks: DayMarks = HashMap::new();
+    // Progress is counted in files, which are replayed one after another,
+    // with the events read so far as detail.
+    progress.stage("Reading events", files.len() as u64, Unit::Items("files"));
+    let mut files_done: u64 = 0;
+    let mut events: u64 = 0;
 
     let mut stmt = conn.prepare(&format!(
         "SELECT file_id, line, date, time, kind, nick, ident, host, other_nick, text, detail
@@ -392,6 +446,17 @@ fn replay_events(conn: &Connection, cuts: &mut Cuts) -> Result<(Vec<Session>, Da
     let mut sessions = Vec::new();
     let mut replay: Option<FileReplay> = None;
     while let Some(row) = rows.next()? {
+        events += 1;
+        if events % PROGRESS_EVENTS == 0 {
+            let found = sessions.len();
+            progress.update(files_done, || {
+                format!(
+                    "{} events, {} sessions",
+                    thousands(events),
+                    thousands(found as u64)
+                )
+            });
+        }
         let date: String = row.get(2)?;
         let time: String = row.get(3)?;
         let Some(at) = parse_at(&date, &time) else {
@@ -414,6 +479,7 @@ fn replay_events(conn: &Connection, cuts: &mut Cuts) -> Result<(Vec<Session>, Da
             if let Some(finished) = replay.take() {
                 let (file_id, marks) = finished.finish(&mut sessions);
                 day_marks.insert(file_id, marks);
+                files_done += 1;
             }
             let (tag, channel, target) = files.get(&event.file_id).cloned().unwrap_or_default();
             replay = Some(FileReplay::new(event.file_id, tag, channel, target));
@@ -426,6 +492,12 @@ fn replay_events(conn: &Connection, cuts: &mut Cuts) -> Result<(Vec<Session>, Da
         let (file_id, marks) = finished.finish(&mut sessions);
         day_marks.insert(file_id, marks);
     }
+    progress.done(&format!(
+        "{} events in {} files, {} sessions",
+        thousands(events),
+        thousands(files.len() as u64),
+        thousands(sessions.len() as u64)
+    ));
     Ok((sessions, day_marks))
 }
 

@@ -33,6 +33,7 @@ use serde::Deserialize;
 
 use crate::db;
 use crate::identity::{self, RebuildSummary};
+use crate::progress::Progress;
 
 const STYLE: &str = include_str!("style.css");
 
@@ -203,9 +204,12 @@ fn filled(value: &Option<String>) -> Option<&str> {
 }
 
 /// Rebuilds identities after a decision that changes them, and describes the
-/// result for a notice.
+/// result for a notice. The page waits for it, so progress goes to the
+/// terminal `wot review` runs in.
 fn rebuild(conn: &mut Connection) -> Result<String, PageError> {
-    let summary = identity::rebuild(conn)
+    let mut progress = Progress::to_stderr();
+    progress.note("Rebuilding sessions and identities for a decision made in the browser...");
+    let summary = identity::rebuild_with_progress(conn, &mut progress)
         .map_err(|err| PageError::internal(format!("rebuilding identities: {err}")))?;
     Ok(rebuild_text(&summary))
 }

@@ -6,6 +6,7 @@ mod history;
 mod identity;
 mod irssi;
 mod lookup;
+mod progress;
 mod report;
 mod review;
 mod scan;
@@ -20,6 +21,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use rusqlite::Connection;
 
 use crate::lookup::Filter;
+use crate::progress::Progress;
 use crate::stats::{Kind, Rating};
 
 /// The default database, in the repository folder. `.gitignore` excludes it.
@@ -349,7 +351,7 @@ fn open(db_path: &Path) -> db::Result<Connection> {
 /// standard error.
 fn rebuild_identities(conn: &mut Connection) -> db::Result<()> {
     eprintln!("Building sessions and identities...");
-    let summary = identity::rebuild(conn)?;
+    let summary = identity::rebuild_with_progress(conn, &mut Progress::to_stderr())?;
     report::identity_summary(&mut io::stderr().lock(), &summary)?;
     Ok(())
 }
@@ -503,6 +505,12 @@ fn analyze(
     db_path: &Path,
     force: bool,
 ) -> ExitCode {
+    let mut progress = Progress::to_stderr();
+    let folders: Vec<String> = roots
+        .iter()
+        .map(|root| root.display().to_string())
+        .collect();
+    progress.note(&format!("Looking for log files in {}", folders.join(", ")));
     let inventory = match discover::discover(roots) {
         Ok(inventory) => inventory,
         Err(err) => {
@@ -510,6 +518,11 @@ fn analyze(
             return ExitCode::FAILURE;
         }
     };
+    progress.note(&format!(
+        "Found {} log files, {} in all",
+        report::thousands(inventory.files.len() as u64),
+        progress::bytes(inventory.files.iter().map(|file| file.bytes).sum())
+    ));
 
     let mut conn = match open(db_path) {
         Ok(conn) => conn,
@@ -518,7 +531,7 @@ fn analyze(
             return ExitCode::FAILURE;
         }
     };
-    let summary = db::import(&mut conn, &inventory.files);
+    let summary = db::import_with_progress(&mut conn, &inventory.files, &mut progress);
     // Summaries go to standard error so the report stays clean.
     let _ = report::import_summary(&mut io::stderr().lock(), db_path, &summary);
 
@@ -553,7 +566,7 @@ fn analyze(
         }
         report::identities(&mut out, filter, &views)
     } else {
-        let scan = scan::scan(&inventory, channel);
+        let scan = scan::scan_with_progress(&inventory, channel, &mut progress);
         match (channel, &scan.activity) {
             (Some(channel), Some(activity)) => {
                 if activity.files.is_empty() {

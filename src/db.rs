@@ -28,6 +28,8 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::discover::{LogFile, TargetKind};
 use crate::irssi::{self, DateTracker, Event, Line};
+use crate::progress::{Progress, Unit};
+use crate::report::thousands;
 
 pub type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -369,12 +371,53 @@ enum Outcome {
     Unchanged,
 }
 
-/// Imports the lines added to each file since the last import. Each file is
-/// imported in its own transaction, so an interrupted import resumes cleanly.
+/// Imports quietly, for tests.
+#[cfg(test)]
 pub fn import(conn: &mut Connection, files: &[LogFile]) -> ImportSummary {
+    import_with_progress(conn, files, &mut Progress::quiet())
+}
+
+/// Lines between progress reports while a file is read.
+const PROGRESS_LINES: u64 = 10_000;
+
+/// Imports the lines added to each file since the last import, reporting
+/// progress by bytes as it goes. Each file is imported in its own
+/// transaction, so an interrupted import resumes cleanly.
+pub fn import_with_progress(
+    conn: &mut Connection,
+    files: &[LogFile],
+    progress: &mut Progress,
+) -> ImportSummary {
     let mut summary = ImportSummary::default();
-    for file in files {
-        match import_file(conn, file) {
+    let total: u64 = files.iter().map(|file| file.bytes).sum();
+    progress.stage("Importing log files", total, Unit::Bytes);
+    let mut finished: u64 = 0;
+    for (index, file) in files.iter().enumerate() {
+        let lines_before = summary.lines;
+        let mut tick = |offset: i64, lines: u64| {
+            progress.update(finished + offset.max(0) as u64, || {
+                format!(
+                    "file {} of {}, {} new lines",
+                    thousands(index as u64 + 1),
+                    thousands(files.len() as u64),
+                    thousands(lines_before + lines)
+                )
+            });
+        };
+        let result = import_file(conn, file, &mut tick);
+        finished += file.bytes;
+        if let Ok((_, lines)) = &result {
+            let lines = lines_before + lines;
+            progress.update(finished, || {
+                format!(
+                    "file {} of {}, {} new lines",
+                    thousands(index as u64 + 1),
+                    thousands(files.len() as u64),
+                    thousands(lines)
+                )
+            });
+        }
+        match result {
             Ok((outcome, lines)) => {
                 summary.lines += lines;
                 match outcome {
@@ -387,11 +430,17 @@ pub fn import(conn: &mut Connection, files: &[LogFile]) -> ImportSummary {
             Err(err) => summary.errors.push((file.path.clone(), err.to_string())),
         }
     }
+    progress.done(&format!("checked {} files", thousands(files.len() as u64)));
     summary
 }
 
 /// Imports one file and returns what happened and how many lines were read.
-fn import_file(conn: &mut Connection, file: &LogFile) -> Result<(Outcome, u64)> {
+/// `tick` hears the offset reached and the lines read so far, now and then.
+fn import_file(
+    conn: &mut Connection,
+    file: &LogFile,
+    tick: &mut dyn FnMut(i64, u64),
+) -> Result<(Outcome, u64)> {
     let path = fs::canonicalize(&file.path)
         .unwrap_or_else(|_| file.path.clone())
         .to_string_lossy()
@@ -462,6 +511,9 @@ fn import_file(conn: &mut Connection, file: &LogFile) -> Result<(Outcome, u64)> 
             offset += i64::try_from(read)?;
             line_number += 1;
             lines += 1;
+            if lines % PROGRESS_LINES == 0 {
+                tick(offset, lines);
+            }
 
             // Old logs may not be valid UTF-8.
             let text = String::from_utf8_lossy(&buf);

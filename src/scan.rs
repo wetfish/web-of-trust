@@ -9,6 +9,8 @@ use chrono::NaiveDate;
 
 use crate::discover::{Inventory, LogFile};
 use crate::irssi::{self, DateTracker, Event, Line};
+use crate::progress::{Progress, Unit};
+use crate::report::thousands;
 
 /// The most unrecognized lines kept as examples, in total and per file.
 const MAX_SAMPLES: usize = 50;
@@ -77,9 +79,26 @@ pub struct Scan {
     pub activity: Option<ChannelActivity>,
 }
 
-/// Reads every file. When `channel` is given, also collects day by day
-/// activity from the files whose target matches it, ignoring case.
+/// Scans quietly, for tests.
+#[cfg(test)]
 pub fn scan(inventory: &Inventory, channel: Option<&str>) -> Scan {
+    scan_with_progress(inventory, channel, &mut Progress::quiet())
+}
+
+/// Lines between progress reports while a file is read.
+const PROGRESS_LINES: u64 = 50_000;
+
+/// Reads every file, reporting progress by bytes as it goes. When `channel`
+/// is given, also collects day by day activity from the files whose target
+/// matches it, ignoring case.
+pub fn scan_with_progress(
+    inventory: &Inventory,
+    channel: Option<&str>,
+    progress: &mut Progress,
+) -> Scan {
+    let total: u64 = inventory.files.iter().map(|file| file.bytes).sum();
+    progress.stage("Reading log files for the report", total, Unit::Bytes);
+    let mut finished: u64 = 0;
     let mut scan = Scan {
         files: Vec::with_capacity(inventory.files.len()),
         samples: Vec::new(),
@@ -95,11 +114,33 @@ pub fn scan(inventory: &Inventory, channel: Option<&str>) -> Scan {
         };
 
         let mut stats = FileStats::default();
-        if let Err(err) = scan_file(file, index, &mut stats, &mut scan.samples, activity) {
+        let count = inventory.files.len() as u64;
+        let mut tick = |read: u64| {
+            progress.update(finished + read, || {
+                format!(
+                    "file {} of {}",
+                    thousands(index as u64 + 1),
+                    thousands(count)
+                )
+            });
+        };
+        if let Err(err) = scan_file(
+            file,
+            index,
+            &mut stats,
+            &mut scan.samples,
+            activity,
+            &mut tick,
+        ) {
             stats.error = Some(err.to_string());
         }
+        finished += file.bytes;
         scan.files.push(stats);
     }
+    progress.done(&format!(
+        "{} files",
+        thousands(inventory.files.len() as u64)
+    ));
     scan
 }
 
@@ -109,18 +150,25 @@ fn scan_file(
     stats: &mut FileStats,
     samples: &mut Vec<Sample>,
     mut activity: Option<&mut ChannelActivity>,
+    tick: &mut dyn FnMut(u64),
 ) -> io::Result<()> {
     let mut reader = BufReader::with_capacity(64 * 1024, File::open(&file.path)?);
     let mut buf = Vec::new();
+    let mut read: u64 = 0;
     let mut dates = DateTracker::default();
     let mut file_samples = 0;
 
     loop {
         buf.clear();
-        if reader.read_until(b'\n', &mut buf)? == 0 {
+        let bytes = reader.read_until(b'\n', &mut buf)?;
+        if bytes == 0 {
             break;
         }
+        read += bytes as u64;
         stats.lines += 1;
+        if stats.lines % PROGRESS_LINES == 0 {
+            tick(read);
+        }
 
         // Old logs may not be valid UTF-8.
         let text = String::from_utf8_lossy(&buf);

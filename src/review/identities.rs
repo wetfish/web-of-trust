@@ -14,6 +14,7 @@ use super::activity::identity_section;
 use super::history::identity_history_href;
 use super::layout::{
     self, back_field, channel_href, day, duration, identity_href, number, person_href, search_href,
+    silent_flag,
 };
 use super::people::record_options;
 use super::{App, Flash, PageError, PageResult, filled, internal, with_db};
@@ -28,6 +29,9 @@ const MAX_RESULTS: usize = 500;
 const MAX_CHANGE_SESSIONS: usize = 20;
 /// Inferred sessions shown on an identity's page.
 const MAX_INFERRED: usize = 20;
+/// Other nicks and connections listed in an identity's summary.
+const MAX_SUMMARY_NICKS: usize = 8;
+const MAX_SUMMARY_HOSTS: usize = 3;
 
 pub(super) fn routes() -> Router<App> {
     Router::new()
@@ -433,6 +437,8 @@ struct Context {
     score: ActivityScore,
     /// Real names `/who` showed, with when each was last seen.
     real_names: Vec<(String, String)>,
+    /// The person or bot it belongs to.
+    record: Option<trust::Record>,
 }
 
 async fn identity_page(
@@ -486,8 +492,12 @@ async fn identity_page(
             bot: activity::bots(conn).map_err(internal)?.contains(&view.id),
             score: trust::activity_score(conn, std::slice::from_ref(&view.id)).map_err(internal)?,
             real_names: trust::real_names(conn, &view.id).map_err(internal)?,
+            record: trust::records(conn)
+                .map_err(internal)?
+                .of_identity(&view.id)
+                .cloned(),
         };
-        let title = format!("Identity {}", view.id);
+        let title = format!("{} (identity {})", main_nick(&view), view.id);
         Ok(layout::page(&title, &flash, identity(&view, &context)).into_response())
     })
     .await
@@ -498,25 +508,108 @@ fn identity(view: &IdentityView, context: &Context) -> Markup {
     let sessions = &view.sessions;
     let count = |link: &str| sessions.iter().filter(|s| s.link == link).count() as i64;
     let logger = sessions.iter().filter(|s| s.logger).count() as i64;
+    let nicks = nick_rows(view);
+    let others: Vec<&NickRow> = nicks.iter().skip(1).collect();
+    let connections = recent_connections(view);
+    let mut total = Totals::default();
+    for (_, month) in &context.months {
+        total.days_present += month.days_present;
+        total.spoken += month.spoken;
+    }
+    let silent = !context.bot && trust::silent(total.days_present, total.spoken);
     html! {
         p.crumbs { a href="/identities" { "Identities" } " / " (view.tag) }
-        h1 { "Identity " code { (view.id) } }
-        p.lead {
-            "Seen " (day(Some(view.first_seen()))) " to " (day(Some(view.last_seen())))
-            ", " (duration(view.channel_minutes())) " in channels, "
-            (number(view.spoken())) " spoken lines."
-        }
-        p.note {
-            (number(sessions.len() as i64)) " sessions: "
-            (number(count("host"))) " with a host, "
-            (number(count("inferred"))) " inferred, "
-            (number(count("nick_only"))) " known by nick only"
-            @if count("cut") > 0 { ", " (number(count("cut"))) " started by a cut" }
-            @if logger > 0 { ", " (number(logger)) " as the logging client" }
-            "."
+        h1 {
+            (main_nick(view))
+            " " span.id-label { "identity " code { (view.id) } }
         }
 
-        section.decision {
+        dl.summary {
+            dt { "Also known as" }
+            dd {
+                @if others.is_empty() {
+                    span.muted { "No other nicks" }
+                } @else {
+                    @for (i, nick) in others.iter().take(MAX_SUMMARY_NICKS).enumerate() {
+                        @if i > 0 { ", " }
+                        a href=(search_href(&[("nick", nick.nick.as_str())])) { (nick.nick) }
+                    }
+                    @if others.len() > MAX_SUMMARY_NICKS {
+                        " and " (others.len() - MAX_SUMMARY_NICKS) " more"
+                    }
+                }
+            }
+            @if !context.real_names.is_empty() {
+                dt { "Real name" }
+                dd {
+                    @for (i, (name, seen)) in context.real_names.iter().enumerate() {
+                        @if i > 0 { ", " }
+                        strong { (name) } " (" (day(Some(seen.as_str()))) ")"
+                    }
+                }
+            }
+            dt { "Connects from" }
+            dd {
+                @if connections.is_empty() {
+                    span.muted { "No host seen" }
+                } @else {
+                    @for (i, (ident, host)) in connections.iter().take(MAX_SUMMARY_HOSTS).enumerate() {
+                        @if i > 0 { ", " }
+                        code { (ident) "@" a href=(search_href(&[("host", host.as_str())])) { (host) } }
+                    }
+                    @if connections.len() > MAX_SUMMARY_HOSTS {
+                        " and " (connections.len() - MAX_SUMMARY_HOSTS) " more"
+                    }
+                }
+            }
+            dt { "Belongs to" }
+            dd {
+                @match &context.record {
+                    Some(record) => {
+                        a href=(person_href(&record.name)) { (record.name) }
+                        @if record.kind == Kind::Bot {
+                            span.muted { ", a bot" }
+                        } @else {
+                            span.muted { ", rated " (record.rating.label()) }
+                        }
+                    },
+                    None => a href="#person" { "Nobody yet" },
+                }
+            }
+            dt { "Seen" }
+            dd {
+                (day(Some(view.first_seen()))) " to " (day(Some(view.last_seen())))
+                ", " (duration(view.channel_minutes())) " in channels, "
+                (number(view.spoken())) " spoken lines, activity score "
+                (context.score.score) " of 100"
+                @if silent {
+                    " " (silent_flag(total.days_present))
+                }
+            }
+            dt { "Sessions" }
+            dd {
+                (number(sessions.len() as i64)) ": "
+                (number(count("host"))) " with a host, "
+                (number(count("inferred"))) " inferred, "
+                (number(count("nick_only"))) " known by nick only"
+                @if count("cut") > 0 { ", " (number(count("cut"))) " started by a cut" }
+                @if logger > 0 { ", " (number(logger)) " as the logging client" }
+            }
+        }
+
+        nav.on-page aria-label="On this page" {
+            a href="#person" { "Person or bot" }
+            a href="#activity" { "Activity" }
+            a href="#nicks" { "Nicks" }
+            a href="#connections" { "Connections" }
+            a href="#channels" { "Channels" }
+            @if !context.changes.is_empty() {
+                a href="#changes" { "Nick changes" }
+            }
+            a href=(identity_history_href(&view.id)) { "Everything it said" }
+        }
+
+        section.decision id="person" {
             h2 { "Person or bot" }
             @match view.people.as_slice() {
                 [] => {
@@ -561,30 +654,28 @@ fn identity(view: &IdentityView, context: &Context) -> Markup {
             }
         }
 
-        (identity_section(&context.months, &context.score, context.private_spoken, context.bot))
-        p { a href=(identity_history_href(&view.id)) { "Everything it said, and the days it was present" } }
-
-        h2 { "Nicks" }
-        (nicks_table(view))
-        @if !context.real_names.is_empty() {
-            p.note {
-                "Real names from channel user lists: "
-                @for (i, (name, seen)) in context.real_names.iter().enumerate() {
-                    @if i > 0 { ", " }
-                    strong { (name) } " (" (day(Some(seen.as_str()))) ")"
-                }
-                "."
-            }
+        section id="activity" {
+            (identity_section(&context.months, &context.score, context.private_spoken, context.bot))
+            p { a href=(identity_history_href(&view.id)) { "Everything it said, and the days it was present" } }
         }
 
-        h2 { "Connections" }
-        (connections_table(view, &context.groups))
+        section id="nicks" {
+            h2 { "Nicks" }
+            (nicks_table(&nicks))
+        }
 
-        h2 { "Channels and private messages" }
-        (channels_table(view))
+        section id="connections" {
+            h2 { "Connections" }
+            (connections_table(view, &context.groups))
+        }
+
+        section id="channels" {
+            h2 { "Channels and private messages" }
+            (channels_table(view))
+        }
 
         @if !context.changes.is_empty() {
-            h2 { "Nick changes" }
+            h2 id="changes" { "Nick changes" }
             p.note {
                 "Nick changes link a session's nicks into one identity. If someone else was at "
                 "the keyboard after a nick change, cut there: the session ends at that line and "
@@ -631,24 +722,69 @@ fn identity(view: &IdentityView, context: &Context) -> Markup {
     }
 }
 
-fn nicks_table(view: &IdentityView) -> Markup {
-    // Lowercased nick: the nick as written, sessions, first and last seen.
-    let mut nicks: BTreeMap<String, (String, i64, &str, &str)> = BTreeMap::new();
+/// A nick of an identity, with its sessions and when it was seen.
+struct NickRow<'a> {
+    nick: String,
+    sessions: i64,
+    first: &'a str,
+    last: &'a str,
+    /// When it was last used, counting every nick of every session in
+    /// order, so the later of two nicks in one session counts as newer.
+    order: usize,
+}
+
+/// An identity's nicks, the most recently seen first.
+fn nick_rows(view: &IdentityView) -> Vec<NickRow<'_>> {
+    let mut nicks: BTreeMap<String, NickRow> = BTreeMap::new();
+    let mut order = 0;
     for session in &view.sessions {
         for nick in &session.nicks {
-            let entry = nicks.entry(nick.to_lowercase()).or_insert((
-                nick.clone(),
-                0,
-                session.start_at.as_str(),
-                session.end_at.as_str(),
-            ));
-            entry.1 += 1;
-            entry.2 = entry.2.min(session.start_at.as_str());
-            entry.3 = entry.3.max(session.end_at.as_str());
+            order += 1;
+            let row = nicks.entry(nick.to_lowercase()).or_insert(NickRow {
+                nick: nick.clone(),
+                sessions: 0,
+                first: session.start_at.as_str(),
+                last: session.end_at.as_str(),
+                order,
+            });
+            row.sessions += 1;
+            row.first = row.first.min(session.start_at.as_str());
+            row.last = row.last.max(session.end_at.as_str());
+            row.order = order;
         }
     }
-    let mut nicks: Vec<_> = nicks.into_values().collect();
-    nicks.sort_by(|a, b| b.3.cmp(a.3));
+    let mut nicks: Vec<NickRow> = nicks.into_values().collect();
+    nicks.sort_by(|a, b| b.last.cmp(a.last).then(b.order.cmp(&a.order)));
+    nicks
+}
+
+/// The nick the identity used most recently, which names it on its page.
+fn main_nick(view: &IdentityView) -> String {
+    nick_rows(view)
+        .into_iter()
+        .next()
+        .map_or_else(|| view.id.clone(), |row| row.nick)
+}
+
+/// The `ident@host` combinations an identity connected from, the most
+/// recently seen first.
+fn recent_connections(view: &IdentityView) -> Vec<(String, String)> {
+    let mut last: HashMap<(&str, &str), &str> = HashMap::new();
+    for session in &view.sessions {
+        if let (Some(ident), Some(host)) = (session.ident.as_deref(), session.host.as_deref()) {
+            let seen = last.entry((ident, host)).or_insert(session.end_at.as_str());
+            *seen = (*seen).max(session.end_at.as_str());
+        }
+    }
+    let mut connections: Vec<((&str, &str), &str)> = last.into_iter().collect();
+    connections.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(&b.0)));
+    connections
+        .into_iter()
+        .map(|((ident, host), _)| (ident.to_string(), host.to_string()))
+        .collect()
+}
+
+fn nicks_table(nicks: &[NickRow]) -> Markup {
     html! {
         div.scroll {
             table {
@@ -661,12 +797,12 @@ fn nicks_table(view: &IdentityView) -> Markup {
                     }
                 }
                 tbody {
-                    @for (nick, sessions, first, last) in &nicks {
+                    @for row in nicks {
                         tr {
-                            td { a href=(search_href(&[("nick", nick.as_str())])) { (nick) } }
-                            td.num { (number(*sessions)) }
-                            td { (day(Some(*first))) }
-                            td { (day(Some(*last))) }
+                            td { a href=(search_href(&[("nick", row.nick.as_str())])) { (row.nick) } }
+                            td.num { (number(row.sessions)) }
+                            td { (day(Some(row.first))) }
+                            td { (day(Some(row.last))) }
                         }
                     }
                 }
@@ -902,6 +1038,7 @@ mod tests {
             bot: false,
             score: ActivityScore::default(),
             real_names: vec![("Quokka Wet".into(), "2026-11-03 07:00:00".into())],
+            record: None,
             changes: vec![(
                 0,
                 vec![NickChange {
@@ -921,6 +1058,15 @@ mod tests {
         assert!(page.contains("/identities?host=bridge.example.net"));
         assert!(page.contains("<strong>Quokka Wet</strong> (2026-11-03)"));
         assert!(page.contains(r#"href="/history?id=1a2b3c4d5e6f""#));
+
+        // The page is named after the most recent nick, and says who the
+        // identity is before asking what to do with it.
+        assert!(page.contains("<h1>rachelaway "));
+        let at = |text: &str| page.find(text).unwrap();
+        assert!(at("Also known as") < at(r#"<section class="decision" id="person">"#));
+        assert!(at("Connects from") < at(r#"<section class="decision" id="person">"#));
+        assert!(page.contains(r#"href="/identities?nick=quokka">quokka</a>"#));
+        assert!(page.contains(r#"<a href="#person">Nobody yet</a>"#));
     }
 
     #[test]

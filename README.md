@@ -217,10 +217,34 @@ Each file is imported in its own transaction, so an interrupted run leaves the
 database consistent and the next run carries on. A summary of the import is
 printed to standard error.
 
+Large imports take a while, so `wot analyze` says what it is doing on standard
+error, stage by stage: finding the log files, importing them, reading events,
+linking sessions into identities, saving sessions, building channel activity,
+and reading the logs again for the report. In a terminal, one line updates in
+place with the percentage done, the counts so far and the time taken; when
+standard error is not a terminal, a line is printed every ten seconds instead.
+Each stage ends with a line saying what it did and how long it took:
+
+```text
+Looking for log files in /home/rachel/irclogs
+Found 1,234 log files, 4.1 GB in all
+Importing log files: checked 1,234 files (2m 03s)
+Building sessions and identities...
+Reading events: 12,345,678 events in 1,234 files, 234,567 sessions (1m 10s)
+Linking sessions into identities: 3,456 identities, 12 of them new (2.1s)
+Saving sessions: 234,567 sessions (8.0s)
+Building channel activity: from 120,000 channel sessions (5.0s)
+Writing to the database: saved (1.2s)
+```
+
+Decisions that rebuild identities, from the command line or from `wot review`,
+show the same stages; for `wot review`, in the terminal it runs in.
+
 The database records its schema version. When a newer version of `wot` adds
 tables, it adds them to an existing database the next time it opens it. A
-database made by a newer version of `wot` than the one running is refused;
-delete it and run again to rebuild it from the logs.
+database made by a newer version of `wot` than the one running is refused.
+It holds your decisions and notes, so use a newer `wot` rather than deleting
+it.
 
 ### Tables
 
@@ -481,16 +505,20 @@ ticked.
   and a new group can be created for the ungrouped hosts. These actions come
   back to the same search, so the identities on a host can be checked before
   and after grouping it.
-- **Identity** (`/identity?id=ID`): one identity in full: its person, nicks,
-  connections with their host group, channels and private messages, nick
-  changes and inferred sessions. Nicks, idents, hosts and channels link to
-  their own searches and pages. Its Activity section shows its activity score,
-  and real names from pasted user lists are listed under its nicks. From here
-  an identity can be added to an existing person or bot, to a new one, or
-  removed from its person or bot, and a session can be cut at any of its nick
-  changes. Connections on hosts that are not in a group link to a search by
-  that host, where it can be grouped. An id merged into another identity leads
-  to that identity.
+- **Identity** (`/identity?id=ID`): one identity in full, named after the
+  nick it used most recently. It opens with who the identity is: its other
+  nicks, real names from pasted user lists, the `ident@host` combinations it
+  connected from most recently, the person or bot it belongs to with their
+  rating, when it was seen with its activity score and any silent watcher
+  flag, and its sessions. Links jump to each section below. Then, in order:
+  its person or bot, which can be set here by adding it to an existing one,
+  creating one, or removing it; its activity by year and month; its nicks;
+  its connections with their host group; its channels and private messages;
+  and, for fixing it, its nick changes, where a session can be cut, and its
+  inferred sessions. Nicks, idents, hosts and channels link to their own
+  searches and pages. Connections on hosts that are not in a group link to a
+  search by that host, where it can be grouped. An id merged into another
+  identity leads to that identity.
 - **People and bots** (`/people`): people, most trusted first, with their
   rating, trust score, activity score, identities, nicks, last seen and
   latest note; then bots, most active first; and a form to create either,
