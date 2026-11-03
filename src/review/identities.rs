@@ -29,7 +29,7 @@ const MAX_RESULTS: usize = 500;
 const MAX_CHANGE_SESSIONS: usize = 20;
 /// Inferred sessions shown on an identity's page.
 const MAX_INFERRED: usize = 20;
-/// Other nicks and connections listed in an identity's summary.
+/// Nicks and connections listed in a summary.
 const MAX_SUMMARY_NICKS: usize = 8;
 const MAX_SUMMARY_HOSTS: usize = 3;
 
@@ -360,7 +360,7 @@ pub(super) fn identity_table(
                         th { "Nicks" }
                         th.num title="Distinct ident@host combinations" { "Hosts" }
                         th.num { "Sessions" }
-                        th.num title="Time in channels, added up over channels" { "Channel time" }
+                        th.num title="Time present in channels, with overlapping sessions counted once" { "Channel time" }
                         th.num { "Spoken" }
                         th { "First seen" }
                         th { "Last seen" }
@@ -504,9 +504,9 @@ fn identity(view: &IdentityView, context: &Context) -> Markup {
     let sessions = &view.sessions;
     let count = |link: &str| sessions.iter().filter(|s| s.link == link).count() as i64;
     let logger = sessions.iter().filter(|s| s.logger).count() as i64;
-    let nicks = nick_rows(view);
-    let others: Vec<&NickRow> = nicks.iter().skip(1).collect();
-    let connections = recent_connections(view);
+    let nicks = nick_rows(sessions);
+    let others: Vec<&str> = nicks.iter().skip(1).map(|row| row.nick.as_str()).collect();
+    let connections = recent_connections(sessions);
     let mut total = Totals::default();
     for (_, month) in &context.months {
         total.days_present += month.days_present;
@@ -522,42 +522,10 @@ fn identity(view: &IdentityView, context: &Context) -> Markup {
 
         dl.summary {
             dt { "Also known as" }
-            dd {
-                @if others.is_empty() {
-                    span.muted { "No other nicks" }
-                } @else {
-                    @for (i, nick) in others.iter().take(MAX_SUMMARY_NICKS).enumerate() {
-                        @if i > 0 { ", " }
-                        a href=(search_href(&[("nick", nick.nick.as_str())])) { (nick.nick) }
-                    }
-                    @if others.len() > MAX_SUMMARY_NICKS {
-                        " and " (others.len() - MAX_SUMMARY_NICKS) " more"
-                    }
-                }
-            }
-            @if !context.real_names.is_empty() {
-                dt { "Real name" }
-                dd {
-                    @for (i, (name, seen)) in context.real_names.iter().enumerate() {
-                        @if i > 0 { ", " }
-                        strong { (name) } " (" (day(Some(seen.as_str()))) ")"
-                    }
-                }
-            }
+            dd { (summary_nicks(&others, "No other nicks")) }
+            (summary_real_names(&context.real_names))
             dt { "Connects from" }
-            dd {
-                @if connections.is_empty() {
-                    span.muted { "No host seen" }
-                } @else {
-                    @for (i, (ident, host)) in connections.iter().take(MAX_SUMMARY_HOSTS).enumerate() {
-                        @if i > 0 { ", " }
-                        code { (ident) "@" a href=(search_href(&[("host", host.as_str())])) { (host) } }
-                    }
-                    @if connections.len() > MAX_SUMMARY_HOSTS {
-                        " and " (connections.len() - MAX_SUMMARY_HOSTS) " more"
-                    }
-                }
-            }
+            dd { (summary_connections(&connections)) }
             dt { "Belongs to" }
             dd {
                 @match &context.record {
@@ -718,9 +686,9 @@ fn identity(view: &IdentityView, context: &Context) -> Markup {
     }
 }
 
-/// A nick of an identity, with its sessions and when it was seen.
-struct NickRow<'a> {
-    nick: String,
+/// A nick, with its sessions and when it was seen.
+pub(super) struct NickRow<'a> {
+    pub(super) nick: String,
     sessions: i64,
     first: &'a str,
     last: &'a str,
@@ -729,11 +697,13 @@ struct NickRow<'a> {
     order: usize,
 }
 
-/// An identity's nicks, the most recently seen first.
-fn nick_rows(view: &IdentityView) -> Vec<NickRow<'_>> {
+/// The nicks of sessions, the most recently seen first.
+pub(super) fn nick_rows<'a>(
+    sessions: impl IntoIterator<Item = &'a SessionRow>,
+) -> Vec<NickRow<'a>> {
     let mut nicks: BTreeMap<String, NickRow> = BTreeMap::new();
     let mut order = 0;
-    for session in &view.sessions {
+    for session in sessions {
         for nick in &session.nicks {
             order += 1;
             let row = nicks.entry(nick.to_lowercase()).or_insert(NickRow {
@@ -756,17 +726,19 @@ fn nick_rows(view: &IdentityView) -> Vec<NickRow<'_>> {
 
 /// The nick the identity used most recently, which names it on its page.
 fn main_nick(view: &IdentityView) -> String {
-    nick_rows(view)
+    nick_rows(&view.sessions)
         .into_iter()
         .next()
         .map_or_else(|| view.id.clone(), |row| row.nick)
 }
 
-/// The `ident@host` combinations an identity connected from, the most
-/// recently seen first.
-fn recent_connections(view: &IdentityView) -> Vec<(String, String)> {
+/// The `ident@host` combinations sessions connected from, the most recently
+/// seen first.
+pub(super) fn recent_connections<'a>(
+    sessions: impl IntoIterator<Item = &'a SessionRow>,
+) -> Vec<(String, String)> {
     let mut last: HashMap<(&str, &str), &str> = HashMap::new();
-    for session in &view.sessions {
+    for session in sessions {
         if let (Some(ident), Some(host)) = (session.ident.as_deref(), session.host.as_deref()) {
             let seen = last.entry((ident, host)).or_insert(session.end_at.as_str());
             *seen = (*seen).max(session.end_at.as_str());
@@ -778,6 +750,56 @@ fn recent_connections(view: &IdentityView) -> Vec<(String, String)> {
         .into_iter()
         .map(|((ident, host), _)| (ident.to_string(), host.to_string()))
         .collect()
+}
+
+/// Nicks for a summary, each a search link, or `empty` when there are none.
+pub(super) fn summary_nicks(nicks: &[&str], empty: &str) -> Markup {
+    html! {
+        @if nicks.is_empty() {
+            span.muted { (empty) }
+        } @else {
+            @for (i, nick) in nicks.iter().copied().take(MAX_SUMMARY_NICKS).enumerate() {
+                @if i > 0 { ", " }
+                a href=(search_href(&[("nick", nick)])) { (nick) }
+            }
+            @if nicks.len() > MAX_SUMMARY_NICKS {
+                " and " (nicks.len() - MAX_SUMMARY_NICKS) " more"
+            }
+        }
+    }
+}
+
+/// The real names `/who` showed, with when each was last seen, for a
+/// summary; nothing when there are none.
+pub(super) fn summary_real_names(names: &[(String, String)]) -> Markup {
+    html! {
+        @if !names.is_empty() {
+            dt { "Real name" }
+            dd {
+                @for (i, (name, seen)) in names.iter().enumerate() {
+                    @if i > 0 { ", " }
+                    strong { (name) } " (" (day(Some(seen.as_str()))) ")"
+                }
+            }
+        }
+    }
+}
+
+/// `ident@host` combinations for a summary, each host a search link.
+pub(super) fn summary_connections(connections: &[(String, String)]) -> Markup {
+    html! {
+        @if connections.is_empty() {
+            span.muted { "No host seen" }
+        } @else {
+            @for (i, (ident, host)) in connections.iter().take(MAX_SUMMARY_HOSTS).enumerate() {
+                @if i > 0 { ", " }
+                code { (ident) "@" a href=(search_href(&[("host", host.as_str())])) { (host) } }
+            }
+            @if connections.len() > MAX_SUMMARY_HOSTS {
+                " and " (connections.len() - MAX_SUMMARY_HOSTS) " more"
+            }
+        }
+    }
 }
 
 fn nicks_table(nicks: &[NickRow]) -> Markup {
@@ -989,10 +1011,10 @@ fn changes_table(view: &IdentityView, changes: &[(usize, Vec<NickChange>)], here
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
-    fn session(nicks: &[&str], link: &str, host: Option<&str>) -> SessionRow {
+    pub(in crate::review) fn session(nicks: &[&str], link: &str, host: Option<&str>) -> SessionRow {
         SessionRow {
             nicks: nicks.iter().map(|nick| nick.to_string()).collect(),
             ident: host.map(|_| "quokkawet".to_string()),

@@ -430,9 +430,10 @@ others. None of them can be combined with `--channel`.
 
 The report starts with a table of the matching identities, most recently seen
 first: their person, nicks, how many `ident@host` combinations they used, sessions,
-channel time, spoken lines, and first and last seen. Channel time adds up the
-time in each channel, so time spent in two channels at once counts twice.
-Private messages add no time.
+channel time, spoken lines, and first and last seen. Channel time is the time
+present in any channel: time in two channels at once, or in one channel logged
+twice, counts once, so it is never more than the time from the first session
+to the last. Private messages add no time.
 
 When 10 or fewer identities match, each one follows in full:
 
@@ -545,8 +546,9 @@ ticked.
 - **Identities** (`/identities`): a search by nick, ident, host and person,
   matched the same way as `wot analyze --nick`, `--ident`, `--host` and
   `--person`. Results show the identity, its person, nicks, number of
-  `ident@host` combinations, sessions, channel time, spoken lines, and first
-  and last seen, most recently seen first, up to 500. Each result has a
+  `ident@host` combinations, sessions, channel time (overlapping sessions
+  counted once), spoken lines, and first and last seen, most recently seen
+  first, up to 500. Each result has a
   checkbox, and the **All** link at the top of the column loads the results
   again with every box ticked (**None** clears them): the ticked identities
   can be made into a new person or a new bot, added to an existing one, or
@@ -577,12 +579,23 @@ ticked.
   rating, trust score, activity score, identities, nicks, last seen and
   latest note; then bots, most active first; and a form to create either,
   optionally with identity ids.
-- **Person or bot** (`/person?name=NAME`): its trust score and what it was
-  made from, a slider to rate a person that explains each rating as it is
-  chosen, who invited them and whom they invited, and notes to add and
-  delete. Then its identities with their totals, with checkboxes and an
-  **All** link to remove several at once, a button to make a person a bot or
-  a bot a person, and forms to add identities by id or delete it.
+- **Person or bot** (`/person?name=NAME`): it opens with who they are across
+  all their identities: their nicks and the `ident@host` combinations they
+  connected from, most recent first, real names from pasted user lists, how
+  many identities on which network tags, their trust score, rating and who
+  invited them, when they were last seen and where, when they last spoke,
+  how long ago each was, the days they were present from first to last with
+  their time in channels, the days they spoke and their lines, their
+  activity score with any silent watcher flag, and the channels they were in
+  on the most days, each linked to the history of that channel. Links jump
+  to each section below. Then, in order: the last 10 lines they said in
+  channels, each day linked to that day in the history; their trust score
+  and what it was made from, a slider to rate a person that explains each
+  rating as it is chosen, who invited them and whom they invited; notes to
+  add and delete; their identities with their totals, with checkboxes and
+  an **All** link to remove several at once; and, under Manage, forms to
+  add identities by id, make a person a bot or a bot a person, and delete
+  it.
 - **History** (`/history?id=ID` or `/history?person=NAME`): everything an
   identity, or all of a person's identities, said in channels, most recent
   first, 200 lines to a page, with filters for a channel, a day and text the

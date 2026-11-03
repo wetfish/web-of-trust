@@ -1,21 +1,28 @@
 //! People and bots: who is behind identities, as decided by hand. Both are
 //! person records, told apart by their kind.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use axum::Router;
 use axum::extract::{Form, Query, State};
 use axum::response::Redirect;
 use axum::routing::{get, post};
+use chrono::NaiveDate;
 use maud::{Markup, html};
 use serde::Deserialize;
 
 use super::activity::activity_breakdown;
-use super::history::person_history_href;
-use super::identities::{Ticks, identity_table};
-use super::layout::{self, back_field, day, number, person_href};
+use super::history::{person_history_href, said};
+use super::identities::{
+    Ticks, identity_table, nick_rows, recent_connections, summary_connections, summary_nicks,
+    summary_real_names,
+};
+use super::layout::{
+    self, back_field, day, duration, number, person_href, silent_flag, url_encode,
+};
 use super::{App, Flash, PageError, PageResult, back_to, done, failed, filled, internal, with_db};
 use crate::decide;
+use crate::history::{self, Day, Line};
 use crate::lookup::{self, Filter};
 use crate::stats::{self, Kind, Person, Rating};
 use crate::trust::{self, ActivityScore};
@@ -215,15 +222,38 @@ async fn person_page(
             ..Filter::default()
         };
         let views = lookup::find(conn, &filter).map_err(internal)?;
+        let ids = person.identity_ids();
+        let (mut last_said, _) =
+            history::lines(conn, &ids, &history::Filter::default()).map_err(internal)?;
+        last_said.truncate(LAST_SAID);
+        // Each real name once, with when it was last seen on any identity.
+        let mut real_names: HashMap<String, String> = HashMap::new();
+        for id in &ids {
+            for (name, seen) in trust::real_names(conn, id).map_err(internal)? {
+                let last = real_names.entry(name).or_default();
+                if seen > *last {
+                    *last = seen;
+                }
+            }
+        }
+        let mut real_names: Vec<(String, String)> = real_names.into_iter().collect();
+        real_names.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        let today: String = conn
+            .query_row("SELECT date('now')", [], |row| row.get(0))
+            .map_err(internal)?;
         let context = PersonContext {
             all: filled(&query.all) == Some("yes"),
-            activity: trust::activity_score(conn, &person.identity_ids()).map_err(internal)?,
+            activity: trust::activity_score(conn, &ids).map_err(internal)?,
             inviters: stats::people_names(conn)
                 .map_err(internal)?
                 .into_iter()
                 .filter(|(name, kind)| *kind == Kind::Person && *name != person.name)
                 .map(|(name, _)| name)
                 .collect(),
+            days: history::days(conn, &ids).map_err(internal)?,
+            last_said,
+            real_names,
+            today: NaiveDate::parse_from_str(&today, "%Y-%m-%d").ok(),
         };
         Ok(layout::page(
             &person.name,
@@ -234,6 +264,11 @@ async fn person_page(
     .await
 }
 
+/// Lines shown under "Last said" on a person's page.
+const LAST_SAID: usize = 10;
+/// Channels listed in a person's summary.
+const MAX_SUMMARY_CHANNELS: usize = 5;
+
 /// What the person page shows besides the person.
 struct PersonContext {
     /// Whether every identity starts ticked.
@@ -241,42 +276,222 @@ struct PersonContext {
     activity: ActivityScore,
     /// Everyone who could have invited the person.
     inviters: Vec<String>,
+    /// The days any of their identities was present in a channel.
+    days: BTreeMap<NaiveDate, Day>,
+    /// The most recent lines they said in channels, newest first.
+    last_said: Vec<Line>,
+    /// Real names `/who` showed for any of their identities, with when each
+    /// was last seen, the most recent first.
+    real_names: Vec<(String, String)>,
+    /// For how long ago they were last seen.
+    today: Option<NaiveDate>,
+}
+
+/// How long before `today` a `YYYY-MM-DD` day, or a timestamp starting with
+/// one, was: `today`, `yesterday` or `12 days ago`.
+fn ago(today: Option<NaiveDate>, at: &str) -> Option<String> {
+    let at = NaiveDate::parse_from_str(at.get(..10)?, "%Y-%m-%d").ok()?;
+    Some(match (today? - at).num_days() {
+        ..=0 => "today".to_string(),
+        1 => "yesterday".to_string(),
+        days => format!("{} days ago", number(days)),
+    })
+}
+
+/// The channels present in on the most days, with their days, most first.
+fn top_channels(days: &BTreeMap<NaiveDate, Day>) -> Vec<(&str, i64)> {
+    let mut counts: HashMap<&str, i64> = HashMap::new();
+    for day in days.values() {
+        for channel in &day.channels {
+            *counts.entry(channel.as_str()).or_default() += 1;
+        }
+    }
+    let mut channels: Vec<(&str, i64)> = counts.into_iter().collect();
+    channels.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+    channels
+}
+
+/// Who the person is across all their identities, when they were last
+/// active, and how much they take part, before anything to decide.
+fn summary(person: &Person, views: &[lookup::IdentityView], context: &PersonContext) -> Markup {
+    let sessions = || views.iter().flat_map(|view| &view.sessions);
+    let nicks = nick_rows(sessions());
+    let nicks: Vec<&str> = nicks.iter().map(|row| row.nick.as_str()).collect();
+    let connections = recent_connections(sessions());
+    let last_seen = sessions().max_by(|a, b| a.end_at.cmp(&b.end_at));
+    let tags: BTreeSet<&str> = views.iter().map(|view| view.tag.as_str()).collect();
+    let days = &context.days;
+    let present = days.len() as i64;
+    let spoke_on = days.values().filter(|day| day.spoken > 0).count() as i64;
+    let spoken: i64 = days.values().map(|day| day.spoken).sum();
+    let channels = top_channels(days);
+    let silent =
+        person.kind == Kind::Person && !person.rating.trusted() && trust::silent(present, spoken);
+    let history = person_history_href(&person.name);
+    html! {
+        dl.summary {
+            dt { "Nicks" }
+            dd { (summary_nicks(&nicks, "No nicks seen")) }
+            (summary_real_names(&context.real_names))
+            dt { "Connects from" }
+            dd { (summary_connections(&connections)) }
+            dt { "Identities" }
+            dd {
+                a href="#identities" { (number(views.len() as i64)) }
+                @if !tags.is_empty() {
+                    " on " (tags.into_iter().collect::<Vec<_>>().join(", "))
+                }
+            }
+            @if person.kind == Kind::Person {
+                dt { "Trust" }
+                dd {
+                    "Trust score " strong { (trust::trust_score(person.rating, context.activity.score)) }
+                    " of 99, rated " (person.rating.label())
+                    @if let Some(by) = &person.invited_by {
+                        ", invited by " a href=(person_href(by)) { (by) }
+                    }
+                }
+            } @else {
+                dt { "Kind" }
+                dd { "A bot: not rated, and left out of activity rankings unless asked" }
+            }
+            dt { "Last seen" }
+            dd {
+                @match last_seen {
+                    Some(session) => {
+                        strong { (day(Some(session.end_at.as_str()))) }
+                        @if let Some(ago) = ago(context.today, &session.end_at) {
+                            " (" (ago) ")"
+                        }
+                        @if session.channel {
+                            " in " (session.target)
+                        } @else {
+                            " in a private message"
+                        }
+                    },
+                    None => span.muted { "Never: no identity has sessions" },
+                }
+            }
+            dt { "Last spoke" }
+            dd {
+                @match context.last_said.first() {
+                    Some(line) if !line.date.is_empty() => {
+                        strong { (line.date) }
+                        @if let Some(ago) = ago(context.today, &line.date) {
+                            " (" (ago) ")"
+                        }
+                        " in " (line.channel) ", " a href="#said" { "below" }
+                    },
+                    Some(line) => {
+                        "In " (line.channel) ", on a day the log does not give, "
+                        a href="#said" { "below" }
+                    },
+                    None => span.muted { "Never in a channel" },
+                }
+            }
+            dt { "Present" }
+            dd {
+                @match (days.first_key_value(), days.last_key_value()) {
+                    (Some((first, _)), Some((last, _))) => {
+                        "On " (number(present)) " days from " (first) " to " (last) ", "
+                        (duration(lookup::present_minutes(sessions()))) " in channels; spoke on "
+                        (number(spoke_on)) " of them, " (number(spoken)) " lines; activity score "
+                        (context.activity.score) " of 100"
+                        @if silent {
+                            " " (silent_flag(present))
+                        }
+                    },
+                    _ => span.muted { "Never in a channel" },
+                }
+            }
+            @if !channels.is_empty() {
+                dt { "Mostly in" }
+                dd {
+                    @for (i, (channel, count)) in channels.iter().take(MAX_SUMMARY_CHANNELS).enumerate() {
+                        @if i > 0 { ", " }
+                        a href=(format!("{history}&channel={}", url_encode(channel))) { (channel) }
+                        span.muted { " (" (number(*count)) " days)" }
+                    }
+                    @if channels.len() > MAX_SUMMARY_CHANNELS {
+                        " and " (channels.len() - MAX_SUMMARY_CHANNELS) " more"
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The most recent lines, each day a link to that day in the history.
+fn last_said(person: &Person, lines: &[Line]) -> Markup {
+    let history = person_history_href(&person.name);
+    html! {
+        @if lines.is_empty() {
+            p.muted { "Nothing said in channels." }
+        } @else {
+            div.scroll {
+                table.lines {
+                    thead {
+                        tr {
+                            th { "Day" }
+                            th { "Time" }
+                            th { "Channel" }
+                            th { "Line" }
+                        }
+                    }
+                    tbody {
+                        @for line in lines {
+                            tr {
+                                td {
+                                    @if line.date.is_empty() {
+                                        span.muted { "-" }
+                                    } @else {
+                                        a href=(format!("{history}&day={}", url_encode(&line.date))) {
+                                            (line.date)
+                                        }
+                                    }
+                                }
+                                td { (line.time) }
+                                td { (line.channel) }
+                                td.wrap { (said(line)) }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        p { a href=(history) { "Everything they said, and the days they were present" } }
+    }
 }
 
 fn page(person: &Person, views: &[lookup::IdentityView], context: &PersonContext) -> Markup {
     let here = person_href(&person.name);
-    let spoken: i64 = views.iter().map(|view| view.spoken()).sum();
-    let minutes: i64 = views.iter().map(|view| view.channel_minutes()).sum();
     let (kind, other) = match person.kind {
         Kind::Person => ("person", Kind::Bot),
         Kind::Bot => ("bot", Kind::Person),
     };
     html! {
         p.crumbs { a href="/people" { "People and bots" } }
-        h1 { (person.name) }
+        h1 { (person.name) " " span.id-label { (kind) } }
         @if let Some(note) = &person.note {
             p.lead { (note) }
         }
-        p.note {
-            @if person.kind == Kind::Bot {
-                "A bot: activity rankings leave its identities out unless asked. "
-            }
-            (number(views.len() as i64)) " identities with sessions, "
-            (layout::duration(minutes)) " in channels, " (number(spoken)) " spoken lines. "
-            "Added " (day(Some(person.created_at.as_str()))) "."
-        }
-        form.inline method="post" action="/people/kind" {
-            input type="hidden" name="name" value=(person.name);
-            input type="hidden" name="kind" value=(other.as_str());
-            button.secondary type="submit" {
-                @match other {
-                    Kind::Bot => "Make it a bot",
-                    Kind::Person => "Make it a person",
-                }
-            }
+        (summary(person, views, context))
+
+        nav.on-page aria-label="On this page" {
+            a href="#said" { "Last said" }
+            a href="#trust" { "Trust" }
+            a href="#notes" { "Notes" }
+            a href="#identities" { "Identities" }
+            a href=(person_history_href(&person.name)) { "Everything they said" }
+            a href="#manage" { "Manage" }
         }
 
-        section.decision {
+        section id="said" {
+            h2 { "Last said" }
+            (last_said(person, &context.last_said))
+        }
+
+        section.decision id="trust" {
             h2 { "Trust" }
             @if person.kind == Kind::Person {
                 p.lead {
@@ -297,7 +512,7 @@ fn page(person: &Person, views: &[lookup::IdentityView], context: &PersonContext
             }
         }
 
-        section.decision {
+        section.decision id="notes" {
             h2 { "Notes" }
             @if person.notes.is_empty() {
                 p.muted { "No notes yet." }
@@ -327,8 +542,7 @@ fn page(person: &Person, views: &[lookup::IdentityView], context: &PersonContext
             }
         }
 
-        h2 { "Identities" }
-        p { a href=(person_history_href(&person.name)) { "Everything they said, and the days they were present" } }
+        h2 id="identities" { "Identities" }
         @if views.is_empty() {
             p { "None of this " (kind) "'s identities have sessions." }
         } @else {
@@ -343,21 +557,36 @@ fn page(person: &Person, views: &[lookup::IdentityView], context: &PersonContext
                 }
             }
         }
-        h2 { "Add identities" }
-        form.inline method="post" action="/people/add" {
-            (back_field(&here))
-            input type="hidden" name="name" value=(person.name);
-            label { "Identity ids, separated by spaces " input type="text" name="id" required; }
-            button type="submit" { "Add" }
-        }
-        h2 { "Delete" }
-        form.inline method="post" action="/people/delete" {
-            input type="hidden" name="name" value=(person.name);
-            label {
-                input type="checkbox" name="confirm" value="yes" required;
-                " Delete " (person.name) "; their identities are kept and belong to no one"
+        section.decision id="manage" {
+            h2 { "Manage" }
+            h3 { "Add identities" }
+            form.inline method="post" action="/people/add" {
+                (back_field(&here))
+                input type="hidden" name="name" value=(person.name);
+                label { "Identity ids, separated by spaces " input type="text" name="id" required; }
+                button type="submit" { "Add" }
             }
-            button.danger type="submit" { "Delete " (kind) }
+            h3 { "Person or bot" }
+            form.inline method="post" action="/people/kind" {
+                input type="hidden" name="name" value=(person.name);
+                input type="hidden" name="kind" value=(other.as_str());
+                span.muted { "Added " (day(Some(person.created_at.as_str()))) " as a " (kind) ". " }
+                button.secondary type="submit" {
+                    @match other {
+                        Kind::Bot => "Make it a bot",
+                        Kind::Person => "Make it a person",
+                    }
+                }
+            }
+            h3 { "Delete" }
+            form.inline method="post" action="/people/delete" {
+                input type="hidden" name="name" value=(person.name);
+                label {
+                    input type="checkbox" name="confirm" value="yes" required;
+                    " Delete " (person.name) "; their identities are kept and belong to no one"
+                }
+                button.danger type="submit" { "Delete " (kind) }
+            }
         }
     }
 }
@@ -731,6 +960,8 @@ async fn delete_note(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lookup::{IdentityView, SessionRow};
+    use crate::review::identities::tests::session;
 
     #[test]
     fn splits_identity_ids() {
@@ -757,7 +988,127 @@ mod tests {
             all: false,
             activity: ActivityScore::default(),
             inviters: vec!["rachel".into()],
+            days: BTreeMap::new(),
+            last_said: Vec::new(),
+            real_names: Vec::new(),
+            today: NaiveDate::from_ymd_opt(2026, 11, 3),
         }
+    }
+
+    #[test]
+    fn sums_up_a_person_across_identities() {
+        let at = |start: &str, end: &str, mut session: SessionRow| {
+            session.start_at = start.into();
+            session.end_at = end.into();
+            session
+        };
+        let views = [
+            IdentityView {
+                id: "1a2b3c4d5e6f".into(),
+                tag: "wetfish".into(),
+                people: vec!["quokka".into()],
+                sessions: vec![at(
+                    "2024-12-11 10:00",
+                    "2024-12-11 12:00",
+                    session(&["quokka_old"], "host", Some("old.example.net")),
+                )],
+            },
+            IdentityView {
+                id: "6f5e4d3c2b1a".into(),
+                tag: "wetfish-bouncer".into(),
+                people: vec!["quokka".into()],
+                sessions: vec![
+                    at(
+                        "2026-10-01 10:00",
+                        "2026-10-01 12:00",
+                        session(&["quokka"], "host", Some("new.example.net")),
+                    ),
+                    // The same hour logged in a second channel counts once.
+                    at(
+                        "2026-10-01 11:00",
+                        "2026-10-01 12:00",
+                        session(&["quokka"], "host", Some("new.example.net")),
+                    ),
+                ],
+            },
+        ];
+        let day = |date: &str, spoken: i64| {
+            (
+                NaiveDate::parse_from_str(date, "%Y-%m-%d").unwrap(),
+                Day {
+                    channels: BTreeSet::from(["#dryfish".to_string()]),
+                    spoken,
+                },
+            )
+        };
+        let context = PersonContext {
+            days: BTreeMap::from([day("2024-12-11", 0), day("2026-10-01", 2)]),
+            last_said: vec![Line {
+                date: "2026-10-01".into(),
+                time: "11:30".into(),
+                channel: "#dryfish".into(),
+                nick: "quokka".into(),
+                action: false,
+                text: "see you <soon>".into(),
+            }],
+            real_names: vec![("Quokka Wet".into(), "2026-10-02 07:00:00".into())],
+            ..context()
+        };
+        let person = Person {
+            rating: Rating::Vouched,
+            invited_by: Some("rachel".into()),
+            ..record("quokka", Kind::Person)
+        };
+        let page = page(&person, &views, &context).into_string();
+        let at = |text: &str| {
+            page.find(text)
+                .unwrap_or_else(|| panic!("{text} in {page}"))
+        };
+
+        // Nicks and hosts of every identity, the most recent first.
+        assert!(at(r#"href="/identities?nick=quokka">"#) < at(r#"nick=quokka_old""#));
+        assert!(at("new.example.net") < at("old.example.net"));
+        assert!(page.contains("<strong>Quokka Wet</strong> (2026-10-02)"));
+        assert!(page.contains("on wetfish, wetfish-bouncer"));
+        assert!(page.contains(r#", invited by <a href="/person?name=rachel">rachel</a>"#));
+
+        // When they were last there and last spoke.
+        assert!(
+            page.contains("<strong>2026-10-01</strong> (33 days ago) in #dryfish"),
+            "{page}"
+        );
+        assert!(page.contains("On 2 days from 2024-12-11 to 2026-10-01, 4h in channels"));
+        assert!(page.contains("spoke on 1 of them, 2 lines"));
+        assert!(page.contains(r#"href="/history?person=quokka&amp;channel=%23dryfish""#));
+
+        // The last lines come before the decisions, each day a link.
+        assert!(page.contains("see you &lt;soon&gt;"));
+        assert!(page.contains(r#"href="/history?person=quokka&amp;day=2026-10-01""#));
+        assert!(at(r#"<section id="said">"#) < at(r#"id="trust""#));
+        assert!(at(r#"id="trust""#) < at(r#"id="manage""#));
+        assert!(at(r#"id="manage""#) < at(r#"name="kind" value="bot""#));
+        assert!(!page.contains("Silent"));
+    }
+
+    #[test]
+    fn flags_a_silent_watcher_and_says_how_long_ago() {
+        let days: BTreeMap<NaiveDate, Day> = (0..40)
+            .map(|n| {
+                let date = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap() + chrono::Days::new(n);
+                (date, Day::default())
+            })
+            .collect();
+        let context = PersonContext { days, ..context() };
+        let page = page(&record("marlowe", Kind::Person), &[], &context).into_string();
+        assert!(page.contains("Silent 40 days"));
+        assert!(page.contains("Nothing said in channels."));
+
+        let today = NaiveDate::from_ymd_opt(2026, 11, 3);
+        assert_eq!(ago(today, "2026-11-03 01:00").as_deref(), Some("today"));
+        assert_eq!(ago(today, "2026-11-02").as_deref(), Some("yesterday"));
+        assert_eq!(ago(today, "2024-11-03").as_deref(), Some("730 days ago"));
+        assert_eq!(ago(None, "2026-11-02"), None);
+        assert_eq!(ago(today, ""), None);
     }
 
     #[test]

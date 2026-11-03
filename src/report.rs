@@ -9,7 +9,7 @@ use chrono::NaiveDate;
 use crate::db::ImportSummary;
 use crate::discover::{Inventory, LogFile, TargetKind};
 use crate::identity::RebuildSummary;
-use crate::lookup::{Filter, IdentityView, SessionRow};
+use crate::lookup::{Filter, IdentityView, SessionRow, present_minutes};
 use crate::scan::{ChannelActivity, FileStats, Scan};
 
 /// A log file with the counts read from it.
@@ -316,8 +316,8 @@ pub fn identities(out: &mut impl Write, filter: &Filter, views: &[IdentityView])
     )?;
     writeln!(
         out,
-        "{}, most recently seen first. Channel time adds up time in each channel, so time \
-         in two channels at once counts twice. Private messages add no time.",
+        "{}, most recently seen first. Channel time is time present in any channel: time \
+         in two channels at once counts once. Private messages add no time.",
         count_plural(views.len() as u64, "identity", "identities")
     )?;
     writeln!(out)?;
@@ -332,7 +332,7 @@ pub fn identities(out: &mut impl Write, filter: &Filter, views: &[IdentityView])
                 nick_list(sessions, 4),
                 thousands(connections(sessions).len() as u64),
                 thousands(sessions.len() as u64),
-                duration(channel_minutes(sessions.iter())),
+                duration(present_minutes(sessions)),
                 thousands(spoken(sessions.iter())),
                 day(&sessions[0].start_at).to_string(),
                 day(view.last_seen()).to_string(),
@@ -407,7 +407,7 @@ fn identity_details(out: &mut impl Write, view: &IdentityView) -> io::Result<()>
         "Seen {} to {}, channel time {}, {}",
         day(&sessions[0].start_at),
         day(view.last_seen()),
-        duration(channel_minutes(sessions.iter())),
+        duration(present_minutes(sessions)),
         count_u64(spoken(sessions.iter()), "spoken line"),
     )?;
 
@@ -674,13 +674,6 @@ fn link_label(link: &str) -> &str {
         "cut" => "cut",
         other => other,
     }
-}
-
-fn channel_minutes<'a>(sessions: impl Iterator<Item = &'a SessionRow>) -> i64 {
-    sessions
-        .filter(|session| session.channel)
-        .map(|session| session.minutes)
-        .sum()
 }
 
 fn spoken<'a>(sessions: impl Iterator<Item = &'a SessionRow>) -> u64 {

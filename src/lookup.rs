@@ -5,6 +5,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 
+use chrono::NaiveDateTime;
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::db::Result;
@@ -45,6 +46,37 @@ impl Filter {
         }
         parts.join(", ")
     }
+}
+
+/// Minutes present in channels. Sessions that overlap, such as one in each
+/// of several channels or the same channel logged twice, count once, so the
+/// time can never be more than the time from the first session to the last.
+pub fn present_minutes<'a>(sessions: impl IntoIterator<Item = &'a SessionRow>) -> i64 {
+    let at = |at: &str| NaiveDateTime::parse_from_str(at, "%Y-%m-%d %H:%M").ok();
+    let mut spans: Vec<(NaiveDateTime, NaiveDateTime)> = sessions
+        .into_iter()
+        .filter(|session| session.channel)
+        .filter_map(|session| Some((at(&session.start_at)?, at(&session.end_at)?)))
+        .filter(|(start, end)| end > start)
+        .collect();
+    spans.sort();
+    let mut minutes = 0;
+    let mut open: Option<(NaiveDateTime, NaiveDateTime)> = None;
+    for (start, end) in spans {
+        if let Some((_, until)) = open.as_mut()
+            && start <= *until
+        {
+            *until = (*until).max(end);
+            continue;
+        }
+        if let Some((from, until)) = open.replace((start, end)) {
+            minutes += (until - from).num_minutes();
+        }
+    }
+    if let Some((from, until)) = open {
+        minutes += (until - from).num_minutes();
+    }
+    minutes
 }
 
 /// One session of an identity, with the file it is in.
@@ -127,13 +159,9 @@ impl IdentityView {
             .len()
     }
 
-    /// Minutes present in channels, added up over channels.
+    /// Minutes present in channels, with overlapping sessions counted once.
     pub fn channel_minutes(&self) -> i64 {
-        self.sessions
-            .iter()
-            .filter(|session| session.channel)
-            .map(|session| session.minutes.max(0))
-            .sum()
+        present_minutes(&self.sessions)
     }
 
     /// Messages and actions.
@@ -470,6 +498,42 @@ mod tests {
         )
         .unwrap();
         assert!(none.is_empty());
+    }
+
+    #[test]
+    fn counts_overlapping_channel_time_once() {
+        let session = |start: &str, end: &str, channel: bool| SessionRow {
+            nicks: vec!["quokka".into()],
+            ident: None,
+            host: None,
+            link: "host".into(),
+            start_at: format!("2026-11-01 {start}"),
+            end_at: format!("2026-11-01 {end}"),
+            minutes: 0,
+            spoken: 0,
+            logger: false,
+            channel,
+            target: "#analysis".into(),
+            file_id: 1,
+            file: "wetfish/#analysis.log".into(),
+            path: "/logs/wetfish/#analysis.log".into(),
+            start_line: 1,
+            end_line: None,
+            inferred_from: None,
+        };
+        let sessions = [
+            // Two channels at once, then the second channel logged twice.
+            session("10:00", "12:00", true),
+            session("11:00", "13:00", true),
+            session("11:30", "12:30", true),
+            // A gap, then an hour on its own.
+            session("15:00", "16:00", true),
+            // Private messages are not time in channels.
+            session("17:00", "20:00", false),
+        ];
+        assert_eq!(present_minutes(&sessions), 4 * 60);
+        assert_eq!(present_minutes(&sessions[3..]), 60);
+        assert_eq!(present_minutes(&sessions[..0]), 0);
     }
 
     #[test]

@@ -20,6 +20,19 @@ pub(super) fn routes() -> Router<App> {
     Router::new().route("/history", get(history_page))
 }
 
+/// A line the way irssi shows it: `<nick> text`, or `* nick text` for an
+/// action.
+pub(super) fn said(line: &Line) -> Markup {
+    html! {
+        @if line.action {
+            "* " strong { (line.nick) } " " (line.text)
+        } @else {
+            span.muted { "<" } strong { (line.nick) } span.muted { ">" }
+            " " (line.text)
+        }
+    }
+}
+
 /// A link to an identity's history.
 pub(super) fn identity_history_href(id: &str) -> String {
     format!("/history?id={}", url_encode(id))
@@ -244,14 +257,7 @@ fn page(
                                 }
                                 td { (line.time) }
                                 td { (line.channel) }
-                                td.wrap {
-                                    @if line.action {
-                                        "* " strong { (line.nick) } " " (line.text)
-                                    } @else {
-                                        span.muted { "<" } strong { (line.nick) } span.muted { ">" }
-                                        " " (line.text)
-                                    }
-                                }
+                                td.wrap { (said(line)) }
                             }
                         }
                     }
