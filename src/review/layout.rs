@@ -86,6 +86,18 @@ pub fn url_encode(value: &str) -> String {
     out
 }
 
+/// A red flag on someone present for many days who never said a line.
+pub fn silent_flag(days: i64) -> Markup {
+    html! {
+        span.flag title=(format!(
+            "Present on {} days without saying a line: watching, not taking part",
+            number(days)
+        )) {
+            "\u{2691} Silent " (number(days)) " days"
+        }
+    }
+}
+
 /// A count with thousands separators, such as `12,345`.
 pub fn number(n: i64) -> String {
     let digits = n.unsigned_abs().to_string();

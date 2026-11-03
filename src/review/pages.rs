@@ -48,7 +48,9 @@ async fn channel_page(
         let review = trust::review(conn, &channel.tag, &channel.name).map_err(internal)?;
         let who = trust::latest_who(conn, &channel.tag, &channel.name).map_err(internal)?;
         let checked = match &who {
-            Some(list) => trust::check(conn, &channel.tag, &list.entries).map_err(internal)?,
+            Some(list) => {
+                trust::check(conn, &channel.tag, &channel.name, &list.entries).map_err(internal)?
+            }
             None => Vec::new(),
         };
         let section = channels::trust_section(

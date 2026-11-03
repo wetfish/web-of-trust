@@ -520,11 +520,11 @@ ticked.
   [Activity](#activity). Filters choose a channel or all channels, a year or
   all time, the order (least active, most active or longest present first),
   the days present an identity needs to be ranked (7 unless chosen), and
-  whether to include bots, which are labelled "bot". Over all channels, each
-  row shows the identity's network tag. Channel pages link to their own
-  ranking. The identity page shows the identity's activity by year, with each
-  month behind a fold, and notes private messages when it never spoke in a
-  channel.
+  whether to include bots, which are labelled "bot". Identities present on 30
+  days or more without a line get a red flag. Over all channels, each row
+  shows the identity's network tag. Channel pages link to their own ranking.
+  The identity page shows the identity's activity by year, with each month
+  behind a fold, and notes private messages when it never spoke in a channel.
 
 ### Code
 
@@ -809,11 +809,20 @@ When several identities match, the most recently seen is used. Its person or
 bot then decides the list:
 
 - **Trusted:** an exact or new nick match to a person rated vouched or known.
-- **Untrusted:** never seen, or matched to someone rated wary or distrusted,
-  including by nick only.
+- **Untrusted:** a silent watcher (see below), never seen, or matched to
+  someone rated wary or distrusted, including by nick only.
 - **Undecided:** everyone else: rated neutral, not linked to a person, or
   matched by nick only.
 - **Bots:** matched to a bot.
+
+A **silent watcher** has been present in the channel on at least 30 days
+without ever saying a line there, counting all of a person's identities. That
+is how an account collecting logs behaves, so they get a red flag and are
+listed as untrusted, the longest silent first, whatever else they matched as.
+Rating them vouched or known clears the flag, for someone you know who only
+reads; bots are never flagged. The same flag shows on the activity ranking and
+on identity pages, for an identity present on 30 days or more without a line
+in any channel.
 
 Each list shows the nick and status, `ident@host`, real name, person or bot
 and rating, trust and activity scores, the identity, and how it was matched.

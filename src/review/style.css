@@ -477,3 +477,27 @@ ul.notes li {
     display: flex;
     gap: 1rem;
 }
+
+/* A red flag on someone present for many days who never said a line. */
+.flag {
+    display: inline-block;
+    padding: 0.05rem 0.45rem;
+    border-radius: 3px;
+    background: var(--danger);
+    color: var(--background);
+    font-weight: 700;
+    font-size: 0.85em;
+    white-space: nowrap;
+}
+
+tr.flagged,
+tr.flagged:hover {
+    background: var(--error-background);
+}
+
+.flag-banner {
+    padding: 0.6rem 0.8rem;
+    border: 2px solid var(--danger);
+    border-radius: 6px;
+    background: var(--error-background);
+}

@@ -6,10 +6,10 @@ use axum::routing::get;
 use maud::{Markup, html};
 use serde::Deserialize;
 
-use super::layout::{self, duration, identity_href, number, person_href};
+use super::layout::{self, duration, identity_href, number, person_href, silent_flag};
 use super::{App, Flash, PageResult, filled, internal, with_db};
 use crate::activity::{self, Order, RankFilter, RankRow, Totals};
-use crate::trust::ActivityScore;
+use crate::trust::{self, ActivityScore};
 
 /// Identities shown in a ranking.
 const MAX_ROWS: usize = 200;
@@ -94,7 +94,9 @@ fn page(
             "show conversations with the logging client, and so is the logging client itself. "
             strong { "Heard" } " counts the lines said in a channel while the identity was there, "
             "its own included; " strong { "share" } " is how much of that it said itself. "
-            "Someone present for a long time with a share near zero is listening, not talking."
+            "Someone present for a long time with a share near zero is listening, not talking; "
+            "present on " (trust::SILENT_DAYS) " days or more without a single line, they get a "
+            "red flag."
         }
         form.search method="get" action="/activity" {
             label {
@@ -171,11 +173,14 @@ fn page(
                     }
                     tbody {
                         @for (rank, row) in rows.iter().enumerate() {
-                            tr {
+                            tr.flagged[!row.bot && trust::silent(row.totals.days_present, row.totals.spoken)] {
                                 td.num { (rank + 1) }
                                 td {
                                     a href=(identity_href(&row.identity_id)) { code { (row.identity_id) } }
                                     @if row.bot { " " span.warning { "bot" } }
+                                    @if !row.bot && trust::silent(row.totals.days_present, row.totals.spoken) {
+                                        " " (silent_flag(row.totals.days_present))
+                                    }
                                 }
                                 @if show_tag { td { (row.tag) } }
                                 td {
@@ -266,6 +271,14 @@ pub(super) fn identity_section(
                 "Activity score " strong { (score.score) } " of 100."
             }
             (activity_breakdown(score))
+        }
+        @if !bot && trust::silent(total.days_present, total.spoken) {
+            p.flag-banner {
+                (silent_flag(total.days_present))
+                " Present in channels on " (number(total.days_present))
+                " days without saying a line: watching, not taking part. Pasted user lists "
+                "count it as untrusted until it belongs to someone rated vouched or known."
+            }
         }
         @if total.spoken == 0 {
             p.note {

@@ -20,6 +20,15 @@ use crate::db::Result;
 use crate::lookup;
 use crate::stats::{Kind, Rating};
 
+/// Days present in a channel without ever saying a line there that flag
+/// someone as a silent watcher, untrusted unless rated vouched or known.
+pub const SILENT_DAYS: i64 = 30;
+
+/// Whether days present with no spoken lines make a silent watcher.
+pub fn silent(days_present: i64, spoken: i64) -> bool {
+    spoken == 0 && days_present >= SILENT_DAYS
+}
+
 /// How long a channel review stays valid.
 pub const REVIEW_VALID_MONTHS: i64 = 6;
 /// Channels are ranked by their activity over this many months, the current
@@ -423,6 +432,10 @@ pub struct Checked {
     pub activity: ActivityScore,
     /// None for bots and users never seen.
     pub trust: Option<i64>,
+    /// Days present in the channel without a spoken line there, when that
+    /// makes them a silent watcher. Never set for bots or for people rated
+    /// vouched or known.
+    pub silent_days: Option<i64>,
     pub verdict: Verdict,
 }
 
@@ -488,8 +501,40 @@ fn identities_matching(
     Ok(ids)
 }
 
+/// Days present in a channel and lines said there, by a set of identities.
+/// Days on which two of them were present count twice.
+pub fn channel_presence(
+    conn: &Connection,
+    tag: &str,
+    channel: &str,
+    identities: &[String],
+) -> Result<(i64, i64)> {
+    if identities.is_empty() {
+        return Ok((0, 0));
+    }
+    let placeholders: Vec<String> = (3..identities.len() + 3).map(|n| format!("?{n}")).collect();
+    let values = [tag, channel]
+        .into_iter()
+        .chain(identities.iter().map(String::as_str));
+    let presence = conn.query_row(
+        &format!(
+            "SELECT coalesce(sum(days_present), 0), coalesce(sum(spoken), 0) FROM activity
+             WHERE tag = ?1 AND channel = ?2 COLLATE NOCASE AND identity_id IN ({})",
+            placeholders.join(", ")
+        ),
+        params_from_iter(values),
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    Ok(presence)
+}
+
 /// Checks each user of a channel in a network tag.
-pub fn check(conn: &Connection, tag: &str, entries: &[WhoEntry]) -> Result<Vec<Checked>> {
+pub fn check(
+    conn: &Connection,
+    tag: &str,
+    channel: &str,
+    entries: &[WhoEntry],
+) -> Result<Vec<Checked>> {
     let records = records(conn)?;
     let mut scores: HashMap<Vec<String>, ActivityScore> = HashMap::new();
     let mut checked = Vec::with_capacity(entries.len());
@@ -531,6 +576,11 @@ pub fn check(conn: &Connection, tag: &str, entries: &[WhoEntry]) -> Result<Vec<C
             Some(record) => record.identities.clone(),
             None => identity.iter().cloned().collect(),
         };
+        let rating = record.as_ref().map_or(Rating::Neutral, |r| r.rating);
+        let bot = record.as_ref().is_some_and(|r| r.kind == Kind::Bot);
+        let (days_present, spoken) = channel_presence(conn, tag, channel, &activity_ids)?;
+        let silent_days =
+            (silent(days_present, spoken) && !bot && !rating.trusted()).then_some(days_present);
         let activity = match scores.get(&activity_ids) {
             Some(score) => *score,
             None => {
@@ -539,10 +589,10 @@ pub fn check(conn: &Connection, tag: &str, entries: &[WhoEntry]) -> Result<Vec<C
                 score
             }
         };
-        let rating = record.as_ref().map_or(Rating::Neutral, |r| r.rating);
-        let bot = record.as_ref().is_some_and(|r| r.kind == Kind::Bot);
         let verdict = match how {
             Match::Unknown => Verdict::Untrusted,
+            // Watching for weeks without a word is a red flag of its own.
+            _ if silent_days.is_some() => Verdict::Untrusted,
             Match::NickOnly if rating.untrusted() => Verdict::Untrusted,
             Match::NickOnly => Verdict::Undecided,
             _ if bot => Verdict::Bot,
@@ -559,6 +609,7 @@ pub fn check(conn: &Connection, tag: &str, entries: &[WhoEntry]) -> Result<Vec<C
             record,
             activity,
             trust,
+            silent_days,
             verdict,
         });
     }
@@ -771,7 +822,7 @@ mod tests {
              22:20 -!- marlowe [marlowewet@hostM] has joined #analysis\n\
              22:21 -!- relay [relay@bots.example.org] has joined #analysis\n\
              22:22 <relay> build passed\n\
-             --- Log closed Sun Nov 01 23:00:00 2026\n",
+             --- Log closed Sat Dec 05 23:00:00 2026\n",
         )
         .unwrap();
         let mut conn = db::open(&root.0.join("wot.sqlite")).unwrap();
@@ -799,14 +850,15 @@ mod tests {
             entry("relay", "relay@bots.example.org", "Relay"),
             entry("stranger", "x@nowhere", ""),
         ];
-        let checked = check(&conn, "wetfish", &users).unwrap();
+        let checked = check(&conn, "wetfish", "#analysis", &users).unwrap();
         let summary: Vec<(Match, Verdict)> = checked.iter().map(|c| (c.how, c.verdict)).collect();
         assert_eq!(
             summary,
             [
                 (Match::Exact, Verdict::Trusted),
                 (Match::NewNick, Verdict::Trusted),
-                (Match::NickOnly, Verdict::Undecided),
+                // marlowe sat in the channel for weeks without a word.
+                (Match::NickOnly, Verdict::Untrusted),
                 (Match::Exact, Verdict::Bot),
                 (Match::Unknown, Verdict::Untrusted),
             ]
@@ -819,17 +871,47 @@ mod tests {
             Some(trust_score(Rating::Known, checked[0].activity.score))
         );
         assert_eq!(checked[3].trust, None);
+        assert!(checked[2].silent_days.unwrap() >= SILENT_DAYS);
+        assert_eq!(checked[0].silent_days, None, "quokka spoke");
+        assert_eq!(checked[3].silent_days, None, "bots are never flagged");
+
+        // Rating a silent watcher vouched or known clears the flag.
+        let marlowe = checked[2].identity.clone().unwrap();
+        decide::create_person(&mut conn, "marlowe", Kind::Person, &[marlowe], None).unwrap();
+        decide::set_rating(&conn, "marlowe", Rating::Vouched).unwrap();
+        let rated = check(&conn, "wetfish", "#analysis", &users[2..3]).unwrap();
+        assert_eq!(rated[0].silent_days, None);
+        assert_eq!(
+            rated[0].verdict,
+            Verdict::Undecided,
+            "still only a nick match"
+        );
+        assert!(silent(SILENT_DAYS, 0));
+        assert!(!silent(SILENT_DAYS - 1, 0));
+        assert!(!silent(365, 1));
         assert_eq!(checked[4].trust, None);
 
         // Someone using a trusted nick from an unknown host gets no trust.
-        let impostor = check(&conn, "wetfish", &[entry("quokka", "evil@elsewhere", "")]).unwrap();
+        let impostor = check(
+            &conn,
+            "wetfish",
+            "#analysis",
+            &[entry("quokka", "evil@elsewhere", "")],
+        )
+        .unwrap();
         assert_eq!(
             (impostor[0].how, impostor[0].verdict),
             (Match::NickOnly, Verdict::Undecided)
         );
         // A distrusted nick stays untrusted from any host.
         decide::set_rating(&conn, "quokka", Rating::Distrusted).unwrap();
-        let impostor = check(&conn, "wetfish", &[entry("quokka", "evil@elsewhere", "")]).unwrap();
+        let impostor = check(
+            &conn,
+            "wetfish",
+            "#analysis",
+            &[entry("quokka", "evil@elsewhere", "")],
+        )
+        .unwrap();
         assert_eq!(impostor[0].verdict, Verdict::Untrusted);
 
         // Pasted lists keep real names, which the logs never show.
