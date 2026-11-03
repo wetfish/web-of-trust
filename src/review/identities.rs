@@ -13,8 +13,8 @@ use serde::Deserialize;
 use super::activity::identity_section;
 use super::history::identity_history_href;
 use super::layout::{
-    self, back_field, channel_href, day, duration, identity_href, number, person_href, search_href,
-    silent_flag,
+    self, back_field, channel_href, day, duration, identity_href, lapse_flag, number, person_href,
+    search_href, silent_flag,
 };
 use super::people::record_options;
 use super::{App, Flash, PageError, PageResult, filled, internal, with_db};
@@ -486,7 +486,12 @@ async fn identity_page(
             months: activity::months(conn, &view.id, None).map_err(internal)?,
             private_spoken: activity::private_spoken(conn, &view.id).map_err(internal)?,
             bot: activity::bots(conn).map_err(internal)?.contains(&view.id),
-            score: trust::activity_score(conn, std::slice::from_ref(&view.id)).map_err(internal)?,
+            score: trust::activity_score(
+                conn,
+                std::slice::from_ref(&view.id),
+                trust::newest_month(conn).map_err(internal)?,
+            )
+            .map_err(internal)?,
             real_names: trust::real_names(conn, &view.id).map_err(internal)?,
             record: trust::records(conn)
                 .map_err(internal)?
@@ -513,6 +518,10 @@ fn identity(view: &IdentityView, context: &Context) -> Markup {
         total.spoken += month.spoken;
     }
     let silent = !context.bot && trust::silent(total.days_present, total.spoken);
+    let rated_trusted = context
+        .record
+        .as_ref()
+        .is_some_and(|record| record.rating.trusted());
     html! {
         p.crumbs { a href="/identities" { "Identities" } " / " (view.tag) }
         h1 {
@@ -548,6 +557,8 @@ fn identity(view: &IdentityView, context: &Context) -> Markup {
                 (context.score.score) " of 100"
                 @if silent {
                     " " (silent_flag(total.days_present))
+                } @else if !context.bot {
+                    " " (lapse_flag(&context.score, rated_trusted))
                 }
             }
             dt { "Sessions" }

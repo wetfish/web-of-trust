@@ -510,6 +510,18 @@ ul.notes li {
     white-space: nowrap;
 }
 
+/* Someone who used to take part and stopped: worth a look, not a red flag. */
+.flag-inactive {
+    display: inline-block;
+    padding: 0.05rem 0.45rem;
+    border: 1px solid var(--warning);
+    border-radius: 3px;
+    color: var(--warning);
+    font-weight: 700;
+    font-size: 0.85em;
+    white-space: nowrap;
+}
+
 tr.flagged,
 tr.flagged:hover {
     background: var(--error-background);

@@ -19,10 +19,10 @@ serves a web interface on this computer for reviewing all of it, ranking the
 most and least active identities, and making the same decisions in a browser.
 People get your own rating, notes and who invited them, which together with
 their activity make a trust score, and a channel's current users, pasted from
-irssi's `/who`, are sorted into trusted, untrusted and undecided. Tags that are
-one server are linked into networks, and lines logged twice, by a client and a
-bouncer, count once. The social
-graph of who talks to whom comes next.
+irssi's `/who`, are sorted into trusted, inactive, untrusted and undecided.
+Tags that are one server are linked into networks, and lines logged twice, by
+a client and a bouncer, count once. The social graph of who talks to whom
+comes next.
 
 ## Requirements
 
@@ -538,11 +538,11 @@ ticked.
   was last pasted. See [Trust](#trust).
 - **Channel** (`/channel?tag=TAG&name=CHANNEL`): the channel's review status
   with a button to mark it reviewed, a box to paste `/who` output into, and
-  the users of the latest list in trusted, untrusted, undecided and bots,
-  see [Checking a channel's users](#checking-a-channels-users). Below that,
-  spoken lines and nicks for each day with spoken lines, most recent first,
-  with a bar comparing each day with the busiest one. The log files read for
-  the channel are listed at the end.
+  the users of the latest list in trusted, inactive, untrusted, undecided and
+  bots, see [Checking a channel's users](#checking-a-channels-users). Below
+  that, spoken lines and nicks for each day with spoken lines, most recent
+  first, with a bar comparing each day with the busiest one. The log files
+  read for the channel are listed at the end.
 - **Identities** (`/identities`): a search by nick, ident, host and person,
   matched the same way as `wot analyze --nick`, `--ident`, `--host` and
   `--person`. Results show the identity, its person, nicks, number of
@@ -561,41 +561,40 @@ ticked.
   and a new group can be created for the ungrouped hosts. These actions come
   back to the same search, so the identities on a host can be checked before
   and after grouping it.
-- **Identity** (`/identity?id=ID`): one identity in full, named after the
-  nick it used most recently. It opens with who the identity is: its other
-  nicks, real names from pasted user lists, the `ident@host` combinations it
+- **Identity** (`/identity?id=ID`): one identity in full, named after the nick
+  it used most recently. It opens with who the identity is: its other nicks,
+  real names from pasted user lists, the `ident@host` combinations it
   connected from most recently, the person or bot it belongs to with their
-  rating, when it was seen with its activity score and any silent watcher
-  flag, and its sessions. Links jump to each section below. Then, in order:
-  its person or bot, which can be set here by adding it to an existing one,
-  creating one, or removing it; its activity by year and month; its nicks;
-  its connections with their host group; its channels and private messages;
-  and, for fixing it, its nick changes, where a session can be cut, and its
-  inferred sessions. Nicks, idents, hosts and channels link to their own
-  searches and pages. Connections on hosts that are not in a group link to a
-  search by that host, where it can be grouped. An id merged into another
+  rating, when it was seen with its activity score and any silent watcher or
+  inactive flag, and its sessions. Links jump to each section below. Then, in
+  order: its person or bot, which can be set here by adding it to an existing
+  one, creating one, or removing it; its activity by year and month; its
+  nicks; its connections with their host group; its channels and private
+  messages; and, for fixing it, its nick changes, where a session can be cut,
+  and its inferred sessions. Nicks, idents, hosts and channels link to their
+  own searches and pages. Connections on hosts that are not in a group link to
+  a search by that host, where it can be grouped. An id merged into another
   identity leads to that identity.
 - **People and bots** (`/people`): people, most trusted first, with their
-  rating, trust score, activity score, identities, nicks, last seen and
-  latest note; then bots, most active first; and a form to create either,
-  optionally with identity ids.
+  rating, trust score, activity score, identities, nicks, last seen with any
+  inactive or silent watcher flag, and latest note; then bots, most active
+  first; and a form to create either, optionally with identity ids.
 - **Person or bot** (`/person?name=NAME`): it opens with who they are across
   all their identities: their nicks and the `ident@host` combinations they
   connected from, most recent first, real names from pasted user lists, how
   many identities on which network tags, their trust score, rating and who
-  invited them, when they were last seen and where, when they last spoke,
-  how long ago each was, the days they were present from first to last with
-  their time in channels, the days they spoke and their lines, their
-  activity score with any silent watcher flag, and the channels they were in
-  on the most days, each linked to the history of that channel. Links jump
-  to each section below. Then, in order: the last 10 lines they said in
-  channels, each day linked to that day in the history; their trust score
-  and what it was made from, a slider to rate a person that explains each
-  rating as it is chosen, who invited them and whom they invited; notes to
-  add and delete; their identities with their totals, with checkboxes and
-  an **All** link to remove several at once; and, under Manage, forms to
-  add identities by id, make a person a bot or a bot a person, and delete
-  it.
+  invited them, when they were last seen and where, when they last spoke, how
+  long ago each was, the days they were present from first to last with their
+  time in channels, the days they spoke and their lines, their activity score
+  with any silent watcher or inactive flag, and the channels they were in on
+  the most days, each linked to the history of that channel. Links jump to
+  each section below. Then, in order: the last 10 lines they said in channels,
+  each day linked to that day in the history; their trust score and what it
+  was made from, a slider to rate a person that explains each rating as it is
+  chosen, who invited them and whom they invited; notes to add and delete;
+  their identities with their totals, with checkboxes and an **All** link to
+  remove several at once; and, under Manage, forms to add identities by id,
+  make a person a bot or a bot a person, and delete it.
 - **History** (`/history?id=ID` or `/history?person=NAME`): everything an
   identity, or all of a person's identities, said in channels, most recent
   first, 200 lines to a page, with filters for a channel, a day and text the
@@ -1017,7 +1016,29 @@ a person's identities, or of one identity not linked to anyone:
   so the first weeks count the most, all 40 at 365 days.
 
 Long-time regulars score high; accounts that joined recently or never talk
-score low. The person and identity pages show what the score was made from.
+score low.
+
+Someone with no spoken line in a channel in the 6 months before the newest
+log line has their score **cut to a fifth**, so a regular who stopped talking
+a year ago no longer ranks with those who still talk. The months are counted
+back from the month of the newest line in the channel logs, not from today, so
+a pause in importing does not change anyone's score, and in whole months, so
+the last line can be up to 7 months old before the cut. Someone first seen
+less than 6 months before that is too new to judge and keeps their score.
+How they stopped decides what they are:
+
+- **Inactive:** they spoke in at least 3 months before stopping, so they
+  probably used to take part. They get an amber "Inactive since" flag with
+  the month of their last line.
+- **Silent watcher:** they spoke in fewer than 3 months, and have been present
+  on at least 30 days since the month of their last line. A hello years ago
+  does not outweigh the silence since, so they get the same red flag as
+  someone who never spoke, as "Silent since" that month (see
+  [Checking a channel's users](#checking-a-channels-users)).
+
+Someone who spoke in fewer than 3 months and has barely been present since
+gets the cut but no flag. The person and identity pages show what the score
+was made from, and why it was cut.
 
 The **trust score**, 0 to 99, is the rating's band of 20 points, from
 distrusted at 0 to 19 up to known at 80 to 99, plus the activity score scaled
@@ -1047,24 +1068,32 @@ Each user is matched against the identity keys of the channel's network tag:
 When several identities match, the most recently seen is used. Its person or
 bot then decides the list:
 
-- **Trusted:** an exact or new nick match to a person rated vouched or known.
+- **Trusted:** an exact or new nick match to a person rated vouched or known,
+  inactive or not.
+- **Inactive:** an exact or new nick match to someone not rated vouched or
+  known who is inactive (see [Scores](#scores)): probably legitimate, but
+  not confirmed until you rate them, which moves them to another list. Rated
+  wary or distrusted, they stay untrusted.
 - **Untrusted:** a silent watcher (see below), never seen, or matched to
   someone rated wary or distrusted, including by nick only.
 - **Undecided:** everyone else: rated neutral, not linked to a person, or
-  matched by nick only.
+  matched by nick only, inactive or not, since anyone can take a nick.
 - **Bots:** matched to a bot.
 
 A **silent watcher** has been present in the channel on at least 30 days
-without ever saying a line there, counting all of a person's identities. That
-is how an account collecting logs behaves, so they get a red flag and are
-listed as untrusted, the longest silent first, whatever else they matched as.
+without ever saying a line there, counting all of a person's identities, or
+spoke in fewer than 3 months and has been present on 30 days or more since,
+without a line in 6 months (see [Scores](#scores)). That is how an account
+collecting logs behaves, so they get a red flag and are listed as untrusted,
+the longest silent first, whatever else they matched as.
 Rating them vouched or known clears the flag, for someone you know who only
 reads; bots are never flagged. The same flag shows on the activity ranking and
 on identity pages, for an identity present on 30 days or more without a line
 in any channel.
 
 Each list shows the nick and status, `ident@host`, real name, person or bot
-and rating, trust and activity scores, the identity, and how it was matched.
+and rating, trust and activity scores, the identity, any silent watcher or
+inactive flag, and how it was matched.
 Unknown users link to a search by their host. Each pasted list is kept, so
 the real names it holds show on the identity pages; a list can be deleted
 from the channel page.

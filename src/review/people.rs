@@ -18,7 +18,7 @@ use super::identities::{
     summary_real_names,
 };
 use super::layout::{
-    self, back_field, day, duration, number, person_href, silent_flag, url_encode,
+    self, back_field, day, duration, lapse_flag, number, person_href, silent_flag, url_encode,
 };
 use super::{App, Flash, PageError, PageResult, back_to, done, failed, filled, internal, with_db};
 use crate::decide;
@@ -46,9 +46,11 @@ pub(super) fn routes() -> Router<App> {
 async fn people_page(State(app): State<App>, Query(flash): Query<Flash>) -> PageResult {
     with_db(&app, move |conn| {
         let people = stats::people(conn).map_err(internal)?;
+        let newest = trust::newest_month(conn).map_err(internal)?;
         let mut scores = HashMap::new();
         for person in &people {
-            let score = trust::activity_score(conn, &person.identity_ids()).map_err(internal)?;
+            let score =
+                trust::activity_score(conn, &person.identity_ids(), newest).map_err(internal)?;
             scores.insert(person.name.clone(), score);
         }
         Ok(layout::page(
@@ -155,7 +157,12 @@ fn records_table(
                                 td.num { (activity(person)) }
                                 td.num { (number(person.identities.len() as i64)) }
                                 td.wrap { (nick_summary(person)) }
-                                td { (day(last_seen(person))) }
+                                td {
+                                    (day(last_seen(person)))
+                                    @if let (Kind::Person, Some(score)) = (person.kind, scores.get(&person.name)) {
+                                        " " (lapse_flag(score, person.rating.trusted()))
+                                    }
+                                }
                                 td.wrap { (latest_note(person)) }
                             }
                         }
@@ -243,7 +250,12 @@ async fn person_page(
             .map_err(internal)?;
         let context = PersonContext {
             all: filled(&query.all) == Some("yes"),
-            activity: trust::activity_score(conn, &ids).map_err(internal)?,
+            activity: trust::activity_score(
+                conn,
+                &ids,
+                trust::newest_month(conn).map_err(internal)?,
+            )
+            .map_err(internal)?,
             inviters: stats::people_names(conn)
                 .map_err(internal)?
                 .into_iter()
@@ -399,6 +411,8 @@ fn summary(person: &Person, views: &[lookup::IdentityView], context: &PersonCont
                         (context.activity.score) " of 100"
                         @if silent {
                             " " (silent_flag(present))
+                        } @else if person.kind == Kind::Person {
+                            " " (lapse_flag(&context.activity, person.rating.trusted()))
                         }
                     },
                     _ => span.muted { "Never in a channel" },
@@ -1098,10 +1112,45 @@ mod tests {
                 (date, Day::default())
             })
             .collect();
-        let context = PersonContext { days, ..context() };
-        let page = page(&record("marlowe", Kind::Person), &[], &context).into_string();
+        let silent = PersonContext { days, ..context() };
+        let page = page(&record("marlowe", Kind::Person), &[], &silent).into_string();
         assert!(page.contains("Silent 40 days"));
         assert!(page.contains("Nothing said in channels."));
+
+        // Someone who used to talk is inactive, not a silent watcher, and
+        // the cut is explained.
+        let days: BTreeMap<NaiveDate, Day> = [("2024-05-01", 3), ("2026-10-01", 0)]
+            .into_iter()
+            .map(|(date, spoken)| {
+                let date = NaiveDate::parse_from_str(date, "%Y-%m-%d").unwrap();
+                (
+                    date,
+                    Day {
+                        spoken,
+                        ..Day::default()
+                    },
+                )
+            })
+            .collect();
+        let inactive = PersonContext {
+            days,
+            activity: ActivityScore {
+                score: 12,
+                full_score: 60,
+                cut: true,
+                active_months: 14,
+                tenure_months: 30,
+                last_spoke: Some(2024 * 12 + 4),
+                lapse: Some(trust::Lapse::Inactive),
+                ..ActivityScore::default()
+            },
+            ..context()
+        };
+        let page = self::page(&record("lindqvist", Kind::Person), &[], &inactive).into_string();
+        assert!(page.contains("Inactive since 2024-05"));
+        assert!(!page.contains("Silent"));
+        assert!(page.contains("cut to a fifth of 60"));
+        assert!(page.contains("they count as inactive"));
 
         let today = NaiveDate::from_ymd_opt(2026, 11, 3);
         assert_eq!(ago(today, "2026-11-03 01:00").as_deref(), Some("today"));

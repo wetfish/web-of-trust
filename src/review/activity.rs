@@ -9,7 +9,7 @@ use serde::Deserialize;
 use super::layout::{self, duration, identity_href, number, person_href, silent_flag};
 use super::{App, Flash, PageResult, filled, internal, with_db};
 use crate::activity::{self, Order, RankFilter, RankRow, Totals};
-use crate::trust::{self, ActivityScore};
+use crate::trust::{self, ActivityScore, Lapse};
 
 /// Identities shown in a ranking.
 const MAX_ROWS: usize = 200;
@@ -229,6 +229,27 @@ pub(super) fn activity_breakdown(activity: &ActivityScore) -> Markup {
                 " days: " (number(activity.spoken)) " lines. The activity score gives up to 40 "
                 "points for months with spoken lines, 20 for months seen and 40 for days with "
                 "spoken lines."
+                @if activity.cut {
+                    " No spoken line in the " (trust::INACTIVE_MONTHS)
+                    " months before the newest log line"
+                    @if let Some(since) = activity.last_spoke_month() {
+                        ", the last in " (since)
+                    }
+                    ", so the score is cut to a fifth of " (activity.full_score) "."
+                    @match activity.lapse {
+                        Some(Lapse::Inactive) => {
+                            " Having spoken in " (trust::PARTICIPANT_MONTHS)
+                            " months or more, they count as inactive: probably someone who "
+                            "used to take part."
+                        },
+                        Some(Lapse::Silent) => {
+                            " Having spoken in fewer than " (trust::PARTICIPANT_MONTHS)
+                            " months, then present on " (number(activity.present_since))
+                            " days without a line, they count as a silent watcher."
+                        },
+                        None => {},
+                    }
+                }
             }
         }
     }

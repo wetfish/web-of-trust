@@ -9,7 +9,8 @@ use maud::{Markup, html};
 use serde::Deserialize;
 
 use super::layout::{
-    self, channel_href, day, identity_href, number, person_href, search_href, silent_flag,
+    self, channel_href, day, identity_href, lapse_flag, number, person_href, search_href,
+    silent_flag,
 };
 use super::{App, Flash, PageError, PageResult, done, failed, internal, with_db};
 use crate::decide;
@@ -185,8 +186,15 @@ fn who_results(tag: &str, name: &str, list: &WhoList, checked: &[Checked]) -> Ma
             of(Verdict::Trusted),
         ),
         (
+            "Inactive",
+            "Not rated yet, and spoke in at least 3 months, but not in the 6 months before the \
+             newest log line: probably someone who used to take part. Rate them to move them.",
+            of(Verdict::Inactive),
+        ),
+        (
             "Untrusted",
-            "Silent for weeks in this channel, never seen in the logs, or rated wary or distrusted.",
+            "Silent for weeks in this channel, silent for months after saying very little, never \
+             seen in the logs, or rated wary or distrusted.",
             of(Verdict::Untrusted),
         ),
         (
@@ -209,8 +217,9 @@ fn who_results(tag: &str, name: &str, list: &WhoList, checked: &[Checked]) -> Ma
         @if silent > 0 {
             p.flag-banner {
                 (silent_flag_count(silent))
-                " present in " (name) " on at least " (trust::SILENT_DAYS)
-                " days without ever saying a line there. They are listed as untrusted until you "
+                " present on at least " (trust::SILENT_DAYS) " days without a line: never in "
+                (name) ", or nowhere since saying very little more than "
+                (trust::INACTIVE_MONTHS) " months ago. They are listed as untrusted until you "
                 "rate them vouched or known."
             }
         }
@@ -300,6 +309,8 @@ fn users_table(users: &[&Checked]) -> Markup {
                             td.wrap {
                                 @if let Some(days) = user.silent_days {
                                     (silent_flag(days)) " "
+                                } @else if user.verdict != Verdict::Bot && user.how != Match::Unknown {
+                                    (lapse_flag(&user.activity, user.verdict == Verdict::Trusted)) " "
                                 }
                                 (match_note(user))
                             }
@@ -431,7 +442,7 @@ async fn delete_who(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::trust::{ActivityScore, Record, WhoEntry};
+    use crate::trust::{ActivityScore, Lapse, Record, WhoEntry};
 
     fn user(nick: &str, how: Match, verdict: Verdict, trust: Option<i64>) -> Checked {
         Checked {
@@ -469,6 +480,18 @@ mod tests {
                 silent_days: Some(120),
                 ..user("watcher", Match::Exact, Verdict::Untrusted, Some(45))
             },
+            Checked {
+                activity: ActivityScore {
+                    score: 20,
+                    full_score: 100,
+                    cut: true,
+                    active_months: 30,
+                    last_spoke: Some(2025 * 12 + 2),
+                    lapse: Some(Lapse::Inactive),
+                    ..ActivityScore::default()
+                },
+                ..user("regular", Match::Exact, Verdict::Inactive, Some(43))
+            },
         ];
         let list = WhoList {
             id: 3,
@@ -478,13 +501,18 @@ mod tests {
         };
         let page = who_results("wetfish", "#analysis", &list, &checked).into_string();
         assert!(page.contains(
-            "5 users, pasted 2026-11-03 07:52:00 UTC: 1 trusted, 3 untrusted, 1 undecided, 0 bots."
+            "6 users, pasted 2026-11-03 07:52:00 UTC: 1 trusted, 1 inactive, 3 untrusted, \
+             1 undecided, 0 bots."
         ));
-        assert!(page.contains("\u{2691} 1 user</span> present in #analysis on at least 30 days"));
+        assert!(page.contains("\u{2691} 1 user</span> present on at least 30 days"));
+        assert!(page.contains("never in #analysis"));
         assert!(page.contains("\u{2691} Silent 120 days"));
         assert!(page.contains(r#"<tr class="flagged">"#));
         let at = |text: &str| page.find(text).unwrap();
-        assert!(at("<h3>Trusted (1)</h3>") < at("<h3>Untrusted (3)</h3>"));
+        assert!(at("<h3>Trusted (1)</h3>") < at("<h3>Inactive (1)</h3>"));
+        assert!(at("<h3>Inactive (1)</h3>") < at("<h3>Untrusted (3)</h3>"));
+        assert!(at("<h3>Inactive (1)</h3>") < at("Inactive since 2025-03"));
+        assert!(page.contains(r#"<span class="flag-inactive" title="Spoke in 30 months"#));
         assert!(at("<h3>Untrusted (3)</h3>") < at("<h3>Undecided (1)</h3>"));
         assert!(!page.contains("<h3>Bots"));
         // Silent watchers come first, then never seen, then the least trusted.

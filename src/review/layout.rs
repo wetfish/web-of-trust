@@ -4,6 +4,7 @@
 use maud::{DOCTYPE, Markup, html};
 
 use super::Flash;
+use crate::trust::{ActivityScore, Lapse};
 
 /// A complete page with the site navigation and any notice or error.
 pub fn page(title: &str, flash: &Flash, body: Markup) -> Markup {
@@ -95,6 +96,37 @@ pub fn silent_flag(days: i64) -> Markup {
             number(days)
         )) {
             "\u{2691} Silent " (number(days)) " days"
+        }
+    }
+}
+
+/// A flag for someone who stopped talking: inactive when they used to take
+/// part, a silent watcher when they barely did. Nothing otherwise, and no
+/// silent watcher flag for someone rated vouched or known (`trusted`).
+pub fn lapse_flag(score: &ActivityScore, trusted: bool) -> Markup {
+    let since = score.last_spoke_month().unwrap_or_default();
+    let months = |n: i64| format!("{} month{}", number(n), if n == 1 { "" } else { "s" });
+    html! {
+        @match score.lapse {
+            Some(Lapse::Inactive) => {
+                span.flag-inactive title=(format!(
+                    "Spoke in {}, the last in {since}: probably someone who used to take part",
+                    months(score.active_months)
+                )) {
+                    "Inactive since " (since)
+                }
+            },
+            Some(Lapse::Silent) if !trusted => {
+                span.flag title=(format!(
+                    "Spoke in only {}, the last in {since}, then present on {} days without a \
+                     line: watching, not taking part",
+                    months(score.active_months),
+                    number(score.present_since)
+                )) {
+                    "\u{2691} Silent since " (since)
+                }
+            },
+            _ => {},
         }
     }
 }

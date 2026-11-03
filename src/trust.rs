@@ -4,7 +4,10 @@
 //!
 //! - **Activity score**, 0 to 100, from the channel activity of a person's
 //!   identities: consistency (months with spoken lines), tenure (months from
-//!   first to last seen) and participation (days with spoken lines).
+//!   first to last seen) and participation (days with spoken lines). Without
+//!   a spoken line in the six months before the newest log line, the score
+//!   is cut to a fifth: someone who used to take part is inactive, and
+//!   someone who barely did is a silent watcher.
 //! - **Trust score**, 0 to 99: the rating sets a band of 20 points, from
 //!   distrusted at 0 to 19 up to known at 80 to 99, and the activity score
 //!   places the person within it. The bands never overlap, so a known friend
@@ -35,6 +38,17 @@ pub const REVIEW_VALID_MONTHS: i64 = 6;
 /// one included.
 pub const RECENT_MONTHS: i64 = 6;
 
+/// Months with spoken lines that make someone a past participant when they
+/// stop talking. Fewer, such as one hello years ago, do not.
+pub const PARTICIPANT_MONTHS: i64 = 3;
+/// Months before the month of the newest log line without a spoken line
+/// that make someone inactive. Counted in whole months, so the last line
+/// can be up to a month more than this ago.
+pub const INACTIVE_MONTHS: i64 = 6;
+/// The activity score of someone with no spoken line in `INACTIVE_MONTHS`
+/// is divided by this.
+const INACTIVE_DIVISOR: f64 = 5.0;
+
 /// Points for each part of the activity score. They add up to 100.
 const CONSISTENCY_POINTS: f64 = 40.0;
 const TENURE_POINTS: f64 = 20.0;
@@ -47,11 +61,34 @@ const FULL_TENURE_MONTHS: f64 = 36.0;
 /// grow with the logarithm of the days, so the first weeks count the most.
 const FULL_ACTIVE_DAYS: f64 = 365.0;
 
+/// How someone who stopped talking stopped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Lapse {
+    /// Spoke in at least `PARTICIPANT_MONTHS` months, but not in the last
+    /// `INACTIVE_MONTHS`: probably someone who used to take part.
+    Inactive,
+    /// Spoke in fewer months, not in the last `INACTIVE_MONTHS`, and present
+    /// on at least `SILENT_DAYS` days since: a silent watcher, like someone
+    /// who never spoke.
+    Silent,
+}
+
 /// The activity score and what it was made from.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ActivityScore {
     /// 0 to 100.
     pub score: i64,
+    /// The score before any cut for not talking.
+    pub full_score: i64,
+    /// Whether no spoken line in the last `INACTIVE_MONTHS` cut the score.
+    pub cut: bool,
+    /// The last month with a spoken line, as a month number.
+    pub last_spoke: Option<i64>,
+    /// Days present after the month of the last spoken line.
+    pub present_since: i64,
+    /// Set when they stopped talking, as opposed to never having spoken,
+    /// which `silent` covers.
+    pub lapse: Option<Lapse>,
     /// Months with at least one spoken line in a channel.
     pub active_months: i64,
     /// Months from the first to the last month present, both included.
@@ -62,11 +99,41 @@ pub struct ActivityScore {
     pub spoken: i64,
 }
 
+impl ActivityScore {
+    /// The last month with a spoken line, as `YYYY-MM`.
+    pub fn last_spoke_month(&self) -> Option<String> {
+        self.last_spoke.map(month_label)
+    }
+}
+
 /// `YYYY-MM` as a number of months, for counting months between two.
 fn month_number(month: &str) -> Option<i64> {
     let (year, month) = month.split_once('-')?;
     let (year, month): (i64, i64) = (year.parse().ok()?, month.parse().ok()?);
     (1..=12).contains(&month).then_some(year * 12 + month - 1)
+}
+
+/// A month number as `YYYY-MM`.
+fn month_label(number: i64) -> String {
+    format!(
+        "{:04}-{:02}",
+        number.div_euclid(12),
+        number.rem_euclid(12) + 1
+    )
+}
+
+/// The month of the newest line in the channel logs, as a month number:
+/// what "the last six months" are counted back from, so that a pause in
+/// importing does not make everyone inactive.
+pub fn newest_month(conn: &Connection) -> Result<Option<i64>> {
+    let date: Option<String> = conn.query_row(
+        "SELECT max(date) FROM files WHERE kind = 'channel'",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(date
+        .as_deref()
+        .and_then(|date| month_number(date.get(..7)?)))
 }
 
 fn days_in_month(number: i64) -> i64 {
@@ -83,8 +150,13 @@ fn days_in_month(number: i64) -> i64 {
     }
 }
 
-/// The activity score of a set of identities, from their channel activity.
-pub fn activity_score(conn: &Connection, identities: &[String]) -> Result<ActivityScore> {
+/// The activity score of a set of identities, from their channel activity,
+/// as of `newest`, the month of the newest log line from `newest_month`.
+pub fn activity_score(
+    conn: &Connection,
+    identities: &[String],
+    newest: Option<i64>,
+) -> Result<ActivityScore> {
     if identities.is_empty() {
         return Ok(ActivityScore::default());
     }
@@ -100,25 +172,60 @@ pub fn activity_score(conn: &Connection, identities: &[String]) -> Result<Activi
             Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
         })?
         .collect::<rusqlite::Result<_>>()?;
+    let months: Vec<Month> = months
+        .into_iter()
+        .filter_map(|(month, present, active, spoken)| {
+            Some(Month {
+                number: month_number(&month)?,
+                days_present: present,
+                active_days: active,
+                spoken,
+            })
+        })
+        .collect();
+    Ok(score_months(&months, newest))
+}
 
+/// One month of activity over all channels.
+#[derive(Clone, Copy)]
+struct Month {
+    number: i64,
+    days_present: i64,
+    active_days: i64,
+    spoken: i64,
+}
+
+/// The activity score from activity by month, oldest first, as of `newest`.
+fn score_months(months: &[Month], newest: Option<i64>) -> ActivityScore {
     let mut score = ActivityScore::default();
     let (mut first, mut last) = (None, None);
-    for (month, present, active, spoken) in months {
-        let Some(number) = month_number(&month) else {
-            continue;
-        };
+    for month in months {
+        let Month {
+            number,
+            days_present: present,
+            active_days: active,
+            spoken,
+        } = *month;
         if present > 0 {
             first = Some(first.map_or(number, |first: i64| first.min(number)));
             last = Some(last.map_or(number, |last: i64| last.max(number)));
         }
         if active > 0 {
             score.active_months += 1;
+            score.last_spoke = Some(number);
         }
         score.active_days += active.min(days_in_month(number));
         score.spoken += spoken;
     }
     if let (Some(first), Some(last)) = (first, last) {
         score.tenure_months = last - first + 1;
+    }
+    if let Some(last_spoke) = score.last_spoke {
+        score.present_since = months
+            .iter()
+            .filter(|month| month.number > last_spoke)
+            .map(|month| month.days_present)
+            .sum();
     }
     let part = |value: f64, full: f64| (value / full).min(1.0);
     let points = CONSISTENCY_POINTS * part(score.active_months as f64, FULL_ACTIVE_MONTHS)
@@ -128,8 +235,26 @@ pub fn activity_score(conn: &Connection, identities: &[String]) -> Result<Activi
                 (1.0 + score.active_days as f64).ln(),
                 (1.0 + FULL_ACTIVE_DAYS).ln(),
             );
-    score.score = points.round() as i64;
-    Ok(score)
+    score.full_score = points.round() as i64;
+    score.score = score.full_score;
+
+    // No spoken line since the start of the window, while seen before it.
+    let window = newest.map(|newest| newest - INACTIVE_MONTHS);
+    if let (Some(window), Some(first)) = (window, first)
+        && first < window
+        && score.last_spoke.is_none_or(|last| last < window)
+    {
+        score.cut = true;
+        score.score = (points / INACTIVE_DIVISOR).round() as i64;
+        if score.last_spoke.is_some() {
+            if score.active_months >= PARTICIPANT_MONTHS {
+                score.lapse = Some(Lapse::Inactive);
+            } else if score.present_since >= SILENT_DAYS {
+                score.lapse = Some(Lapse::Silent);
+            }
+        }
+    }
+    score
 }
 
 /// The trust score, 0 to 99: the rating's band of 20 points, and the
@@ -411,9 +536,12 @@ pub enum Match {
 pub enum Verdict {
     /// Rated vouched or known.
     Trusted,
+    /// Not rated vouched or known, and inactive: spoke in at least
+    /// `PARTICIPANT_MONTHS` months, but not in the last `INACTIVE_MONTHS`.
+    Inactive,
     /// Rated neutral, not linked to a person, or only matched by nick.
     Undecided,
-    /// Rated wary or distrusted, or never seen.
+    /// Rated wary or distrusted, never seen, or a silent watcher.
     Untrusted,
     /// Belongs to a bot.
     Bot,
@@ -432,9 +560,10 @@ pub struct Checked {
     pub activity: ActivityScore,
     /// None for bots and users never seen.
     pub trust: Option<i64>,
-    /// Days present in the channel without a spoken line there, when that
-    /// makes them a silent watcher. Never set for bots or for people rated
-    /// vouched or known.
+    /// When they are a silent watcher, the days they were present without
+    /// a line: in this channel, never having spoken there, or in any
+    /// channel since the little they said, `Lapse::Silent`. Never set for
+    /// bots or for people rated vouched or known.
     pub silent_days: Option<i64>,
     pub verdict: Verdict,
 }
@@ -536,6 +665,7 @@ pub fn check(
     entries: &[WhoEntry],
 ) -> Result<Vec<Checked>> {
     let records = records(conn)?;
+    let newest = newest_month(conn)?;
     let mut scores: HashMap<Vec<String>, ActivityScore> = HashMap::new();
     let mut checked = Vec::with_capacity(entries.len());
     for entry in entries {
@@ -579,15 +709,22 @@ pub fn check(
         let rating = record.as_ref().map_or(Rating::Neutral, |r| r.rating);
         let bot = record.as_ref().is_some_and(|r| r.kind == Kind::Bot);
         let (days_present, spoken) = channel_presence(conn, tag, channel, &activity_ids)?;
-        let silent_days =
-            (silent(days_present, spoken) && !bot && !rating.trusted()).then_some(days_present);
         let activity = match scores.get(&activity_ids) {
             Some(score) => *score,
             None => {
-                let score = activity_score(conn, &activity_ids)?;
+                let score = activity_score(conn, &activity_ids, newest)?;
                 scores.insert(activity_ids, score);
                 score
             }
+        };
+        let silent_days = if bot || rating.trusted() {
+            None
+        } else if silent(days_present, spoken) {
+            Some(days_present)
+        } else if activity.lapse == Some(Lapse::Silent) {
+            Some(activity.present_since)
+        } else {
+            None
         };
         let verdict = match how {
             Match::Unknown => Verdict::Untrusted,
@@ -598,6 +735,9 @@ pub fn check(
             _ if bot => Verdict::Bot,
             _ if rating.trusted() => Verdict::Trusted,
             _ if rating.untrusted() => Verdict::Untrusted,
+            // Past activity makes them probably legitimate, but not
+            // confirmed until rated.
+            _ if activity.lapse == Some(Lapse::Inactive) => Verdict::Inactive,
             _ => Verdict::Undecided,
         };
         let trust = (how != Match::Unknown && !bot).then(|| trust_score(rating, activity.score));
@@ -794,6 +934,124 @@ mod tests {
         assert_eq!(trust_score(Rating::Known, 100), 99);
         // A known person who never talks outranks the busiest stranger.
         assert!(trust_score(Rating::Known, 0) > trust_score(Rating::Neutral, 100));
+    }
+
+    /// Each month from `from` to `to`, present on 20 days and speaking on
+    /// `active` of them.
+    fn span(from: &str, to: &str, active: i64) -> Vec<Month> {
+        (month_number(from).unwrap()..=month_number(to).unwrap())
+            .map(|number| Month {
+                number,
+                days_present: 20,
+                active_days: active,
+                spoken: active * 5,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn cuts_the_score_of_those_who_stopped_talking() {
+        fn score(spans: &[Vec<Month>]) -> ActivityScore {
+            score_months(&spans.concat(), month_number("2026-11"))
+        }
+        assert_eq!(month_label(month_number("2024-12").unwrap()), "2024-12");
+
+        // Two years of talking, then nearly two years of listening.
+        let regular = [
+            span("2023-01", "2024-12", 20),
+            span("2025-01", "2026-11", 0),
+        ];
+        let inactive = score(&regular);
+        assert_eq!(inactive.full_score, 100);
+        assert_eq!((inactive.score, inactive.cut), (20, true));
+        assert_eq!(inactive.lapse, Some(Lapse::Inactive));
+        assert_eq!(inactive.last_spoke_month().as_deref(), Some("2024-12"));
+        assert_eq!(inactive.present_since, 23 * 20);
+        // Nothing to count back from, nothing cut.
+        let uncut = score_months(&regular.concat(), None);
+        assert_eq!((uncut.score, uncut.lapse), (100, None));
+
+        // A line in the month six months back still counts; one in the
+        // month before does not.
+        let recent = score(&[
+            span("2023-01", "2026-04", 20),
+            span("2026-05", "2026-05", 1),
+        ]);
+        assert_eq!((recent.cut, recent.lapse), (false, None));
+        let lapsed = score(&[
+            span("2023-01", "2026-04", 20),
+            span("2026-05", "2026-11", 0),
+        ]);
+        assert_eq!(lapsed.lapse, Some(Lapse::Inactive));
+
+        // One hello, then years of watching: a silent watcher.
+        let hello = [span("2024-03", "2024-03", 1), span("2024-04", "2026-11", 0)];
+        let watcher = score(&hello);
+        assert!(watcher.cut);
+        assert_eq!(watcher.lapse, Some(Lapse::Silent));
+        // One hello, then gone: nothing to flag.
+        let gone = score(&[span("2024-03", "2024-03", 1)]);
+        assert_eq!((gone.cut, gone.lapse), (true, None));
+
+        // Never spoke: cut, and left to the silent watcher rule.
+        let never = score(&[span("2025-01", "2026-11", 0)]);
+        assert_eq!((never.cut, never.lapse), (true, None));
+        assert_eq!(never.last_spoke, None);
+        // Too new to judge.
+        let newcomer = score(&[span("2026-06", "2026-11", 0)]);
+        assert!(!newcomer.cut);
+    }
+
+    #[test]
+    fn sets_apart_inactive_users_and_silent_watchers() {
+        let root = TempDir::new("trust-inactive");
+        fs::create_dir_all(root.0.join("wetfish")).unwrap();
+        fs::write(
+            root.0.join("wetfish/#old.log"),
+            "--- Log opened Thu Jan 01 10:00:00 2026\n\
+             10:00 -!- rachel [rachel@hostR] has joined #old\n\
+             10:00 -!- Irssi: #old: Total of 1 nicks [1 ops, 0 halfops, 0 voices, 0 normal]\n\
+             10:00 -!- Irssi: Join to #old was synced in 0 secs\n\
+             10:01 -!- quokka [quokkawet@hostQ] has joined #old\n\
+             10:02 <quokka> january\n\
+             --- Day changed Sun Feb 01 2026\n\
+             10:02 <quokka> february\n\
+             --- Day changed Sun Mar 01 2026\n\
+             10:02 <quokka> march\n\
+             10:03 -!- marlowe [marlowewet@hostM] has joined #old\n\
+             10:04 <marlowe> just once\n\
+             --- Day changed Sun Nov 01 2026\n\
+             10:05 <rachel> anyone here?\n\
+             --- Log closed Sun Nov 01 11:00:00 2026\n",
+        )
+        .unwrap();
+        let mut conn = db::open(&root.0.join("wot.sqlite")).unwrap();
+        let inventory = discover::discover(&[root.0.clone()]).unwrap();
+        db::import(&mut conn, &inventory.files);
+        identity::rebuild(&mut conn).unwrap();
+        assert_eq!(newest_month(&conn).unwrap(), month_number("2026-11"));
+
+        let users = [
+            entry("quokka", "quokkawet@hostQ", ""),
+            entry("marlowe", "marlowewet@hostM", ""),
+        ];
+        let checked = check(&conn, "wetfish", "#old", &users).unwrap();
+        // quokka talked for three months, then stopped.
+        assert_eq!(checked[0].verdict, Verdict::Inactive);
+        assert_eq!(checked[0].activity.lapse, Some(Lapse::Inactive));
+        assert!(checked[0].activity.cut);
+        assert_eq!(checked[0].silent_days, None);
+        // marlowe said one line, then watched for months.
+        assert_eq!(checked[1].verdict, Verdict::Untrusted);
+        assert_eq!(checked[1].activity.lapse, Some(Lapse::Silent));
+        assert!(checked[1].silent_days.unwrap() >= SILENT_DAYS);
+
+        // Rating decides over inactivity.
+        let quokka = checked[0].identity.clone().unwrap();
+        decide::create_person(&mut conn, "quokka", Kind::Person, &[quokka], None).unwrap();
+        decide::set_rating(&conn, "quokka", Rating::Known).unwrap();
+        let rated = check(&conn, "wetfish", "#old", &users[..1]).unwrap();
+        assert_eq!(rated[0].verdict, Verdict::Trusted);
     }
 
     fn entry(nick: &str, mask: &str, realname: &str) -> WhoEntry {
