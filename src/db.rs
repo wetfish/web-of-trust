@@ -37,7 +37,9 @@ const HEAD_LEN: u64 = 1024;
 /// The schema, as the steps that build it. SQLite's `user_version` stores how
 /// many steps a database has had, so an older database is brought up to date
 /// by running the steps it is missing.
-const MIGRATIONS: [&str; 5] = [SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5];
+const MIGRATIONS: [&str; 6] = [
+    SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6,
+];
 
 const SCHEMA_V1: &str = "
 CREATE TABLE files (
@@ -295,6 +297,28 @@ CREATE TABLE who_entries (
     realname TEXT NOT NULL,
     PRIMARY KEY (list_id, nick)
 );
+";
+
+const SCHEMA_V6: &str = "
+-- The lines over which a session held each of its nicks, for sessions that
+-- spoke, apart from the logging client's. A message on these lines by that
+-- nick was the session's. Rebuilt with the sessions.
+CREATE TABLE session_nicks (
+    session_id INTEGER NOT NULL,
+    -- Lowercased.
+    nick TEXT NOT NULL,
+    from_line INTEGER NOT NULL,
+    -- NULL when the session ran to the end of the file.
+    to_line INTEGER
+);
+
+CREATE INDEX session_nicks_by_session ON session_nicks (session_id);
+
+-- Finding the lines of a session.
+CREATE INDEX events_by_file_line ON events (file_id, line);
+
+-- Sessions are built again, with their nick spans, by the next wot analyze.
+DELETE FROM sessions;
 ";
 
 const INSERT_EVENT: &str = "
@@ -833,7 +857,8 @@ mod tests {
                         + (SELECT count(*) FROM people WHERE kind <> 'person')
                         + (SELECT count(*) FROM person_notes)
                         + (SELECT count(*) FROM channel_reviews)
-                        + (SELECT count(*) FROM who_lists) + (SELECT count(*) FROM who_entries)",
+                        + (SELECT count(*) FROM who_lists) + (SELECT count(*) FROM who_entries)
+                        + (SELECT count(*) FROM session_nicks)",
                 [],
                 |row| row.get(0),
             )

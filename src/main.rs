@@ -2,6 +2,7 @@ mod activity;
 mod db;
 mod decide;
 mod discover;
+mod history;
 mod identity;
 mod irssi;
 mod lookup;

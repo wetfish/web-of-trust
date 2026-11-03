@@ -11,6 +11,7 @@ use maud::{Markup, html};
 use serde::Deserialize;
 
 use super::activity::identity_section;
+use super::history::identity_history_href;
 use super::layout::{
     self, back_field, channel_href, day, duration, identity_href, number, person_href, search_href,
 };
@@ -561,6 +562,7 @@ fn identity(view: &IdentityView, context: &Context) -> Markup {
         }
 
         (identity_section(&context.months, &context.score, context.private_spoken, context.bot))
+        p { a href=(identity_history_href(&view.id)) { "Everything it said, and the days it was present" } }
 
         h2 { "Nicks" }
         (nicks_table(view))
@@ -918,6 +920,7 @@ mod tests {
         assert!(page.contains(r#"name="kind" value="bot""#));
         assert!(page.contains("/identities?host=bridge.example.net"));
         assert!(page.contains("<strong>Quokka Wet</strong> (2026-11-03)"));
+        assert!(page.contains(r#"href="/history?id=1a2b3c4d5e6f""#));
     }
 
     #[test]

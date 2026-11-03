@@ -188,9 +188,14 @@ pub fn rebuild(conn: &mut Connection) -> Result<RebuildSummary> {
     let ids = assign_ids(&tx, &links, &mut summary)?;
 
     tx.execute("DELETE FROM sessions", [])?;
+    tx.execute("DELETE FROM session_nicks", [])?;
     // The identity of each session, for its activity.
     let mut identity_of: Vec<&str> = Vec::with_capacity(sessions.len());
     {
+        let mut insert_span = tx.prepare(
+            "INSERT INTO session_nicks (session_id, nick, from_line, to_line)
+             VALUES (?1, ?2, ?3, ?4)",
+        )?;
         let mut insert = tx.prepare(
             "INSERT INTO sessions (id, file_id, identity_id, link, inferred_from, nicks, ident,
                  host, start_at, start_line, joined, end_at, end_line, end_reason, minutes,
@@ -247,6 +252,11 @@ pub fn rebuild(conn: &mut Connection) -> Result<RebuildSummary> {
                 session.heard_to - session.heard_from,
             ])?;
             identity_of.push(identity.as_str());
+            if session.spoken > 0 && !session.logger {
+                for (nick, from, to) in nick_spans(session) {
+                    insert_span.execute(params![session_id(index), nick, from, to])?;
+                }
+            }
         }
     }
 
@@ -275,6 +285,25 @@ pub fn rebuild(conn: &mut Connection) -> Result<RebuildSummary> {
     Ok(summary)
 }
 
+/// The lines over which a session held each of its nicks: the lowercased
+/// nick, the first line and the last, which is open when the session ran to
+/// the end of the file. A message on these lines by that nick was the
+/// session's.
+fn nick_spans(session: &Session) -> Vec<(String, i64, Option<i64>)> {
+    session
+        .nicks
+        .iter()
+        .enumerate()
+        .map(|(i, nick)| {
+            let to = match session.nick_lines.get(i + 1) {
+                Some(next) => Some(next - 1),
+                None => session.end_line,
+            };
+            (nick.to_lowercase(), session.nick_lines[i], to)
+        })
+        .collect()
+}
+
 /// Session row ids are their position in the rebuilt list, starting at 1.
 fn session_id(index: usize) -> i64 {
     index as i64 + 1
@@ -289,6 +318,8 @@ struct Session {
     tag: String,
     /// In the order the session used them, as written in the log.
     nicks: Vec<String>,
+    /// The line from which the session held each of `nicks`.
+    nick_lines: Vec<i64>,
     ident: Option<String>,
     host: Option<String>,
     start: NaiveDateTime,
@@ -620,6 +651,7 @@ impl FileReplay {
             file_id: self.file_id,
             tag: self.tag.clone(),
             nicks: vec![nick.to_string()],
+            nick_lines: vec![event.line],
             ident: None,
             host: None,
             start,
@@ -685,6 +717,7 @@ impl FileReplay {
             close(&mut sessions[stale], event, "nick_taken", self.said);
         }
         sessions[index].nicks.push(new.to_string());
+        sessions[index].nick_lines.push(event.line);
         self.open.insert(new.to_lowercase(), index);
     }
 

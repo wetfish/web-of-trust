@@ -414,6 +414,13 @@ nick-only keys), and `identity_id`. Sessions started by a cut have an empty
 | `logger` | 1 for the logging client's own session |
 | `heard` | Messages and actions in the channel while the session was present, its own included |
 
+`session_nicks`: `session_id`, `nick` (lowercased), `from_line` and `to_line`
+(empty when the session ran to the end of the file): the lines over which a
+session held each of its nicks, for sessions that spoke, apart from the
+logging client's. A message on these lines by that nick was the session's, so
+a nick someone else took after a nick change is never mistaken for the
+session's. The [History](#history) page finds lines this way.
+
 ## Reviewing in a browser
 
 `wot review` serves a web interface for reviewing the imported data, then
@@ -494,6 +501,12 @@ ticked.
   delete. Then its identities with their totals, with checkboxes and an
   **All** link to remove several at once, a button to make a person a bot or
   a bot a person, and forms to add identities by id or delete it.
+- **History** (`/history?id=ID` or `/history?person=NAME`): everything an
+  identity, or all of a person's identities, said in channels, most recent
+  first, 200 lines to a page, with filters for a channel, a day and text the
+  line contains. Below, every day they were present, by month with the
+  newest open, with the lines said and the channels; silent days included.
+  Linked from identity and person pages. See [History](#history).
 - **Host groups** (`/hosts`): each group with its hosts, how many identities
   used each, and forms to add and remove hosts, change the kind, ident
   setting and note, or delete the group; a form to create a group; and the
@@ -520,9 +533,10 @@ what the pages share: errors, database access, notices and redirects.
 `layout.rs` has the page frame and helpers, and `style.css` the styles. Each
 area has its own module with its pages and actions: `pages.rs` for the
 overview and channels, then `identities.rs`, `people.rs`, `hosts.rs`,
-`cuts.rs`, `activity.rs` and `channels.rs`. The data comes from
-`src/stats.rs`, `src/lookup.rs`, `src/activity.rs` and `src/trust.rs`, and
-the actions call the same functions in `src/decide.rs` as the commands.
+`cuts.rs`, `activity.rs`, `channels.rs` and `history.rs`. The data comes
+from `src/stats.rs`, `src/lookup.rs`, `src/activity.rs`, `src/trust.rs` and
+`src/history.rs`, and the actions call the same functions in `src/decide.rs`
+as the commands.
 
 ## Activity
 
@@ -562,8 +576,24 @@ together), `month` (`YYYY-MM`), `days_present`, `active_days`, `minutes`,
 `heard` and `spoken`.
 
 Upgrading a database to this version empties `sessions` so that the next
-`wot analyze` rebuilds them with heard lines and activity. Run it once before
-`wot review`.
+`wot analyze` rebuilds them with heard lines, activity and nick spans. Run it
+once before `wot review`.
+
+## History
+
+The history of an identity, or of a person across all their identities, lists
+what they said in channels and the days they were present. Private messages
+and the logging client's own lines are left out, as in activity.
+
+Lines are found through each session's nick spans in `session_nicks`, kept
+with the sessions: a line belongs to a session when its nick is the one the
+session held on that line. Someone who takes a nick after its owner changed
+away from it is never mistaken for the owner.
+
+A day counts as present when a session in a channel covered any part of it,
+so a session through a bouncer counts on every day it lasted. A session
+longer than a year counts only its first and last days, so one session left
+open by a broken log cannot fill years.
 
 ## Decisions
 

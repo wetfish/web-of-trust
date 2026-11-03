@@ -11,6 +11,7 @@ use maud::{Markup, html};
 use serde::Deserialize;
 
 use super::activity::activity_breakdown;
+use super::history::person_history_href;
 use super::identities::{Ticks, identity_table};
 use super::layout::{self, back_field, day, number, person_href};
 use super::{App, Flash, PageError, PageResult, back_to, done, failed, filled, internal, with_db};
@@ -327,6 +328,7 @@ fn page(person: &Person, views: &[lookup::IdentityView], context: &PersonContext
         }
 
         h2 { "Identities" }
+        p { a href=(person_history_href(&person.name)) { "Everything they said, and the days they were present" } }
         @if views.is_empty() {
             p { "None of this " (kind) "'s identities have sessions." }
         } @else {
@@ -773,6 +775,7 @@ mod tests {
         // A person can be made a bot.
         assert!(page.contains(r#"name="kind" value="bot""#));
         assert!(page.contains("Delete person"));
+        assert!(page.contains(r#"href="/history?person=rachel""#));
     }
 
     #[test]

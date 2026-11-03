@@ -280,6 +280,7 @@ form label:has(input[type="checkbox"]) {
 }
 
 input[type="text"],
+input[type="date"],
 textarea,
 select {
     font: inherit;
@@ -469,4 +470,10 @@ ul.notes li {
 
 .verdict-untrusted {
     color: var(--danger);
+}
+
+/* Links to newer and older pages of lines. */
+.pager {
+    display: flex;
+    gap: 1rem;
 }

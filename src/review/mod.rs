@@ -11,6 +11,7 @@
 mod activity;
 mod channels;
 mod cuts;
+mod history;
 mod hosts;
 mod identities;
 mod layout;
@@ -63,6 +64,7 @@ pub fn run(db_path: &Path, port: u16) -> db::Result<()> {
         .merge(cuts::routes())
         .merge(activity::routes())
         .merge(channels::routes())
+        .merge(history::routes())
         .route("/style.css", get(style))
         .fallback(not_found)
         .with_state(app);
