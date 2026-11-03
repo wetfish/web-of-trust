@@ -294,6 +294,12 @@ pub(super) fn identity_section(
             (totals_table("Year", &years, None))
             details {
                 summary { "By month" }
+                p.note {
+                    "Each bar is the month's days present, in grey, compared with the busiest "
+                    "month. The days it spoke fill it in "
+                    span.legend-spoke { "green" } ", so a bar with no green is a month of "
+                    "listening without a word."
+                }
                 (totals_table("Month", months, Some(busiest)))
             }
         }
@@ -316,7 +322,7 @@ fn totals_table(period: &str, rows: &[(String, Totals)], busiest: Option<i64>) -
                         th.num { "Spoken" }
                         th.num { "Share" }
                         @if busiest.is_some() {
-                            th.bar-cell { span.visually-hidden { "Days present, compared with the busiest month" } }
+                            th.bar-cell { "Present, and spoke" }
                         }
                     }
                 }
@@ -332,13 +338,32 @@ fn totals_table(period: &str, rows: &[(String, Totals)], busiest: Option<i64>) -
                             td.num { (share(totals)) }
                             @if let Some(busiest) = busiest {
                                 td.bar-cell {
-                                    span.bar style=(format!("width: {:.1}%", percent(totals.days_present, busiest))) {}
+                                    (presence_bar(totals, busiest))
                                 }
                             }
                         }
                     }
                 }
             }
+        }
+    }
+}
+
+/// The days present as a grey bar, compared with the busiest month, with the
+/// days spoken filled in.
+fn presence_bar(totals: &Totals, busiest: i64) -> Markup {
+    html! {
+        span.presence
+            style=(format!("width: {:.1}%", percent(totals.days_present, busiest)))
+            title=(format!(
+                "Present on {} days, spoke on {}",
+                number(totals.days_present),
+                number(totals.active_days)
+            )) {
+            span.spoke style=(format!(
+                "width: {:.1}%",
+                percent(totals.active_days, totals.days_present)
+            )) {}
         }
     }
 }
@@ -363,6 +388,21 @@ mod tests {
             heard,
             spoken,
         }
+    }
+
+    #[test]
+    fn fills_the_presence_bar_with_the_days_spoken() {
+        let month = |present, active| Totals {
+            days_present: present,
+            active_days: active,
+            ..Totals::default()
+        };
+        let silent = presence_bar(&month(15, 0), 30).into_string();
+        assert!(silent.contains(r#"class="presence" style="width: 50.0%""#));
+        assert!(silent.contains(r#"class="spoke" style="width: 0.0%""#));
+        assert!(silent.contains("Present on 15 days, spoke on 0"));
+        let talkative = presence_bar(&month(30, 10), 30).into_string();
+        assert!(talkative.contains(r#"class="spoke" style="width: 33.3%""#));
     }
 
     #[test]

@@ -524,7 +524,9 @@ ticked.
   days or more without a line get a red flag. Over all channels, each row
   shows the identity's network tag. Channel pages link to their own ranking.
   The identity page shows the identity's activity by year, with each month
-  behind a fold, and notes private messages when it never spoke in a channel.
+  behind a fold, where a bar shows the month's days present in grey with the
+  days it spoke filled in green, and notes private messages when it never
+  spoke in a channel.
 
 ### Code
 

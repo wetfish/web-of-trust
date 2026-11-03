@@ -171,6 +171,26 @@ tbody tr:hover {
     border-radius: 2px;
 }
 
+/* Days present as a grey bar, with the days spoken filled in green. */
+.presence {
+    display: block;
+    height: 0.7rem;
+    border-radius: 2px;
+    overflow: hidden;
+    background: color-mix(in srgb, var(--muted) 45%, transparent);
+}
+
+.presence .spoke {
+    display: block;
+    height: 100%;
+    background: var(--accent);
+}
+
+.legend-spoke {
+    color: var(--accent);
+    font-weight: 600;
+}
+
 details {
     margin-top: 2rem;
 }
