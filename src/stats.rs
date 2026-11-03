@@ -845,9 +845,9 @@ mod tests {
         let channel = &tag.channels[0];
         assert_eq!(channel.name, "#analysis");
         assert_eq!((channel.lines, channel.spoken, channel.joins), (11, 4, 3));
-        // The logging client is left out: quokka and marlowe were seen, and
-        // only marlowe spoke.
-        assert_eq!((channel.identities, channel.speakers), (2, 1));
+        // The logging client counts like anyone else: rachel, quokka and
+        // marlowe were seen, and rachel and marlowe spoke.
+        assert_eq!((channel.identities, channel.speakers), (3, 2));
         assert_eq!(channel.first.as_deref(), Some("2026-11-01 01:00"));
         assert_eq!(channel.last.as_deref(), Some("2026-11-02 09:00"));
 

@@ -380,6 +380,10 @@ what a trust score needs.
   irssi only writes the sync line while its `channel_sync` setting is on,
   which is the default. With it off, no session is marked as the logger's.
 
+  The logging client is someone in the channel too, usually you, so its
+  sessions count like anyone else's: in activity, scores, history and the
+  overview. Only private messages tell it apart, see [Activity](#activity).
+
 Only join, part and quit lines show `ident@host`, so a session learns its host
 from its join line, or from its part or quit line when it had no join.
 
@@ -486,8 +490,8 @@ nick-only keys), and `identity_id`. Sessions started by a cut have an empty
 
 `session_nicks`: `session_id`, `nick` (lowercased), `from_line` and `to_line`
 (empty when the session ran to the end of the file): the lines over which a
-session held each of its nicks, for sessions that spoke, apart from the
-logging client's. A message on these lines by that nick was the session's, so
+session held each of its nicks, for sessions that spoke, the logging
+client's included. A message on these lines by that nick was the session's, so
 a nick someone else took after a nick change is never mistaken for the
 session's. The [History](#history) page finds lines this way.
 
@@ -528,7 +532,7 @@ ticked.
 - **Overview** (`/`): for each network tag, the number of identities, people,
   bots, host groups and cuts, and a table of channels with their log files,
   lines, spoken lines and joins. Identities counts the identities with a
-  session in the channel, apart from the logging client; Spoke counts those
+  session in the channel, the logging client included; Spoke counts those
   that said anything; Silent is the share that never did; Merged counts the
   lines logged twice that were counted once, see [Lines logged
   twice](#lines-logged-twice). Private messages are summarized in one line.
@@ -646,7 +650,13 @@ as the commands.
 Activity is tracked for each identity, never merged into people, so the
 numbers stay right however identities are linked later. It only counts
 channels: private messages only show conversations with the logging client,
-so they are left out, and so are the logging client's own sessions.
+so they are left out. The logging client's own sessions in channels count
+like anyone else's, since it is someone in the channel too, usually you.
+
+Upgrading a database to schema version 11 clears the overview totals, so the
+next `wot analyze` rebuilds activity, nick spans and totals with the logging
+client counted. Until then, your own lines since you started logging with
+the client you talk from are missing, and you may show as inactive.
 
 For each identity, channel and month:
 
@@ -687,7 +697,7 @@ once before `wot review`.
 
 The history of an identity, or of a person across all their identities, lists
 what they said in channels and the days they were present. Private messages
-and the logging client's own lines are left out, as in activity.
+are left out, as in activity; the logging client's own lines count.
 
 Lines are found through each session's nick spans in `session_nicks`, kept
 with the sessions: a line belongs to a session when its nick is the one the

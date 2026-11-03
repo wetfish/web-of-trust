@@ -294,7 +294,7 @@ pub fn rebuild_with_progress(
                 session.heard_to - session.heard_from,
             ])?;
             identity_of.push(identity.as_str());
-            if session.spoken > 0 && !session.logger {
+            if session.spoken > 0 {
                 for (nick, from, to) in nick_spans(session) {
                     insert_span.execute(params![session_id(index), nick, from, to])?;
                 }
@@ -306,11 +306,12 @@ pub fn rebuild_with_progress(
     duplicates::save(&tx, &duplicates)?;
     progress.done(&format!("{} sessions", thousands(sessions.len() as u64)));
 
-    // Channel activity, leaving out private messages and the logging client.
+    // Channel activity, leaving out private messages. The logging client
+    // counts like anyone else: it is someone in the channel too.
     let presences: Vec<activity::Presence> = sessions
         .iter()
         .zip(identity_of.iter().copied())
-        .filter(|(session, _)| session.channel && !session.logger)
+        .filter(|(session, _)| session.channel)
         .map(|(session, identity)| activity::Presence {
             identity,
             tag: &session.tag,
@@ -340,7 +341,7 @@ pub fn rebuild_with_progress(
 
 /// Saves the totals the overview shows: per file, its spoken lines, joins and
 /// first and last session; per channel, its identities and those that spoke,
-/// apart from the logging client.
+/// the logging client included.
 fn save_totals(
     tx: &Connection,
     sessions: &[Session],
@@ -361,7 +362,7 @@ fn save_totals(
         file.1 += i64::from(session.joined);
         file.2 = file.2.min(session.start);
         file.3 = file.3.max(session.end);
-        if session.channel && !session.logger {
+        if session.channel {
             let people = channels
                 .entry((session.tag.as_str(), session.target.as_str()))
                 .or_default();

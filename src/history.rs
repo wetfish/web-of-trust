@@ -38,7 +38,7 @@ pub fn days(conn: &Connection, identities: &[String]) -> Result<BTreeMap<NaiveDa
 
     let mut stmt = conn.prepare(&format!(
         "SELECT s.start_at, s.end_at, f.target FROM sessions s JOIN files f ON f.id = s.file_id
-         WHERE s.identity_id IN ({ids}) AND s.logger = 0 AND f.kind = 'channel'"
+         WHERE s.identity_id IN ({ids}) AND f.kind = 'channel'"
     ))?;
     let sessions: Vec<(String, String, String)> = stmt
         .query_map(params_from_iter(values.iter()), |row| {
@@ -92,9 +92,9 @@ pub fn days(conn: &Connection, identities: &[String]) -> Result<BTreeMap<NaiveDa
     Ok(days)
 }
 
-/// The lines of channel logs said by a session while it held the nick, apart
-/// from the logging client's, and from the lines left out: second copies of
-/// lines logged twice, and a bouncer's own lines.
+/// The lines of channel logs said by a session while it held the nick, the
+/// logging client's included, apart from the lines left out: second copies
+/// of lines logged twice, and a bouncer's own lines.
 const SPOKEN_FROM: &str = "
     FROM sessions s
     JOIN session_nicks n ON n.session_id = s.id
@@ -285,6 +285,12 @@ mod tests {
         let (theirs, _) = self::lines(&conn, &marlowe, &Filter::default()).unwrap();
         assert_eq!(theirs.len(), 1);
         assert_eq!(theirs[0].text, "not the same person");
+        // The logging client's lines count like anyone else's.
+        let rachel = vec![id("rachel")];
+        let (own, _) = self::lines(&conn, &rachel, &Filter::default()).unwrap();
+        assert_eq!(own.len(), 1);
+        assert_eq!(own[0].text, "hi");
+        assert_eq!(days(&conn, &rachel).unwrap().len(), 2);
 
         // Filters, with % searched for as itself.
         let only = |filter: Filter| self::lines(&conn, &quokka, &filter).unwrap().0.len();

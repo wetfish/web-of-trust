@@ -188,7 +188,7 @@ fn page(
             (number(spoke_on as i64)) " of them: " (number(spoken)) " lines."
         }
         p.note {
-            "Private messages and the logging client's own lines are left out. A session "
+            "Private messages are left out. A session "
             "counts on every day it lasted, so a bouncer's days add up quickly."
         }
 

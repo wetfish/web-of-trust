@@ -4,7 +4,8 @@
 //!
 //! Only channels count. Private messages only show one side of a
 //! conversation, the logging client's, so they are kept apart and only shown
-//! next to quiet identities. The logging client's own sessions are left out.
+//! next to quiet identities. The logging client's own sessions count like
+//! anyone else's.
 //!
 //! - **Days present:** days on which the identity had a session in the
 //!   channel, however short.
@@ -544,15 +545,14 @@ mod tests {
                 spoken: 2,
             }
         );
-        // The logging client has no activity.
-        let logged: i64 = conn
-            .query_row(
-                "SELECT count(*) FROM activity WHERE identity_id = ?1",
-                params![id("rachel")],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(logged, 0);
+        // The logging client counts like anyone else.
+        let rachel = id("rachel");
+        let logger = super::months(&conn, &rachel, None).unwrap();
+        assert_eq!(
+            (logger[0].1.days_present, logger[0].1.spoken),
+            (2, 2),
+            "{logger:?}"
+        );
 
         let mut filter = RankFilter {
             tag: None,
@@ -564,20 +564,24 @@ mod tests {
             limit: 10,
         };
         let (rows, matched) = ranking(&conn, &filter).unwrap();
-        assert_eq!(matched, 2);
+        assert_eq!(matched, 3);
         assert_eq!(rows[0].identity_id, quokka);
         assert_eq!(rows[0].nicks, ["quokka"]);
         assert_eq!(rows[0].private_spoken, 1);
 
+        // marlowe and rachel each said two lines on two days; quokka none.
         filter.order = Order::MostActive;
-        assert_eq!(ranking(&conn, &filter).unwrap().0[0].identity_id, marlowe);
+        let (rows, _) = ranking(&conn, &filter).unwrap();
+        assert_eq!(rows[2].identity_id, quokka);
+        assert!(rows[..2].iter().any(|row| row.identity_id == marlowe));
+        assert!(rows[..2].iter().any(|row| row.identity_id == rachel));
 
         // Bots are left out unless asked for.
         decide::create_person(&mut conn, "relay", Kind::Bot, &[marlowe.clone()], None).unwrap();
-        assert_eq!(ranking(&conn, &filter).unwrap().1, 1);
+        assert_eq!(ranking(&conn, &filter).unwrap().1, 2);
         filter.include_bots = true;
         let (rows, _) = ranking(&conn, &filter).unwrap();
-        assert!(rows[0].bot);
+        assert!(rows.iter().any(|row| row.bot && row.identity_id == marlowe));
 
         filter.year = Some("2025".into());
         assert_eq!(ranking(&conn, &filter).unwrap().1, 0);

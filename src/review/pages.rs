@@ -124,7 +124,7 @@ fn tag_section(tag: &TagSummary) -> Markup {
                                 th.num { "Lines" }
                                 th.num { "Spoken" }
                                 th.num { "Joins" }
-                                th.num title="Identities with a session in the channel, apart from the logging client" { "Identities" }
+                                th.num title="Identities with a session in the channel, the logging client included" { "Identities" }
                                 th.num title="Of those identities, the ones that spoke at least once" { "Spoke" }
                                 th.num title="The share of identities that never spoke" { "Silent" }
                                 th.num title="Lines logged twice, by a client and a bouncer or two instances, counted once" { "Merged" }

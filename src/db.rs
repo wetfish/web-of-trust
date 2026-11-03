@@ -40,9 +40,9 @@ const HEAD_LEN: u64 = 1024;
 /// The schema, as the steps that build it. SQLite's `user_version` stores how
 /// many steps a database has had, so an older database is brought up to date
 /// by running the steps it is missing.
-const MIGRATIONS: [&str; 10] = [
+const MIGRATIONS: [&str; 11] = [
     SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8,
-    SCHEMA_V9, SCHEMA_V10,
+    SCHEMA_V9, SCHEMA_V10, SCHEMA_V11,
 ];
 
 const SCHEMA_V1: &str = "
@@ -429,6 +429,13 @@ CREATE TABLE replayed_lines (
 );
 
 -- Without totals, the next wot analyze rebuilds with the bouncer's markers.
+DELETE FROM file_totals;
+";
+
+const SCHEMA_V11: &str = "
+-- The logging client's own sessions now count like anyone else's, in
+-- activity, nick spans and channel totals. Without totals, the next
+-- wot analyze rebuilds them.
 DELETE FROM file_totals;
 ";
 

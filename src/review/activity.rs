@@ -91,7 +91,7 @@ fn page(
         h1 { "Activity" }
         p.note {
             "Activity in channels, by identity. Private messages are left out, since they only "
-            "show conversations with the logging client, and so is the logging client itself. "
+            "show conversations with the logging client, which counts like anyone else. "
             strong { "Heard" } " counts the lines said in a channel while the identity was there, "
             "its own included; " strong { "share" } " is how much of that it said itself. "
             "Someone present for a long time with a share near zero is listening, not talking; "
@@ -283,7 +283,7 @@ pub(super) fn identity_section(
             p.note { "It belongs to a bot, so activity rankings leave it out." }
         }
         @if months.is_empty() {
-            p.muted { "No channel activity, apart from any as the logging client." }
+            p.muted { "No channel activity." }
         } @else {
             p.lead {
                 "Present on " (number(total.days_present)) " days, spoke on "
