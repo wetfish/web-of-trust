@@ -68,16 +68,12 @@ pub fn overview(conn: &Connection) -> Result<Overview> {
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     )?;
 
-    // Identities seen and identities that spoke, by tag and channel.
+    // Identities seen and identities that spoke, by tag and channel, as the
+    // last rebuild counted them.
     let mut people_in: HashMap<(String, String), (i64, i64)> = HashMap::new();
     {
-        let mut stmt = conn.prepare(
-            "SELECT f.tag, f.target, count(DISTINCT s.identity_id),
-                    count(DISTINCT CASE WHEN s.spoken > 0 THEN s.identity_id END)
-             FROM sessions s JOIN files f ON f.id = s.file_id
-             WHERE f.kind = 'channel' AND s.logger = 0
-             GROUP BY f.tag, f.target",
-        )?;
+        let mut stmt =
+            conn.prepare("SELECT tag, channel, identities, speakers FROM channel_totals")?;
         let mut rows = stmt.query([])?;
         while let Some(row) = rows.next()? {
             people_in.insert((row.get(0)?, row.get(1)?), (row.get(2)?, row.get(3)?));
@@ -86,14 +82,9 @@ pub fn overview(conn: &Connection) -> Result<Overview> {
 
     let mut tags: Vec<TagSummary> = Vec::new();
     let mut stmt = conn.prepare(
-        "WITH per_file AS (
-             SELECT file_id, sum(spoken) AS spoken, sum(joined) AS joins,
-                    min(start_at) AS first, max(end_at) AS last
-             FROM sessions GROUP BY file_id
-         )
-         SELECT f.tag, f.kind, f.target, count(*), sum(f.lines_read),
-                ifnull(sum(p.spoken), 0), ifnull(sum(p.joins), 0), min(p.first), max(p.last)
-         FROM files f LEFT JOIN per_file p ON p.file_id = f.id
+        "SELECT f.tag, f.kind, f.target, count(*), sum(f.lines_read),
+                ifnull(sum(t.spoken), 0), ifnull(sum(t.joins), 0), min(t.first_at), max(t.last_at)
+         FROM files f LEFT JOIN file_totals t ON t.file_id = f.id
          GROUP BY f.tag, f.kind, f.target
          ORDER BY f.tag, f.target",
     )?;
@@ -148,9 +139,12 @@ fn tag_summary(conn: &Connection, tag: &str) -> Result<TagSummary> {
     };
     Ok(TagSummary {
         tag: tag.to_string(),
+        // Identities of the tag that have a session, found through the
+        // identities rather than by adding up every session.
         identities: count(
-            "SELECT count(DISTINCT s.identity_id) FROM sessions s
-             JOIN files f ON f.id = s.file_id WHERE f.tag = ?1",
+            "SELECT count(*) FROM identities i
+             WHERE i.tag = ?1 AND i.merged_into IS NULL
+               AND EXISTS (SELECT 1 FROM sessions s WHERE s.identity_id = i.id)",
         )?,
         people: count(
             "SELECT count(DISTINCT pi.person_id) FROM person_identities pi

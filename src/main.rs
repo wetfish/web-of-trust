@@ -113,6 +113,23 @@ enum Command {
         db: PathBuf,
     },
 
+    /// List network tags, or leave one out of imports and delete its lines
+    Tags {
+        #[command(subcommand)]
+        action: TagsAction,
+
+        /// SQLite database to use
+        #[arg(long, value_name = "FILE", default_value = DEFAULT_DB, global = true)]
+        db: PathBuf,
+    },
+
+    /// Shrink the database file after deleting lines, by rewriting it
+    Compact {
+        /// SQLite database to compact
+        #[arg(long, value_name = "FILE", default_value = DEFAULT_DB)]
+        db: PathBuf,
+    },
+
     /// Review the imported data in a web browser, on this computer only
     Review {
         /// Port to serve on, at http://127.0.0.1:PORT/
@@ -288,6 +305,24 @@ impl RatingArg {
 }
 
 #[derive(Subcommand)]
+enum TagsAction {
+    /// List every network tag with its size, and the ignored ones
+    List,
+
+    /// Leave a network tag out of imports and delete everything imported
+    /// from it, such as a large public network the project does not need
+    Ignore {
+        tag: String,
+
+        #[arg(long)]
+        note: Option<String>,
+    },
+
+    /// Import an ignored network tag again on the next wot analyze
+    Unignore { tag: String },
+}
+
+#[derive(Subcommand)]
 enum CutsAction {
     /// Cut a session at a nick change line, given as tag/target.log:LINE or
     /// the full path of the log file and :LINE. Quote it in the shell
@@ -328,6 +363,8 @@ fn main() -> ExitCode {
         Command::Hosts { action, tag, db } => finish(hosts(action, tag.as_deref(), &db)),
         Command::People { action, db } => finish(people(action, &db)),
         Command::Cuts { action, db } => finish(cuts(action, &db)),
+        Command::Tags { action, db } => finish(tags(action, &db)),
+        Command::Compact { db } => finish(compact(&db)),
         Command::Review { port, db } => finish(review::run(&db, port)),
     }
 }
@@ -345,6 +382,66 @@ fn finish(result: db::Result<()>) -> ExitCode {
 
 fn open(db_path: &Path) -> db::Result<Connection> {
     db::open(db_path).map_err(|err| format!("opening database {}: {err}", db_path.display()).into())
+}
+
+fn tags(action: TagsAction, db_path: &Path) -> db::Result<()> {
+    let mut conn = open(db_path)?;
+    match action {
+        TagsAction::List => {
+            let mut out = io::stdout().lock();
+            decide::list_tags(&conn, &mut out)?;
+        }
+        TagsAction::Ignore { tag, note } => {
+            let mut progress = Progress::to_stderr();
+            progress.stage(
+                &format!("Deleting what was imported from {tag}"),
+                0,
+                progress::Unit::Bytes,
+            );
+            let deleted = decide::ignore_tag(&mut conn, &tag, note.as_deref())?;
+            if deleted.files == 0 {
+                progress.done("nothing was imported from it yet");
+            } else {
+                progress.done(&format!(
+                    "{} files, {} lines",
+                    report::thousands(deleted.files as u64),
+                    report::thousands(deleted.lines as u64)
+                ));
+            }
+            println!("{tag} is ignored: wot analyze leaves its files out from now on.");
+            if deleted.files > 0 {
+                rebuild_identities(&mut conn)?;
+                println!(
+                    "The database file keeps its size until it is compacted: run wot compact."
+                );
+            }
+        }
+        TagsAction::Unignore { tag } => {
+            decide::unignore_tag(&conn, &tag)?;
+            println!("{tag} is imported again by the next wot analyze.");
+        }
+    }
+    Ok(())
+}
+
+/// Rewrites the database without the space deleted rows left behind.
+fn compact(db_path: &Path) -> db::Result<()> {
+    let conn = open(db_path)?;
+    let size = || {
+        std::fs::metadata(db_path)
+            .map(|meta| meta.len())
+            .unwrap_or(0)
+    };
+    let before = size();
+    let mut progress = Progress::to_stderr();
+    progress.stage("Compacting the database", 0, progress::Unit::Bytes);
+    conn.execute_batch("VACUUM")?;
+    progress.done(&format!(
+        "{} down to {}",
+        progress::bytes(before),
+        progress::bytes(size())
+    ));
+    Ok(())
 }
 
 /// Rebuilds identities after a decision that changes them, with a summary on
@@ -511,7 +608,7 @@ fn analyze(
         .map(|root| root.display().to_string())
         .collect();
     progress.note(&format!("Looking for log files in {}", folders.join(", ")));
-    let inventory = match discover::discover(roots) {
+    let mut inventory = match discover::discover(roots) {
         Ok(inventory) => inventory,
         Err(err) => {
             eprintln!("error: {err}");
@@ -531,6 +628,20 @@ fn analyze(
             return ExitCode::FAILURE;
         }
     };
+    match decide::leave_out_ignored(&conn, &mut inventory.files) {
+        Ok(left_out) => {
+            for (tag, files) in left_out {
+                progress.note(&format!(
+                    "Leaving out {} files of the ignored tag {tag}",
+                    report::thousands(files as u64)
+                ));
+            }
+        }
+        Err(err) => {
+            eprintln!("error: reading ignored tags: {err}");
+            return ExitCode::FAILURE;
+        }
+    }
     let summary = db::import_with_progress(&mut conn, &inventory.files, &mut progress);
     // Summaries go to standard error so the report stays clean.
     let _ = report::import_summary(&mut io::stderr().lock(), db_path, &summary);

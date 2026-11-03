@@ -11,14 +11,16 @@
 //! - **Cuts:** nick changes made by someone else at the keyboard. Changing
 //!   them needs an identity rebuild.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write;
 
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::db::Result;
+use crate::discover::LogFile;
 use crate::identity;
 use crate::lookup::{self, current_id};
+use crate::progress;
 use crate::report::{day, heading, table, thousands};
 use crate::stats::{self, Kind, Rating};
 
@@ -595,6 +597,176 @@ fn list_records(out: &mut impl Write, people: &[&stats::Person]) -> Result<()> {
     Ok(())
 }
 
+// Ignored tags
+
+/// The network tags left out of imports, lowercased.
+pub fn ignored_tags(conn: &Connection) -> Result<HashSet<String>> {
+    let mut stmt = conn.prepare("SELECT lower(tag) FROM ignored_tags")?;
+    let tags = stmt
+        .query_map([], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(tags)
+}
+
+/// Takes the files of ignored tags out of `files`, and returns how many were
+/// taken out of each tag.
+pub fn leave_out_ignored(
+    conn: &Connection,
+    files: &mut Vec<LogFile>,
+) -> Result<Vec<(String, usize)>> {
+    let ignored = ignored_tags(conn)?;
+    let mut left_out: BTreeMap<String, usize> = BTreeMap::new();
+    files.retain(|file| {
+        let ignore = ignored.contains(&file.tag.to_lowercase());
+        if ignore {
+            *left_out.entry(file.tag.clone()).or_default() += 1;
+        }
+        !ignore
+    });
+    Ok(left_out.into_iter().collect())
+}
+
+/// What ignoring a tag deleted.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Deleted {
+    pub files: i64,
+    pub lines: i64,
+}
+
+/// Leaves a network tag out of imports and deletes its files and lines. The
+/// sessions of every tag are deleted too, so identities have to be rebuilt
+/// afterwards; decisions are kept.
+pub fn ignore_tag(conn: &mut Connection, tag: &str, note: Option<&str>) -> Result<Deleted> {
+    let tag = tag.trim();
+    if tag.is_empty() {
+        return Err("give the network tag to ignore".into());
+    }
+    let ignored: bool = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM ignored_tags WHERE tag = ?1)",
+        params![tag],
+        |row| row.get(0),
+    )?;
+    if ignored {
+        return Err(format!("network tag {tag} is ignored already").into());
+    }
+    let tx = conn.transaction()?;
+    let (files, lines): (i64, i64) = tx.query_row(
+        "SELECT count(*), ifnull(sum(lines_read), 0) FROM files WHERE tag = ?1 COLLATE NOCASE",
+        params![tag],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if files > 0 {
+        // Sessions refer to files, and are all rebuilt afterwards anyway.
+        tx.execute("DELETE FROM session_nicks", [])?;
+        tx.execute("DELETE FROM sessions", [])?;
+        tx.execute("DELETE FROM file_totals", [])?;
+        tx.execute(
+            "DELETE FROM events WHERE file_id IN
+                 (SELECT id FROM files WHERE tag = ?1 COLLATE NOCASE)",
+            params![tag],
+        )?;
+        tx.execute(
+            "DELETE FROM files WHERE tag = ?1 COLLATE NOCASE",
+            params![tag],
+        )?;
+    }
+    tx.execute(
+        "INSERT INTO ignored_tags (tag, note) VALUES (?1, ?2)",
+        params![tag, note],
+    )?;
+    tx.commit()?;
+    Ok(Deleted { files, lines })
+}
+
+/// Imports a network tag again from the next `wot analyze`.
+pub fn unignore_tag(conn: &Connection, tag: &str) -> Result<()> {
+    let removed = conn.execute(
+        "DELETE FROM ignored_tags WHERE tag = ?1",
+        params![tag.trim()],
+    )?;
+    if removed == 0 {
+        return Err(format!("network tag {tag} is not ignored").into());
+    }
+    Ok(())
+}
+
+/// Lists every imported network tag with its size, then the ignored ones.
+pub fn list_tags(conn: &Connection, out: &mut impl Write) -> Result<()> {
+    let tags: Vec<(String, i64, i64, i64, i64)> = {
+        let mut stmt = conn.prepare(
+            "SELECT tag, count(*), sum(kind = 'channel'), ifnull(sum(lines_read), 0),
+                    ifnull(sum(bytes_read), 0)
+             FROM files GROUP BY tag ORDER BY sum(bytes_read) DESC, tag",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        rows
+    };
+    heading(out, "Network tags", '=')?;
+    if tags.is_empty() {
+        writeln!(out, "Nothing imported yet.")?;
+    } else {
+        let rows: Vec<Vec<String>> = tags
+            .iter()
+            .map(|(tag, files, channels, lines, bytes)| {
+                vec![
+                    tag.clone(),
+                    thousands(*files as u64),
+                    thousands(*channels as u64),
+                    thousands(*lines as u64),
+                    progress::bytes(*bytes as u64),
+                ]
+            })
+            .collect();
+        table(
+            out,
+            &["Tag", "Files", "Channels", "Lines", "Size"],
+            &rows,
+            &[false, true, true, true, true],
+        )?;
+        writeln!(out)?;
+        writeln!(
+            out,
+            "Leave a tag out of imports and delete its lines with wot tags ignore TAG."
+        )?;
+    }
+
+    let ignored: Vec<(String, Option<String>, String)> = {
+        let mut stmt =
+            conn.prepare("SELECT tag, note, created_at FROM ignored_tags ORDER BY tag")?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        rows
+    };
+    if !ignored.is_empty() {
+        writeln!(out)?;
+        heading(out, "Ignored tags", '-')?;
+        let rows: Vec<Vec<String>> = ignored
+            .into_iter()
+            .map(|(tag, note, created_at)| {
+                vec![tag, day(&created_at).to_string(), note.unwrap_or_default()]
+            })
+            .collect();
+        table(
+            out,
+            &["Tag", "Since", "Note"],
+            &rows,
+            &[false, false, false],
+        )?;
+    }
+    Ok(())
+}
+
 // Channel reviews
 
 /// Records that you went through a channel's users now. A review stays valid
@@ -913,6 +1085,56 @@ mod tests {
         let marlowe = stats::person(&conn, "marlowe").unwrap().unwrap();
         assert_eq!(marlowe.invited_by, None);
         set_invited_by(&conn, "marlowe", None).unwrap();
+    }
+
+    #[test]
+    fn ignores_a_tag_and_deletes_its_lines() {
+        let (root, mut conn) = setup("decide-ignore");
+        fs::create_dir_all(root.0.join("rizon")).unwrap();
+        fs::write(
+            root.0.join("rizon/#busy.log"),
+            "--- Log opened Sun Nov 01 01:00:00 2026\n01:00 <someone> hi\n",
+        )
+        .unwrap();
+        let mut inventory = discover::discover(&[root.0.clone()]).unwrap();
+        db::import(&mut conn, &inventory.files);
+        let count = |sql: &str| -> i64 { conn.query_row(sql, [], |row| row.get(0)).unwrap() };
+        assert_eq!(count("SELECT count(*) FROM files WHERE tag = 'rizon'"), 1);
+
+        let deleted = ignore_tag(&mut conn, "RIZON", Some("public network")).unwrap();
+        assert_eq!(deleted, Deleted { files: 1, lines: 2 });
+        let count = |sql: &str| -> i64 { conn.query_row(sql, [], |row| row.get(0)).unwrap() };
+        assert_eq!(count("SELECT count(*) FROM files WHERE tag = 'rizon'"), 0);
+        assert_eq!(
+            count("SELECT count(*) FROM events WHERE text = 'hi'"),
+            0,
+            "its lines are gone"
+        );
+        assert!(count("SELECT count(*) FROM files WHERE tag = 'wetfish'") > 0);
+        assert!(
+            ignore_tag(&mut conn, "rizon", None).is_err(),
+            "ignored already"
+        );
+
+        // Later imports leave its files out.
+        let left_out = leave_out_ignored(&conn, &mut inventory.files).unwrap();
+        assert_eq!(left_out, [("rizon".to_string(), 1)]);
+        assert!(inventory.files.iter().all(|file| file.tag == "wetfish"));
+        identity::rebuild(&mut conn).unwrap();
+
+        let mut out = Vec::new();
+        list_tags(&conn, &mut out).unwrap();
+        let listed = String::from_utf8(out).unwrap();
+        assert!(listed.contains("wetfish"));
+        assert!(listed.contains("public network"));
+
+        unignore_tag(&conn, "Rizon").unwrap();
+        assert!(unignore_tag(&conn, "rizon").is_err());
+        // A tag never imported can be ignored before its first import.
+        assert_eq!(
+            ignore_tag(&mut conn, "libera", None).unwrap(),
+            Deleted::default()
+        );
     }
 
     #[test]

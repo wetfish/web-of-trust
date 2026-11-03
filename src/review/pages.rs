@@ -108,6 +108,10 @@ fn tag_section(tag: &TagSummary) -> Markup {
                 li { a href="/hosts" { strong { (number(tag.host_groups)) } " host groups" } }
                 li { a href="/cuts" { strong { (number(tag.cuts)) } " cuts" } }
             }
+            p.note {
+                "Not needed for this project? " code { "wot tags ignore " (tag.tag) }
+                " deletes its lines and leaves it out of later imports."
+            }
             @if tag.channels.is_empty() {
                 p { "No channel logs." }
             } @else {
@@ -278,6 +282,7 @@ mod tests {
         let page = super::overview(&overview).into_string();
         assert!(page.contains(r#"href="/channel?tag=wetfish&amp;name=%23dry%20fish""#));
         assert!(page.contains("50%"));
+        assert!(page.contains("<code>wot tags ignore wetfish</code>"));
     }
 
     #[test]

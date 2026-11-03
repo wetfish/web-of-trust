@@ -234,18 +234,16 @@ pub fn bots(conn: &Connection) -> Result<HashSet<String>> {
         .collect())
 }
 
-/// Messages and actions each identity sent in private messages, apart from
-/// the logging client's.
-pub fn private_spoken(conn: &Connection) -> Result<HashMap<String, i64>> {
-    let mut stmt = conn.prepare(
-        "SELECT s.identity_id, sum(s.spoken) FROM sessions s JOIN files f ON f.id = s.file_id
-         WHERE f.kind = 'query' AND s.logger = 0
-         GROUP BY s.identity_id",
+/// Messages and actions an identity sent in private messages, apart from the
+/// logging client's.
+pub fn private_spoken(conn: &Connection, identity: &str) -> Result<i64> {
+    let spoken = conn.query_row(
+        "SELECT ifnull(sum(s.spoken), 0) FROM sessions s JOIN files f ON f.id = s.file_id
+         WHERE s.identity_id = ?1 AND f.kind = 'query' AND s.logger = 0",
+        params![identity],
+        |row| row.get(0),
     )?;
-    let rows = stmt
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-        .collect::<rusqlite::Result<_>>()?;
-    Ok(rows)
+    Ok(spoken)
 }
 
 /// How to order a ranking.
@@ -337,7 +335,6 @@ pub fn ranking(conn: &Connection, filter: &RankFilter) -> Result<(Vec<RankRow>, 
 
     let merges = lookup::merges(conn)?;
     let people = lookup::people_by_identity(conn, &merges)?;
-    let private = private_spoken(conn)?;
     let mut nicks = conn
         .prepare("SELECT DISTINCT nick FROM identity_keys WHERE identity_id = ?1 ORDER BY nick")?;
     for row in &mut rows {
@@ -345,7 +342,7 @@ pub fn ranking(conn: &Connection, filter: &RankFilter) -> Result<(Vec<RankRow>, 
             .query_map(params![row.identity_id], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?;
         row.people = people.get(&row.identity_id).cloned().unwrap_or_default();
-        row.private_spoken = private.get(&row.identity_id).copied().unwrap_or(0);
+        row.private_spoken = private_spoken(conn, &row.identity_id)?;
     }
     Ok((rows, matched))
 }

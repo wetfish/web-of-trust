@@ -95,6 +95,15 @@ To use a different database file:
 wot analyze ~/irclogs --db /path/to/other.sqlite
 ```
 
+To leave a network tag out, such as a large public network the project does
+not need, see [Ignoring network tags](#ignoring-network-tags):
+
+```bash
+wot tags list
+wot tags ignore rizon --note "public network"
+wot compact
+```
+
 To review the imported data in a web browser instead, see
 [Reviewing in a browser](#reviewing-in-a-browser):
 
@@ -239,6 +248,25 @@ Writing to the database: saved (1.2s)
 
 Decisions that rebuild identities, from the command line or from `wot review`,
 show the same stages; for `wot review`, in the terminal it runs in.
+
+### Ignoring network tags
+
+Some log folders hold networks the project does not need, such as large public
+networks with millions of lines that only slow imports and reports down.
+`wot tags list` lists every imported network tag with its files, channels,
+lines and size, biggest first, and the tags already ignored.
+
+`wot tags ignore TAG` deletes every file and line imported from the tag and
+leaves its folders out of every later `wot analyze`, which says how many files
+it left out. Identities are rebuilt straight away, since the deleted lines may
+have linked sessions. Decisions about the tag, such as host groups, are kept.
+Tags are matched ignoring case, and a tag can be ignored before it was ever
+imported. `wot tags unignore TAG` imports it again on the next run, from the
+start.
+
+SQLite keeps the space deleted rows took, so the database file stays the same
+size until `wot compact` rewrites it. That takes a while for a large database
+and needs free disk space about the size of the database.
 
 The database records its schema version. When a newer version of `wot` adds
 tables, it adds them to an existing database the next time it opens it. A
@@ -445,6 +473,13 @@ logging client's. A message on these lines by that nick was the session's, so
 a nick someone else took after a nick change is never mistaken for the
 session's. The [History](#history) page finds lines this way.
 
+`file_totals` (`file_id`, `spoken`, `joins`, `first_at`, `last_at`) and
+`channel_totals` (`tag`, `channel`, `identities`, `speakers`) hold the
+overview's totals, rebuilt with the sessions, so the overview reads a row per
+file and channel instead of adding up millions of sessions. A database
+upgraded since its last rebuild has no totals yet, and `wot analyze` rebuilds
+on its next run.
+
 ## Reviewing in a browser
 
 `wot review` serves a web interface for reviewing the imported data, then
@@ -603,7 +638,8 @@ the logging client, which tells a shy member from someone who never talks.
 
 `activity` table: `identity_id`, `tag`, `channel` (`*` for all channels
 together), `month` (`YYYY-MM`), `days_present`, `active_days`, `minutes`,
-`heard` and `spoken`.
+`heard` and `spoken`. An index on every column the ranking reads, in the order
+it groups them, lets it rank millions of rows in about a second.
 
 Upgrading a database to this version empties `sessions` so that the next
 `wot analyze` rebuilds them with heard lines, activity and nick spans. Run it
@@ -763,6 +799,9 @@ a search and choose **Create bot**, or add them to an existing bot.
 
 `session_cuts`: `id`, `path` (the log file), `line`, `expected` (the nick
 change on that line), `note` and `created_at`.
+
+`ignored_tags`: `tag`, `note` and `created_at`, see
+[Ignoring network tags](#ignoring-network-tags).
 
 `who_lists`: `id`, `tag`, `channel` and `pasted_at`.
 

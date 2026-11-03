@@ -168,9 +168,13 @@ fn cut_host(id: i64) -> String {
 /// Whether sessions have been built at all, for example after upgrading a
 /// database that predates them.
 pub fn is_built(conn: &Connection) -> Result<bool> {
-    let built = conn.query_row("SELECT EXISTS (SELECT 1 FROM sessions)", [], |row| {
-        row.get(0)
-    })?;
+    // The totals are filled with the sessions; a database upgraded since the
+    // last rebuild has sessions but no totals yet.
+    let built = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM sessions) AND EXISTS (SELECT 1 FROM file_totals)",
+        [],
+        |row| row.get(0),
+    )?;
     Ok(built)
 }
 
@@ -296,6 +300,7 @@ pub fn rebuild_with_progress(
         }
     }
 
+    save_totals(&tx, &sessions, &identity_of)?;
     progress.done(&format!("{} sessions", thousands(sessions.len() as u64)));
 
     // Channel activity, leaving out private messages and the logging client.
@@ -328,6 +333,63 @@ pub fn rebuild_with_progress(
     tx.commit()?;
     progress.done("saved");
     Ok(summary)
+}
+
+/// Saves the totals the overview shows: per file, its spoken lines, joins and
+/// first and last session; per channel, its identities and those that spoke,
+/// apart from the logging client.
+fn save_totals(tx: &Connection, sessions: &[Session], identity_of: &[&str]) -> Result<()> {
+    tx.execute("DELETE FROM file_totals", [])?;
+    tx.execute("DELETE FROM channel_totals", [])?;
+
+    let mut files: HashMap<i64, (i64, i64, NaiveDateTime, NaiveDateTime)> = HashMap::new();
+    type People<'a> = (HashSet<&'a str>, HashSet<&'a str>);
+    let mut channels: HashMap<(&str, &str), People<'_>> = HashMap::new();
+    for (session, identity) in sessions.iter().zip(identity_of.iter().copied()) {
+        let file = files
+            .entry(session.file_id)
+            .or_insert((0, 0, session.start, session.end));
+        file.0 += session.spoken;
+        file.1 += i64::from(session.joined);
+        file.2 = file.2.min(session.start);
+        file.3 = file.3.max(session.end);
+        if session.channel && !session.logger {
+            let people = channels
+                .entry((session.tag.as_str(), session.target.as_str()))
+                .or_default();
+            people.0.insert(identity);
+            if session.spoken > 0 {
+                people.1.insert(identity);
+            }
+        }
+    }
+
+    let mut insert = tx.prepare(
+        "INSERT INTO file_totals (file_id, spoken, joins, first_at, last_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+    )?;
+    for (file_id, (spoken, joins, first, last)) in files {
+        insert.execute(params![
+            file_id,
+            spoken,
+            joins,
+            format_at(first),
+            format_at(last)
+        ])?;
+    }
+    let mut insert = tx.prepare(
+        "INSERT OR REPLACE INTO channel_totals (tag, channel, identities, speakers)
+         VALUES (?1, ?2, ?3, ?4)",
+    )?;
+    for ((tag, channel), (identities, speakers)) in channels {
+        insert.execute(params![
+            tag,
+            channel,
+            identities.len() as i64,
+            speakers.len() as i64
+        ])?;
+    }
+    Ok(())
 }
 
 /// The lines over which a session held each of its nicks: the lowercased

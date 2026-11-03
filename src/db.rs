@@ -39,8 +39,8 @@ const HEAD_LEN: u64 = 1024;
 /// The schema, as the steps that build it. SQLite's `user_version` stores how
 /// many steps a database has had, so an older database is brought up to date
 /// by running the steps it is missing.
-const MIGRATIONS: [&str; 6] = [
-    SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6,
+const MIGRATIONS: [&str; 8] = [
+    SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8,
 ];
 
 const SCHEMA_V1: &str = "
@@ -323,6 +323,47 @@ CREATE INDEX events_by_file_line ON events (file_id, line);
 DELETE FROM sessions;
 ";
 
+const SCHEMA_V7: &str = "
+-- Totals for the overview, rebuilt with the sessions, so the page reads a
+-- row per file and channel instead of adding up every session. Until the
+-- next rebuild fills them, wot analyze rebuilds on its next run.
+CREATE TABLE file_totals (
+    file_id INTEGER PRIMARY KEY,
+    spoken INTEGER NOT NULL,
+    joins INTEGER NOT NULL,
+    -- YYYY-MM-DD HH:MM, of the first session and the end of the last.
+    first_at TEXT NOT NULL,
+    last_at TEXT NOT NULL
+);
+
+-- Identities with a session in each channel, apart from the logging client,
+-- and those of them that spoke.
+CREATE TABLE channel_totals (
+    tag TEXT NOT NULL,
+    channel TEXT NOT NULL,
+    identities INTEGER NOT NULL,
+    speakers INTEGER NOT NULL,
+    PRIMARY KEY (tag, channel)
+);
+
+-- The activity ranking reads every column it needs from this index, in the
+-- order it groups them, instead of looking up each row.
+DROP INDEX activity_by_channel;
+CREATE INDEX activity_ranking ON activity
+    (channel, tag, identity_id, month, days_present, active_days, minutes, heard, spoken);
+";
+
+const SCHEMA_V8: &str = "
+-- Network tags left out of imports, such as large public networks the
+-- project does not need. Their files are never read, and ignoring a tag
+-- deletes what was imported from it.
+CREATE TABLE ignored_tags (
+    tag TEXT PRIMARY KEY COLLATE NOCASE,
+    note TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+";
+
 const INSERT_EVENT: &str = "
 INSERT INTO events (file_id, line, date, time, kind, nick, ident, host, other_nick, text, detail)
 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
@@ -343,6 +384,13 @@ pub fn open(path: &Path) -> Result<Connection> {
              deleting it, or pass a different --db"
         )
         .into());
+    }
+    if version > 0 && version < latest {
+        // Some steps index or empty large tables, which takes a while.
+        eprintln!(
+            "Upgrading the database from schema version {version} to {latest}, which can take \
+             a minute for a large one..."
+        );
     }
     for (step, sql) in MIGRATIONS.iter().enumerate().skip(version as usize) {
         let version = step + 1;
@@ -910,7 +958,9 @@ mod tests {
                         + (SELECT count(*) FROM person_notes)
                         + (SELECT count(*) FROM channel_reviews)
                         + (SELECT count(*) FROM who_lists) + (SELECT count(*) FROM who_entries)
-                        + (SELECT count(*) FROM session_nicks)",
+                        + (SELECT count(*) FROM session_nicks)
+                        + (SELECT count(*) FROM file_totals) + (SELECT count(*) FROM channel_totals)
+                        + (SELECT count(*) FROM ignored_tags)",
                 [],
                 |row| row.get(0),
             )

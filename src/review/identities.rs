@@ -484,11 +484,7 @@ async fn identity_page(
             groups: stats::group_of_hosts(conn).map_err(internal)?,
             changes,
             months: activity::months(conn, &view.id, None).map_err(internal)?,
-            private_spoken: activity::private_spoken(conn)
-                .map_err(internal)?
-                .get(&view.id)
-                .copied()
-                .unwrap_or(0),
+            private_spoken: activity::private_spoken(conn, &view.id).map_err(internal)?,
             bot: activity::bots(conn).map_err(internal)?.contains(&view.id),
             score: trust::activity_score(conn, std::slice::from_ref(&view.id)).map_err(internal)?,
             real_names: trust::real_names(conn, &view.id).map_err(internal)?,
@@ -1066,7 +1062,7 @@ mod tests {
         assert!(at("Also known as") < at(r#"<section class="decision" id="person">"#));
         assert!(at("Connects from") < at(r#"<section class="decision" id="person">"#));
         assert!(page.contains(r#"href="/identities?nick=quokka">quokka</a>"#));
-        assert!(page.contains(r#"<a href="#person">Nobody yet</a>"#));
+        assert!(page.contains(r##"<a href="#person">Nobody yet</a>"##));
     }
 
     #[test]
