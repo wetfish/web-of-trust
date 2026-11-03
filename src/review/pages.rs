@@ -127,6 +127,7 @@ fn tag_section(tag: &TagSummary) -> Markup {
                                 th.num title="Identities with a session in the channel, apart from the logging client" { "Identities" }
                                 th.num title="Of those identities, the ones that spoke at least once" { "Spoke" }
                                 th.num title="The share of identities that never spoke" { "Silent" }
+                                th.num title="Lines logged twice, by a client and a bouncer or two instances, counted once" { "Merged" }
                                 th { "First seen" }
                                 th { "Last seen" }
                             }
@@ -142,6 +143,13 @@ fn tag_section(tag: &TagSummary) -> Markup {
                                     td.num { (number(channel.identities)) }
                                     td.num { (number(channel.speakers)) }
                                     td.num { (silent_share(channel.identities, channel.speakers)) }
+                                    td.num {
+                                        @if channel.merged > 0 {
+                                            (number(channel.merged))
+                                        } @else {
+                                            span.muted { "-" }
+                                        }
+                                    }
                                     td { (day(channel.first.as_deref())) }
                                     td { (day(channel.last.as_deref())) }
                                 }
@@ -273,6 +281,7 @@ mod tests {
                     joins: 2,
                     identities: 2,
                     speakers: 1,
+                    merged: 4,
                     first: Some("2026-11-01 01:00".into()),
                     last: Some("2026-11-02 09:00".into()),
                 }],

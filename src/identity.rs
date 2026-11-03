@@ -38,10 +38,10 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime, TimeDelta};
 use rusqlite::{Connection, params};
 
-use crate::activity;
-use crate::db::Result;
+use crate::db::{self, Result};
 use crate::progress::{Progress, Unit};
 use crate::report::thousands;
+use crate::{activity, duplicates};
 
 /// The event kinds that open, change or close sessions.
 const SESSION_KINDS: &str = "'log_opened', 'log_closed', 'join', 'part', 'quit', 'kick', \
@@ -197,7 +197,9 @@ pub fn rebuild_with_progress(
 ) -> Result<RebuildSummary> {
     let tx = conn.transaction()?;
     let mut rules = load_rules(&tx)?;
-    let (sessions, day_marks) = replay_events(&tx, &mut rules.cuts, progress)?;
+    // Second copies of lines logged twice are left out of everything below.
+    let duplicates = duplicates::find(&tx, progress)?;
+    let (sessions, day_marks) = replay_events(&tx, &mut rules.cuts, &duplicates, progress)?;
 
     let mut summary = RebuildSummary {
         sessions: sessions.len(),
@@ -300,7 +302,8 @@ pub fn rebuild_with_progress(
         }
     }
 
-    save_totals(&tx, &sessions, &identity_of)?;
+    save_totals(&tx, &sessions, &identity_of, &duplicates.by_target)?;
+    duplicates::save(&tx, &duplicates)?;
     progress.done(&format!("{} sessions", thousands(sessions.len() as u64)));
 
     // Channel activity, leaving out private messages and the logging client.
@@ -338,7 +341,12 @@ pub fn rebuild_with_progress(
 /// Saves the totals the overview shows: per file, its spoken lines, joins and
 /// first and last session; per channel, its identities and those that spoke,
 /// apart from the logging client.
-fn save_totals(tx: &Connection, sessions: &[Session], identity_of: &[&str]) -> Result<()> {
+fn save_totals(
+    tx: &Connection,
+    sessions: &[Session],
+    identity_of: &[&str],
+    duplicates: &HashMap<(String, String), i64>,
+) -> Result<()> {
     tx.execute("DELETE FROM file_totals", [])?;
     tx.execute("DELETE FROM channel_totals", [])?;
 
@@ -378,15 +386,20 @@ fn save_totals(tx: &Connection, sessions: &[Session], identity_of: &[&str]) -> R
         ])?;
     }
     let mut insert = tx.prepare(
-        "INSERT OR REPLACE INTO channel_totals (tag, channel, identities, speakers)
-         VALUES (?1, ?2, ?3, ?4)",
+        "INSERT OR REPLACE INTO channel_totals (tag, channel, identities, speakers, duplicates)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
     )?;
     for ((tag, channel), (identities, speakers)) in channels {
+        let merged = duplicates
+            .get(&(tag.to_string(), channel.to_lowercase()))
+            .copied()
+            .unwrap_or(0);
         insert.execute(params![
             tag,
             channel,
             identities.len() as i64,
-            speakers.len() as i64
+            speakers.len() as i64,
+            merged
         ])?;
     }
     Ok(())
@@ -469,6 +482,8 @@ struct Row {
     other_nick: Option<String>,
     text: Option<String>,
     detail: Option<String>,
+    /// Replayed by a bouncer from its buffer, later than it was said.
+    replayed: bool,
 }
 
 /// For each file, the count of spoken lines at the start of each day.
@@ -479,6 +494,7 @@ type DayMarks = HashMap<i64, Vec<(NaiveDate, i64)>>;
 fn replay_events(
     conn: &Connection,
     cuts: &mut Cuts,
+    duplicates: &duplicates::Duplicates,
     progress: &mut Progress,
 ) -> Result<(Vec<Session>, DayMarks)> {
     let files: HashMap<i64, (String, bool, String)> = {
@@ -498,7 +514,7 @@ fn replay_events(
     let mut events: u64 = 0;
 
     let mut stmt = conn.prepare(&format!(
-        "SELECT file_id, line, date, time, kind, nick, ident, host, other_nick, text, detail
+        "SELECT file_id, line, date, time, kind, nick, ident, host, other_nick, text, detail, id
          FROM events
          WHERE kind IN ({SESSION_KINDS}) AND date IS NOT NULL AND time IS NOT NULL
          ORDER BY file_id, line"
@@ -509,6 +525,13 @@ fn replay_events(
     let mut replay: Option<FileReplay> = None;
     while let Some(row) = rows.next()? {
         events += 1;
+        // A second copy of a line another log of the channel has, or a
+        // bouncer's own line: as if it was never said, so nobody is counted
+        // twice and the bouncer is nobody.
+        let id: i64 = row.get(11)?;
+        if duplicates.left_out(id) {
+            continue;
+        }
         if events % PROGRESS_EVENTS == 0 {
             let found = sessions.len();
             progress.update(files_done, || {
@@ -535,6 +558,7 @@ fn replay_events(
             other_nick: row.get(8)?,
             text: row.get(9)?,
             detail: row.get(10)?,
+            replayed: duplicates.replayed.contains(&id),
         };
 
         if replay.as_ref().is_none_or(|r| r.file_id != event.file_id) {
@@ -653,6 +677,11 @@ impl FileReplay {
                 });
             }
             "message" | "action" => {
+                // A replayed line says nothing about who was present when it
+                // was replayed: it only counts for someone still there.
+                if event.replayed && !self.open.contains_key(&nick.to_lowercase()) {
+                    return;
+                }
                 let index = self.session_for(sessions, nick, event);
                 self.said += 1;
                 let session = &mut sessions[index];
@@ -1109,19 +1138,24 @@ fn assign_ids(
     links: &Links,
     summary: &mut RebuildSummary,
 ) -> Result<HashMap<usize, String>> {
-    let previous: HashMap<Key, String> = {
+    // Keys recorded under a folder tag since linked into a network count as
+    // the network's, so its identities keep their ids. A key two folder tags
+    // shared now belongs to both their identities, which merge below.
+    let networks = db::network_names(conn)?;
+    let mut previous: HashMap<Key, Vec<String>> = HashMap::new();
+    {
         let mut stmt =
             conn.prepare("SELECT tag, nick, ident, host, identity_id FROM identity_keys")?;
-        let rows = stmt
-            .query_map([], |row| {
-                Ok((
-                    (row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?),
-                    row.get(4)?,
-                ))
-            })?
-            .collect::<rusqlite::Result<_>>()?;
-        rows
-    };
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let tag: String = row.get(0)?;
+            let tag = networks.get(&tag.to_lowercase()).cloned().unwrap_or(tag);
+            previous
+                .entry((tag, row.get(1)?, row.get(2)?, row.get(3)?))
+                .or_default()
+                .push(row.get(4)?);
+        }
+    }
     let created: HashMap<String, String> = {
         let mut stmt = conn.prepare("SELECT id, created_at FROM identities")?;
         let rows = stmt
@@ -1145,6 +1179,7 @@ fn assign_ids(
         let mut candidates: Vec<&String> = nodes
             .iter()
             .filter_map(|&node| previous.get(&links.keys[node]))
+            .flatten()
             .filter(|id| !used.contains(*id))
             .collect();
         candidates.sort_by_key(|&id| (created.get(id), id));
@@ -1158,7 +1193,12 @@ fn assign_ids(
                     merge.execute(params![winner, loser])?;
                     summary.merged_identities += 1;
                 }
-                merge.execute(params![None::<String>, winner])?;
+                // It keeps its id, under the tag it has now, which changes
+                // when its folder tag is linked into a network.
+                conn.prepare_cached(
+                    "UPDATE identities SET merged_into = NULL, tag = ?1 WHERE id = ?2",
+                )?
+                .execute(params![&links.keys[*root].0, winner])?;
                 winner.clone()
             }
             None => {

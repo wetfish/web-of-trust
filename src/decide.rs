@@ -651,7 +651,8 @@ pub fn ignore_tag(conn: &mut Connection, tag: &str, note: Option<&str>) -> Resul
     }
     let tx = conn.transaction()?;
     let (files, lines): (i64, i64) = tx.query_row(
-        "SELECT count(*), ifnull(sum(lines_read), 0) FROM files WHERE tag = ?1 COLLATE NOCASE",
+        "SELECT count(*), ifnull(sum(lines_read), 0) FROM files
+         WHERE folder_tag = ?1 COLLATE NOCASE",
         params![tag],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
@@ -662,14 +663,16 @@ pub fn ignore_tag(conn: &mut Connection, tag: &str, note: Option<&str>) -> Resul
         tx.execute("DELETE FROM file_totals", [])?;
         tx.execute(
             "DELETE FROM events WHERE file_id IN
-                 (SELECT id FROM files WHERE tag = ?1 COLLATE NOCASE)",
+                 (SELECT id FROM files WHERE folder_tag = ?1 COLLATE NOCASE)",
             params![tag],
         )?;
         tx.execute(
-            "DELETE FROM files WHERE tag = ?1 COLLATE NOCASE",
+            "DELETE FROM files WHERE folder_tag = ?1 COLLATE NOCASE",
             params![tag],
         )?;
     }
+    // An ignored tag leaves its network, if it was in one.
+    tx.execute("DELETE FROM network_tags WHERE tag = ?1", params![tag])?;
     tx.execute(
         "INSERT INTO ignored_tags (tag, note) VALUES (?1, ?2)",
         params![tag, note],
@@ -690,64 +693,96 @@ pub fn unignore_tag(conn: &Connection, tag: &str) -> Result<()> {
     Ok(())
 }
 
-/// Lists every imported network tag with its size, then the ignored ones.
+/// A folder tag with what was imported from it, and its network.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FolderTag {
+    pub folder: String,
+    /// The network it was linked into, if any.
+    pub network: Option<String>,
+    /// Marked as logged through a bouncer.
+    pub bouncer: bool,
+    pub files: i64,
+    pub channels: i64,
+    pub lines: i64,
+    pub bytes: i64,
+}
+
+/// Every folder tag imported, the biggest first.
+pub fn folder_tags(conn: &Connection) -> Result<Vec<FolderTag>> {
+    let mut stmt = conn.prepare(
+        "SELECT f.folder_tag, n.name, count(*), sum(f.kind = 'channel'),
+                ifnull(sum(f.lines_read), 0), ifnull(sum(f.bytes_read), 0),
+                EXISTS (SELECT 1 FROM bouncer_tags b WHERE b.tag = f.folder_tag)
+         FROM files f
+         LEFT JOIN network_tags t ON t.tag = f.folder_tag
+         LEFT JOIN networks n ON n.id = t.network_id
+         GROUP BY f.folder_tag COLLATE NOCASE
+         ORDER BY sum(f.bytes_read) DESC, f.folder_tag",
+    )?;
+    let tags = stmt
+        .query_map([], |row| {
+            Ok(FolderTag {
+                folder: row.get(0)?,
+                network: row.get(1)?,
+                files: row.get(2)?,
+                channels: row.get(3)?,
+                lines: row.get(4)?,
+                bytes: row.get(5)?,
+                bouncer: row.get(6)?,
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(tags)
+}
+
+/// The ignored tags: tag, note and since when.
+pub fn ignored_tag_list(conn: &Connection) -> Result<Vec<(String, Option<String>, String)>> {
+    let mut stmt = conn.prepare("SELECT tag, note, created_at FROM ignored_tags ORDER BY tag")?;
+    let rows = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(rows)
+}
+
+/// Lists every imported folder tag with its size and network, then the
+/// ignored ones.
 pub fn list_tags(conn: &Connection, out: &mut impl Write) -> Result<()> {
-    let tags: Vec<(String, i64, i64, i64, i64)> = {
-        let mut stmt = conn.prepare(
-            "SELECT tag, count(*), sum(kind = 'channel'), ifnull(sum(lines_read), 0),
-                    ifnull(sum(bytes_read), 0)
-             FROM files GROUP BY tag ORDER BY sum(bytes_read) DESC, tag",
-        )?;
-        let rows = stmt
-            .query_map([], |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                ))
-            })?
-            .collect::<rusqlite::Result<_>>()?;
-        rows
-    };
+    let tags = folder_tags(conn)?;
     heading(out, "Network tags", '=')?;
     if tags.is_empty() {
         writeln!(out, "Nothing imported yet.")?;
     } else {
         let rows: Vec<Vec<String>> = tags
             .iter()
-            .map(|(tag, files, channels, lines, bytes)| {
+            .map(|tag| {
                 vec![
-                    tag.clone(),
-                    thousands(*files as u64),
-                    thousands(*channels as u64),
-                    thousands(*lines as u64),
-                    progress::bytes(*bytes as u64),
+                    tag.folder.clone(),
+                    tag.network.clone().unwrap_or_else(|| "-".into()),
+                    if tag.bouncer { "yes" } else { "-" }.to_string(),
+                    thousands(tag.files as u64),
+                    thousands(tag.channels as u64),
+                    thousands(tag.lines as u64),
+                    progress::bytes(tag.bytes as u64),
                 ]
             })
             .collect();
         table(
             out,
-            &["Tag", "Files", "Channels", "Lines", "Size"],
+            &[
+                "Tag", "Network", "Bouncer", "Files", "Channels", "Lines", "Size",
+            ],
             &rows,
-            &[false, true, true, true, true],
+            &[false, false, false, true, true, true, true],
         )?;
         writeln!(out)?;
         writeln!(
             out,
-            "Leave a tag out of imports and delete its lines with wot tags ignore TAG."
+            "Link tags into a network with wot networks create NAME TAG..., or leave one out of \
+             imports and delete its lines with wot tags ignore TAG."
         )?;
     }
 
-    let ignored: Vec<(String, Option<String>, String)> = {
-        let mut stmt =
-            conn.prepare("SELECT tag, note, created_at FROM ignored_tags ORDER BY tag")?;
-        let rows = stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
-            .collect::<rusqlite::Result<_>>()?;
-        rows
-    };
+    let ignored = ignored_tag_list(conn)?;
     if !ignored.is_empty() {
         writeln!(out)?;
         heading(out, "Ignored tags", '-')?;
@@ -764,6 +799,311 @@ pub fn list_tags(conn: &Connection, out: &mut impl Write) -> Result<()> {
             &[false, false, false],
         )?;
     }
+    Ok(())
+}
+
+// Bouncers
+
+/// Marks a folder tag as logged through a bouncer, such as ZNC: its playback
+/// markers are read for replayed lines, and its copies of lines logged twice
+/// are the ones left out. Identities have to be rebuilt afterwards.
+pub fn mark_bouncer(conn: &Connection, tag: &str) -> Result<()> {
+    let folder = imported_folder(conn, tag)?;
+    let added = conn.execute(
+        "INSERT OR IGNORE INTO bouncer_tags (tag) VALUES (?1)",
+        params![folder],
+    )?;
+    if added == 0 {
+        return Err(format!("network tag {folder} is marked as a bouncer already").into());
+    }
+    Ok(())
+}
+
+/// Takes the bouncer mark off a folder tag. Identities have to be rebuilt
+/// afterwards.
+pub fn unmark_bouncer(conn: &Connection, tag: &str) -> Result<()> {
+    let removed = conn.execute(
+        "DELETE FROM bouncer_tags WHERE tag = ?1",
+        params![tag.trim()],
+    )?;
+    if removed == 0 {
+        return Err(format!("network tag {tag} is not marked as a bouncer").into());
+    }
+    Ok(())
+}
+
+// Networks
+
+/// The decision tables that refer to a network tag, which move with it.
+const TAGGED_DECISIONS: [&str; 4] = [
+    "host_groups",
+    "host_group_members",
+    "channel_reviews",
+    "who_lists",
+];
+
+fn network_id(conn: &Connection, name: &str) -> Result<i64> {
+    conn.query_row(
+        "SELECT id FROM networks WHERE name = ?1",
+        params![name],
+        |row| row.get(0),
+    )
+    .optional()?
+    .ok_or_else(|| format!("there is no network named {name}").into())
+}
+
+/// A folder tag as imported, or an error when nothing was imported from it.
+fn imported_folder(conn: &Connection, tag: &str) -> Result<String> {
+    conn.query_row(
+        "SELECT folder_tag FROM files WHERE folder_tag = ?1 COLLATE NOCASE LIMIT 1",
+        params![tag.trim()],
+        |row| row.get(0),
+    )
+    .optional()?
+    .ok_or_else(|| {
+        format!("nothing from network tag {tag} has been imported; see wot tags list").into()
+    })
+}
+
+/// Links folder tags into a network: their files, and the decisions made
+/// under them, move to the network's name. Identities have to be rebuilt
+/// afterwards, which links them across the tags.
+fn link_tags(conn: &Connection, network: i64, name: &str, tags: &[String]) -> Result<()> {
+    for tag in tags {
+        let folder = imported_folder(conn, tag)?;
+        let current: Option<String> = conn
+            .query_row(
+                "SELECT n.name FROM network_tags t JOIN networks n ON n.id = t.network_id
+                 WHERE t.tag = ?1",
+                params![folder],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match current {
+            Some(current) if current.eq_ignore_ascii_case(name) => continue,
+            Some(current) => {
+                return Err(format!(
+                    "network tag {folder} belongs to network {current}; remove it from there first"
+                )
+                .into());
+            }
+            None => {}
+        }
+        conn.execute(
+            "INSERT INTO network_tags (tag, network_id) VALUES (?1, ?2)",
+            params![folder, network],
+        )?;
+        conn.execute(
+            "UPDATE files SET tag = ?1 WHERE folder_tag = ?2 COLLATE NOCASE",
+            params![name, folder],
+        )?;
+        for table in TAGGED_DECISIONS {
+            conn.execute(
+                &format!("UPDATE {table} SET tag = ?1 WHERE tag = ?2 COLLATE NOCASE"),
+                params![name, folder],
+            )
+            .map_err(|err| match err {
+                rusqlite::Error::SqliteFailure(failure, _)
+                    if failure.code == rusqlite::ErrorCode::ConstraintViolation =>
+                {
+                    format!(
+                        "network tag {folder} has a host group or host with the same name as \
+                         one already in {name}; rename or remove one of them first"
+                    )
+                    .into()
+                }
+                err => Box::<dyn std::error::Error + Send + Sync>::from(err),
+            })?;
+        }
+    }
+    Ok(())
+}
+
+/// Creates a network from folder tags, such as a server's old and new
+/// hostnames, or a bouncer's and a client's. Identities have to be rebuilt
+/// afterwards.
+pub fn create_network(
+    conn: &mut Connection,
+    name: &str,
+    tags: &[String],
+    note: Option<&str>,
+) -> Result<()> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("give the network a name".into());
+    }
+    if network_id(conn, name).is_ok() {
+        return Err(format!("a network named {name} already exists").into());
+    }
+    if tags.is_empty() {
+        return Err("give at least one network tag to link".into());
+    }
+    // Files of another tag already under this name would join it unasked.
+    let mut stmt =
+        conn.prepare("SELECT DISTINCT folder_tag FROM files WHERE tag = ?1 COLLATE NOCASE")?;
+    let others: Vec<String> = stmt
+        .query_map(params![name], |row| row.get(0))?
+        .collect::<rusqlite::Result<Vec<String>>>()?
+        .into_iter()
+        .filter(|folder| {
+            !tags
+                .iter()
+                .any(|tag| tag.trim().eq_ignore_ascii_case(folder))
+        })
+        .collect();
+    drop(stmt);
+    if let Some(other) = others.first() {
+        return Err(format!(
+            "network tag {other} is already called {name}; link it into the network too, or \
+             choose another name"
+        )
+        .into());
+    }
+    let tx = conn.transaction()?;
+    tx.execute(
+        "INSERT INTO networks (name, note) VALUES (?1, ?2)",
+        params![name, note],
+    )?;
+    let id = tx.last_insert_rowid();
+    link_tags(&tx, id, name, tags)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Links more folder tags into a network. Identities have to be rebuilt
+/// afterwards.
+pub fn add_to_network(conn: &mut Connection, name: &str, tags: &[String]) -> Result<()> {
+    let id = network_id(conn, name)?;
+    let name: String = conn.query_row(
+        "SELECT name FROM networks WHERE id = ?1",
+        params![id],
+        |row| row.get(0),
+    )?;
+    let tx = conn.transaction()?;
+    link_tags(&tx, id, &name, tags)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Takes folder tags out of their network. Their files go back to their own
+/// tag; decisions made while linked stay with the network. Identities have
+/// to be rebuilt afterwards; they keep their ids where they can.
+pub fn remove_from_network(conn: &mut Connection, tags: &[String]) -> Result<()> {
+    let tx = conn.transaction()?;
+    let mut removed = 0;
+    for tag in tags {
+        let linked: Option<(String, String)> = tx
+            .query_row(
+                "SELECT t.tag, n.name FROM network_tags t JOIN networks n ON n.id = t.network_id
+                 WHERE t.tag = ?1",
+                params![tag.trim()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((folder, network)) = linked else {
+            continue;
+        };
+        tx.execute("DELETE FROM network_tags WHERE tag = ?1", params![folder])?;
+        tx.execute(
+            "UPDATE files SET tag = folder_tag WHERE folder_tag = ?1 COLLATE NOCASE",
+            params![folder],
+        )?;
+        // The network's keys, copied to the folder tag, let its identities
+        // keep their ids when rebuilt.
+        tx.execute(
+            "INSERT OR IGNORE INTO identity_keys (tag, nick, ident, host, identity_id)
+             SELECT ?1, nick, ident, host, identity_id FROM identity_keys WHERE tag = ?2",
+            params![folder, network],
+        )?;
+        removed += 1;
+    }
+    if removed == 0 {
+        return Err(match tags {
+            [tag] => format!("network tag {tag} is not in a network"),
+            _ => "none of these network tags are in a network".to_string(),
+        }
+        .into());
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// Deletes a network, taking all its tags out of it first.
+pub fn delete_network(conn: &mut Connection, name: &str) -> Result<()> {
+    let id = network_id(conn, name)?;
+    let tags: Vec<String> = {
+        let mut stmt = conn.prepare("SELECT tag FROM network_tags WHERE network_id = ?1")?;
+        let rows = stmt
+            .query_map(params![id], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        rows
+    };
+    if !tags.is_empty() {
+        remove_from_network(conn, &tags)?;
+    }
+    conn.execute("DELETE FROM networks WHERE id = ?1", params![id])?;
+    Ok(())
+}
+
+/// A network with its folder tags.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Network {
+    pub name: String,
+    pub note: Option<String>,
+    pub tags: Vec<String>,
+}
+
+pub fn networks(conn: &Connection) -> Result<Vec<Network>> {
+    let mut stmt = conn.prepare(
+        "SELECT n.name, n.note, t.tag FROM networks n
+         LEFT JOIN network_tags t ON t.network_id = n.id
+         ORDER BY n.name, t.tag",
+    )?;
+    let rows: Vec<(String, Option<String>, Option<String>)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut networks: Vec<Network> = Vec::new();
+    for (name, note, tag) in rows {
+        if networks.last().is_none_or(|last| last.name != name) {
+            networks.push(Network {
+                name,
+                note,
+                tags: Vec::new(),
+            });
+        }
+        if let (Some(tag), Some(network)) = (tag, networks.last_mut()) {
+            network.tags.push(tag);
+        }
+    }
+    Ok(networks)
+}
+
+pub fn list_networks(conn: &Connection, out: &mut impl Write) -> Result<()> {
+    let networks = networks(conn)?;
+    heading(out, "Networks", '=')?;
+    if networks.is_empty() {
+        writeln!(
+            out,
+            "No networks yet. Link network tags into one with wot networks create NAME TAG..."
+        )?;
+        return Ok(());
+    }
+    let rows: Vec<Vec<String>> = networks
+        .into_iter()
+        .map(|network| {
+            vec![
+                network.name,
+                network.tags.join(", "),
+                network.note.unwrap_or_default(),
+            ]
+        })
+        .collect();
+    table(
+        out,
+        &["Network", "Tags", "Note"],
+        &rows,
+        &[false, false, false],
+    )?;
     Ok(())
 }
 
@@ -811,7 +1151,9 @@ pub fn add_cut(conn: &Connection, at: &str, note: Option<&str>) -> Result<String
             .split_once('/')
             .ok_or_else(|| format!("{file} is not tag/target.log or a full path"))?;
         let target = name.strip_suffix(".log").unwrap_or(name);
-        let mut stmt = conn.prepare("SELECT id, path FROM files WHERE tag = ?1 AND target = ?2")?;
+        // Logs are named by the folder they are in, not their network.
+        let mut stmt =
+            conn.prepare("SELECT id, path FROM files WHERE folder_tag = ?1 AND target = ?2")?;
         let rows = stmt
             .query_map(params![tag, target], |row| Ok((row.get(0)?, row.get(1)?)))?
             .collect::<rusqlite::Result<_>>()?;
@@ -1085,6 +1427,106 @@ mod tests {
         let marlowe = stats::person(&conn, "marlowe").unwrap().unwrap();
         assert_eq!(marlowe.invited_by, None);
         set_invited_by(&conn, "marlowe", None).unwrap();
+    }
+
+    #[test]
+    fn links_network_tags_into_one_network() {
+        let root = TempDir::new("decide-networks");
+        for (folder, day) in [
+            ("old.example.net", "Sun Nov 01"),
+            ("irc.example.net", "Mon Nov 02"),
+        ] {
+            fs::create_dir_all(root.0.join(folder)).unwrap();
+            fs::write(
+                root.0.join(folder).join("#analysis.log"),
+                format!(
+                    "--- Log opened {day} 22:00:00 2026\n\
+                     22:00 -!- quokka [quokkawet@hostQ] has joined #analysis\n\
+                     22:01 <quokka> hello\n"
+                ),
+            )
+            .unwrap();
+        }
+        let mut conn = db::open(&root.0.join("wot.sqlite")).unwrap();
+        let inventory = discover::discover(&[root.0.clone()]).unwrap();
+        db::import(&mut conn, &inventory.files);
+        identity::rebuild(&mut conn).unwrap();
+        let quokkas = |conn: &Connection| -> Vec<String> {
+            let mut stmt = conn
+                .prepare("SELECT DISTINCT identity_id FROM identity_keys WHERE nick = 'quokka'")
+                .unwrap();
+            let ids = stmt
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            ids
+        };
+        let before = quokkas(&conn);
+        assert_eq!(before.len(), 2, "one identity per tag");
+        create_person(&mut conn, "quokka", Kind::Person, &before[..1], None).unwrap();
+
+        let tags = ["old.example.net".to_string(), "IRC.example.net".to_string()];
+        create_network(&mut conn, "example", &tags, Some("renamed server")).unwrap();
+        assert!(create_network(&mut conn, "EXAMPLE", &tags[..1], None).is_err());
+        assert!(add_to_network(&mut conn, "example", &["nowhere".into()]).is_err());
+        identity::rebuild(&mut conn).unwrap();
+
+        // One identity across both tags, still the person's.
+        let after = quokkas(&conn);
+        assert_eq!(after.len(), 1);
+        assert!(before.contains(&after[0]), "an old id is kept");
+        let person = stats::person(&conn, "quokka").unwrap().unwrap();
+        assert_eq!(person.identities[0].current, after[0]);
+        let tagged: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM files WHERE tag = 'example'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tagged, 2);
+        let listed = folder_tags(&conn).unwrap();
+        assert!(
+            listed
+                .iter()
+                .all(|tag| tag.network.as_deref() == Some("example"))
+        );
+        assert_eq!(networks(&conn).unwrap()[0].tags.len(), 2);
+        assert!(listed.iter().all(|tag| !tag.bouncer));
+        mark_bouncer(&conn, "IRC.example.net").unwrap();
+        assert!(
+            mark_bouncer(&conn, "irc.example.net").is_err(),
+            "marked already"
+        );
+        assert!(mark_bouncer(&conn, "nowhere").is_err());
+        let marked: Vec<String> = folder_tags(&conn)
+            .unwrap()
+            .into_iter()
+            .filter(|tag| tag.bouncer)
+            .map(|tag| tag.folder)
+            .collect();
+        assert_eq!(marked, ["irc.example.net"]);
+        unmark_bouncer(&conn, "irc.example.net").unwrap();
+        assert!(unmark_bouncer(&conn, "irc.example.net").is_err());
+
+        // Taken apart again, each tag has its own identity, one with its id.
+        remove_from_network(&mut conn, &tags[..1]).unwrap();
+        assert!(remove_from_network(&mut conn, &tags[..1]).is_err());
+        identity::rebuild(&mut conn).unwrap();
+        let split = quokkas(&conn);
+        assert_eq!(split.len(), 2);
+        assert!(split.contains(&after[0]));
+        delete_network(&mut conn, "example").unwrap();
+        assert!(networks(&conn).unwrap().is_empty());
+        let separate: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM files WHERE tag = folder_tag",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(separate, 2);
     }
 
     #[test]

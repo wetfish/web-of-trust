@@ -27,6 +27,7 @@ pub fn page(title: &str, flash: &Flash, body: Markup) -> Markup {
                         a href="/people" { "People and bots" }
                         a href="/hosts" { "Host groups" }
                         a href="/cuts" { "Cuts" }
+                        a href="/networks" { "Networks" }
                     }
                 }
                 main {

@@ -48,6 +48,9 @@ pub struct TargetSummary {
     pub identities: i64,
     /// Of those, the identities that spoke at least once.
     pub speakers: i64,
+    /// Lines logged more than once, by two logs of the channel, whose second
+    /// copies were left out of the counts.
+    pub merged: i64,
     /// `YYYY-MM-DD HH:MM` of the first and last session.
     pub first: Option<String>,
     pub last: Option<String>,
@@ -70,13 +73,16 @@ pub fn overview(conn: &Connection) -> Result<Overview> {
 
     // Identities seen and identities that spoke, by tag and channel, as the
     // last rebuild counted them.
-    let mut people_in: HashMap<(String, String), (i64, i64)> = HashMap::new();
+    let mut people_in: HashMap<(String, String), (i64, i64, i64)> = HashMap::new();
     {
-        let mut stmt =
-            conn.prepare("SELECT tag, channel, identities, speakers FROM channel_totals")?;
+        let mut stmt = conn
+            .prepare("SELECT tag, channel, identities, speakers, duplicates FROM channel_totals")?;
         let mut rows = stmt.query([])?;
         while let Some(row) = rows.next()? {
-            people_in.insert((row.get(0)?, row.get(1)?), (row.get(2)?, row.get(3)?));
+            people_in.insert(
+                (row.get(0)?, row.get(1)?),
+                (row.get(2)?, row.get(3)?, row.get(4)?),
+            );
         }
     }
 
@@ -101,7 +107,7 @@ pub fn overview(conn: &Connection) -> Result<Overview> {
         let lines: i64 = row.get(4)?;
         let spoken: i64 = row.get(5)?;
         if kind == "channel" {
-            let (identities, speakers) = people_in
+            let (identities, speakers, merged) = people_in
                 .get(&(tag.clone(), name.clone()))
                 .copied()
                 .unwrap_or_default();
@@ -113,6 +119,7 @@ pub fn overview(conn: &Connection) -> Result<Overview> {
                 joins: row.get(6)?,
                 identities,
                 speakers,
+                merged,
                 first: row.get(7)?,
                 last: row.get(8)?,
             });
@@ -201,8 +208,11 @@ pub fn channel_days(conn: &Connection, tag: &str, name: &str) -> Result<Option<C
         return Ok(None);
     }
 
+    // Second copies of lines logged twice, and a bouncer's own lines, are
+    // left out.
     let spoken_in = "file_id IN (SELECT id FROM files WHERE tag = ?1 AND target = ?2)
-                     AND kind IN ('message', 'action') AND date IS NOT NULL";
+                     AND kind IN ('message', 'action') AND date IS NOT NULL
+                     AND NOT EXISTS (SELECT 1 FROM left_out_lines d WHERE d.event_id = events.id)";
     let days: Vec<Day> = {
         let mut stmt = conn.prepare(&format!(
             "SELECT date, count(*), count(DISTINCT lower(nick)) FROM events
@@ -743,7 +753,7 @@ pub struct Cut {
 
 pub fn cuts(conn: &Connection) -> Result<Vec<Cut>> {
     let mut stmt = conn.prepare(
-        "SELECT c.id, c.path, f.tag, f.target, c.line, c.expected, c.note, c.created_at,
+        "SELECT c.id, c.path, f.folder_tag, f.target, c.line, c.expected, c.note, c.created_at,
                 e.kind, e.nick, e.other_nick
          FROM session_cuts c
          LEFT JOIN files f ON f.path = c.path

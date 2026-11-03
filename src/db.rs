@@ -18,6 +18,7 @@
 //! either. The `activity` table is rebuilt with the identities, by the
 //! `activity` module.
 
+use std::collections::HashMap;
 use std::error::Error;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
@@ -39,8 +40,9 @@ const HEAD_LEN: u64 = 1024;
 /// The schema, as the steps that build it. SQLite's `user_version` stores how
 /// many steps a database has had, so an older database is brought up to date
 /// by running the steps it is missing.
-const MIGRATIONS: [&str; 8] = [
+const MIGRATIONS: [&str; 10] = [
     SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8,
+    SCHEMA_V9, SCHEMA_V10,
 ];
 
 const SCHEMA_V1: &str = "
@@ -364,6 +366,72 @@ CREATE TABLE ignored_tags (
 );
 ";
 
+const SCHEMA_V9: &str = "
+-- The network tag folder each file was found in. `tag` is the network the
+-- file belongs to: the folder tag itself, or the name of the network it was
+-- linked into.
+ALTER TABLE files ADD COLUMN folder_tag TEXT NOT NULL DEFAULT '';
+UPDATE files SET folder_tag = tag;
+
+-- Folder tags that are one network, such as a server's old and new
+-- hostnames, or a bouncer's and a client's, linked under one name.
+CREATE TABLE networks (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    note TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- The folder tags in each network, each in at most one.
+CREATE TABLE network_tags (
+    tag TEXT PRIMARY KEY COLLATE NOCASE,
+    network_id INTEGER NOT NULL REFERENCES networks (id) ON DELETE CASCADE,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- Second copies of lines logged more than once, such as by a client and a
+-- bouncer in the same channel. Rebuilt with the sessions; everything counted
+-- from the logs leaves them out.
+CREATE TABLE duplicate_lines (
+    event_id INTEGER PRIMARY KEY
+);
+
+-- Lines of each channel that were second copies.
+ALTER TABLE channel_totals ADD COLUMN duplicates INTEGER NOT NULL DEFAULT 0;
+
+-- Without totals, the next wot analyze rebuilds, which finds the copies.
+DELETE FROM file_totals;
+";
+
+const SCHEMA_V10: &str = "
+-- Folder tags logged through a bouncer, such as ZNC, marked by hand. Only
+-- their logs are read for the bouncer's playback, and their copies of lines
+-- logged twice are the ones left out.
+CREATE TABLE bouncer_tags (
+    tag TEXT PRIMARY KEY COLLATE NOCASE,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- Lines left out of every count, rebuilt with the sessions: second copies of
+-- lines logged twice, with the copy kept, and a bouncer's own lines.
+DROP TABLE duplicate_lines;
+CREATE TABLE left_out_lines (
+    event_id INTEGER PRIMARY KEY,
+    -- 'duplicate' or 'bouncer'.
+    reason TEXT NOT NULL CHECK (reason IN ('duplicate', 'bouncer')),
+    -- For a duplicate, the copy that was kept.
+    kept_id INTEGER
+);
+
+-- Lines a bouncer replayed from its buffer, between its playback markers.
+CREATE TABLE replayed_lines (
+    event_id INTEGER PRIMARY KEY
+);
+
+-- Without totals, the next wot analyze rebuilds with the bouncer's markers.
+DELETE FROM file_totals;
+";
+
 const INSERT_EVENT: &str = "
 INSERT INTO events (file_id, line, date, time, kind, nick, ident, host, other_nick, text, detail)
 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
@@ -437,6 +505,16 @@ pub fn import_with_progress(
     progress: &mut Progress,
 ) -> ImportSummary {
     let mut summary = ImportSummary::default();
+    // New files go into the network their folder tag is linked into.
+    let networks = match network_names(conn) {
+        Ok(networks) => networks,
+        Err(err) => {
+            summary
+                .errors
+                .push((PathBuf::new(), format!("reading networks: {err}")));
+            return summary;
+        }
+    };
     let total: u64 = files.iter().map(|file| file.bytes).sum();
     progress.stage("Importing log files", total, Unit::Bytes);
     let mut finished: u64 = 0;
@@ -452,7 +530,10 @@ pub fn import_with_progress(
                 )
             });
         };
-        let result = import_file(conn, file, &mut tick);
+        let tag = networks
+            .get(&file.tag.to_lowercase())
+            .map_or(file.tag.as_str(), String::as_str);
+        let result = import_file(conn, file, tag, &mut tick);
         finished += file.bytes;
         if let Ok((_, lines)) = &result {
             let lines = lines_before + lines;
@@ -482,11 +563,24 @@ pub fn import_with_progress(
     summary
 }
 
-/// Imports one file and returns what happened and how many lines were read.
-/// `tick` hears the offset reached and the lines read so far, now and then.
+/// The network each linked folder tag belongs to, by lowercased folder tag.
+pub fn network_names(conn: &Connection) -> Result<HashMap<String, String>> {
+    let mut stmt = conn.prepare(
+        "SELECT lower(t.tag), n.name FROM network_tags t JOIN networks n ON n.id = t.network_id",
+    )?;
+    let rows = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(rows)
+}
+
+/// Imports one file under the network tag `tag` and returns what happened
+/// and how many lines were read. `tick` hears the offset reached and the
+/// lines read so far, now and then.
 fn import_file(
     conn: &mut Connection,
     file: &LogFile,
+    tag: &str,
     tick: &mut dyn FnMut(i64, u64),
 ) -> Result<(Outcome, u64)> {
     let path = fs::canonicalize(&file.path)
@@ -520,8 +614,8 @@ fn import_file(
     let (file_id, outcome, mut offset, mut line_number, mut dates) = match stored {
         None => {
             tx.execute(
-                "INSERT INTO files (path, tag, target, kind) VALUES (?1, ?2, ?3, ?4)",
-                params![path, file.tag, file.target, kind_name(file.kind)],
+                "INSERT INTO files (path, tag, folder_tag, target, kind) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![path, tag, file.tag, file.target, kind_name(file.kind)],
             )?;
             let id = tx.last_insert_rowid();
             (id, Outcome::New, 0, 0, DateTracker::default())
@@ -960,7 +1054,10 @@ mod tests {
                         + (SELECT count(*) FROM who_lists) + (SELECT count(*) FROM who_entries)
                         + (SELECT count(*) FROM session_nicks)
                         + (SELECT count(*) FROM file_totals) + (SELECT count(*) FROM channel_totals)
-                        + (SELECT count(*) FROM ignored_tags)",
+                        + (SELECT count(*) FROM ignored_tags)
+                        + (SELECT count(*) FROM networks) + (SELECT count(*) FROM network_tags)
+                        + (SELECT count(*) FROM left_out_lines)
+                        + (SELECT count(*) FROM replayed_lines) + (SELECT count(*) FROM bouncer_tags)",
                 [],
                 |row| row.get(0),
             )

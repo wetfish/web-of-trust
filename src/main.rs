@@ -2,9 +2,11 @@ mod activity;
 mod db;
 mod decide;
 mod discover;
+mod duplicates;
 mod history;
 mod identity;
 mod irssi;
+mod lines;
 mod lookup;
 mod progress;
 mod report;
@@ -110,6 +112,53 @@ enum Command {
 
         /// SQLite database to use
         #[arg(long, value_name = "FILE", default_value = DEFAULT_DB, global = true)]
+        db: PathBuf,
+    },
+
+    /// Link network tags that are one network, such as a server's old and new
+    /// hostnames, or a bouncer's and a client's
+    Networks {
+        #[command(subcommand)]
+        action: NetworksAction,
+
+        /// SQLite database to use
+        #[arg(long, value_name = "FILE", default_value = DEFAULT_DB, global = true)]
+        db: PathBuf,
+    },
+
+    /// Show imported lines of a network tag: unparsed ones, ones a bouncer
+    /// replayed, or ones left out as logged twice
+    Lines {
+        /// A network tag or network, as wot tags list shows them
+        tag: String,
+
+        /// Only lines of this channel or private message log
+        #[arg(long)]
+        channel: Option<String>,
+
+        /// Only lines irssi's format did not match
+        #[arg(long, group = "show")]
+        unparsed: bool,
+
+        /// Only lines a bouncer replayed, between its playback markers, in
+        /// tags marked with wot tags bouncer
+        #[arg(long, group = "show")]
+        replayed: bool,
+
+        /// Only lines left out as logged twice, each with the copy kept
+        #[arg(long, group = "show")]
+        duplicates: bool,
+
+        /// Only lines containing this text, ignoring case for ASCII letters
+        #[arg(long)]
+        contains: Option<String>,
+
+        /// Show at most this many lines
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+
+        /// SQLite database to read
+        #[arg(long, value_name = "FILE", default_value = DEFAULT_DB)]
         db: PathBuf,
     },
 
@@ -305,6 +354,40 @@ impl RatingArg {
 }
 
 #[derive(Subcommand)]
+enum NetworksAction {
+    /// Create a network from network tags, as wot tags list shows them
+    Create {
+        name: String,
+
+        #[arg(required = true)]
+        tags: Vec<String>,
+
+        #[arg(long)]
+        note: Option<String>,
+    },
+
+    /// Link more network tags into a network
+    Add {
+        name: String,
+
+        #[arg(required = true)]
+        tags: Vec<String>,
+    },
+
+    /// Take network tags out of their network
+    Remove {
+        #[arg(required = true)]
+        tags: Vec<String>,
+    },
+
+    /// Delete a network, taking its tags out of it first
+    Delete { name: String },
+
+    /// List networks and their tags
+    List,
+}
+
+#[derive(Subcommand)]
 enum TagsAction {
     /// List every network tag with its size, and the ignored ones
     List,
@@ -320,6 +403,14 @@ enum TagsAction {
 
     /// Import an ignored network tag again on the next wot analyze
     Unignore { tag: String },
+
+    /// Mark a network tag as logged through a bouncer, such as ZNC: its
+    /// playback is read for replayed lines, and its copies of lines logged
+    /// twice are the ones left out
+    Bouncer { tag: String },
+
+    /// Take the bouncer mark off a network tag
+    NoBouncer { tag: String },
 }
 
 #[derive(Subcommand)]
@@ -363,6 +454,35 @@ fn main() -> ExitCode {
         Command::Hosts { action, tag, db } => finish(hosts(action, tag.as_deref(), &db)),
         Command::People { action, db } => finish(people(action, &db)),
         Command::Cuts { action, db } => finish(cuts(action, &db)),
+        Command::Networks { action, db } => finish(networks(action, &db)),
+        Command::Lines {
+            tag,
+            channel,
+            unparsed,
+            replayed,
+            duplicates,
+            contains,
+            limit,
+            db,
+        } => {
+            let show = if unparsed {
+                lines::Show::Unparsed
+            } else if replayed {
+                lines::Show::Replayed
+            } else if duplicates {
+                lines::Show::Duplicates
+            } else {
+                lines::Show::All
+            };
+            let filter = lines::Filter {
+                tag,
+                channel,
+                show,
+                contains,
+                limit,
+            };
+            finish(show_lines(&filter, &db))
+        }
         Command::Tags { action, db } => finish(tags(action, &db)),
         Command::Compact { db } => finish(compact(&db)),
         Command::Review { port, db } => finish(review::run(&db, port)),
@@ -382,6 +502,44 @@ fn finish(result: db::Result<()>) -> ExitCode {
 
 fn open(db_path: &Path) -> db::Result<Connection> {
     db::open(db_path).map_err(|err| format!("opening database {}: {err}", db_path.display()).into())
+}
+
+fn networks(action: NetworksAction, db_path: &Path) -> db::Result<()> {
+    let mut conn = open(db_path)?;
+    match action {
+        NetworksAction::Create { name, tags, note } => {
+            decide::create_network(&mut conn, &name, &tags, note.as_deref())?;
+            println!("Created network {name} from {}.", tags.join(", "));
+        }
+        NetworksAction::Add { name, tags } => {
+            decide::add_to_network(&mut conn, &name, &tags)?;
+            println!("Linked {} into {name}.", tags.join(", "));
+        }
+        NetworksAction::Remove { tags } => {
+            decide::remove_from_network(&mut conn, &tags)?;
+            println!("Took {} out of their network.", tags.join(", "));
+        }
+        NetworksAction::Delete { name } => {
+            decide::delete_network(&mut conn, &name)?;
+            println!("Deleted network {name}; its tags are separate again.");
+        }
+        NetworksAction::List => {
+            let mut out = io::stdout().lock();
+            decide::list_networks(&conn, &mut out)?;
+            return Ok(());
+        }
+    }
+    rebuild_identities(&mut conn)
+}
+
+fn show_lines(filter: &lines::Filter, db_path: &Path) -> db::Result<()> {
+    let conn = open(db_path)?;
+    let (found, more) = lines::find(&conn, filter)?;
+    let mut out = io::BufWriter::new(io::stdout().lock());
+    match lines::write(&mut out, &found, more, filter).and_then(|()| out.flush()) {
+        Err(err) if err.kind() != io::ErrorKind::BrokenPipe => Err(err.into()),
+        _ => Ok(()),
+    }
 }
 
 fn tags(action: TagsAction, db_path: &Path) -> db::Result<()> {
@@ -419,6 +577,16 @@ fn tags(action: TagsAction, db_path: &Path) -> db::Result<()> {
         TagsAction::Unignore { tag } => {
             decide::unignore_tag(&conn, &tag)?;
             println!("{tag} is imported again by the next wot analyze.");
+        }
+        TagsAction::Bouncer { tag } => {
+            decide::mark_bouncer(&conn, &tag)?;
+            println!("{tag} is marked as logged through a bouncer.");
+            rebuild_identities(&mut conn)?;
+        }
+        TagsAction::NoBouncer { tag } => {
+            decide::unmark_bouncer(&conn, &tag)?;
+            println!("{tag} is no longer marked as a bouncer.");
+            rebuild_identities(&mut conn)?;
         }
     }
     Ok(())

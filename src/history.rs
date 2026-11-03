@@ -93,14 +93,16 @@ pub fn days(conn: &Connection, identities: &[String]) -> Result<BTreeMap<NaiveDa
 }
 
 /// The lines of channel logs said by a session while it held the nick, apart
-/// from the logging client's.
+/// from the logging client's, and from the lines left out: second copies of
+/// lines logged twice, and a bouncer's own lines.
 const SPOKEN_FROM: &str = "
     FROM sessions s
     JOIN session_nicks n ON n.session_id = s.id
     JOIN files f ON f.id = s.file_id AND f.kind = 'channel'
     JOIN events e ON e.file_id = s.file_id AND e.line >= n.from_line
                  AND (n.to_line IS NULL OR e.line <= n.to_line)
-                 AND e.kind IN ('message', 'action') AND lower(e.nick) = n.nick";
+                 AND e.kind IN ('message', 'action') AND lower(e.nick) = n.nick
+                 AND NOT EXISTS (SELECT 1 FROM left_out_lines d WHERE d.event_id = e.id)";
 
 /// `?first` to `?first + count - 1`, separated by commas.
 fn placeholders(first: usize, count: usize) -> String {
@@ -201,7 +203,7 @@ pub fn lines(
 }
 
 /// Escapes `%`, `_` and `\` for a LIKE pattern that uses `\` as its escape.
-fn escape_like(text: &str) -> String {
+pub fn escape_like(text: &str) -> String {
     let mut escaped = String::with_capacity(text.len());
     for c in text.chars() {
         if matches!(c, '%' | '_' | '\\') {

@@ -260,8 +260,8 @@ fn load_views(
     let mut tag_of = conn.prepare("SELECT tag FROM identities WHERE id = ?1")?;
     let mut stmt = conn.prepare(
         "SELECT s.nicks, s.ident, s.host, s.link, s.start_at, s.end_at, s.minutes, s.spoken,
-                s.logger, f.kind, f.tag, f.target, s.start_line, s.end_line,
-                sf.tag, sf.target, src.start_line, s.file_id, f.path
+                s.logger, f.kind, f.folder_tag, f.target, s.start_line, s.end_line,
+                sf.folder_tag, sf.target, src.start_line, s.file_id, f.path
          FROM sessions s
          JOIN files f ON f.id = s.file_id
          LEFT JOIN sessions src ON src.id = s.inferred_from

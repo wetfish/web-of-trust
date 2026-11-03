@@ -19,7 +19,9 @@ serves a web interface on this computer for reviewing all of it, ranking the
 most and least active identities, and making the same decisions in a browser.
 People get your own rating, notes and who invited them, which together with
 their activity make a trust score, and a channel's current users, pasted from
-irssi's `/who`, are sorted into trusted, untrusted and undecided. The social
+irssi's `/who`, are sorted into trusted, untrusted and undecided. Tags that are
+one server are linked into networks, and lines logged twice, by a client and a
+bouncer, count once. The social
 graph of who talks to whom comes next.
 
 ## Requirements
@@ -93,6 +95,20 @@ To use a different database file:
 
 ```bash
 wot analyze ~/irclogs --db /path/to/other.sqlite
+```
+
+Tags that are one network, such as a server's old and new hostnames or a
+bouncer's and a client's logs, are linked into a network, see
+[Networks](#networks), and tags logged through a bouncer are marked, see
+[Bouncers](#bouncers). Lines both logs have count once, see
+[Lines logged twice](#lines-logged-twice), and `wot lines` shows the lines of
+a tag that need a closer look:
+
+```bash
+wot networks create example irc.example.net old.example.net
+wot tags bouncer example-bouncer
+wot lines example --replayed
+wot lines example --unparsed --channel '#wetfish'
 ```
 
 To leave a network tag out, such as a large public network the project does
@@ -261,7 +277,7 @@ leaves its folders out of every later `wot analyze`, which says how many files
 it left out. Identities are rebuilt straight away, since the deleted lines may
 have linked sessions. Decisions about the tag, such as host groups, are kept.
 Tags are matched ignoring case, and a tag can be ignored before it was ever
-imported. `wot tags unignore TAG` imports it again on the next run, from the
+imported. An ignored tag leaves its network, if it was in one. `wot tags unignore TAG` imports it again on the next run, from the
 start.
 
 SQLite keeps the space deleted rows took, so the database file stays the same
@@ -281,7 +297,8 @@ it.
 | Column | Contents |
 | --- | --- |
 | `path` | Absolute path of the log file |
-| `tag`, `target` | Network tag folder and channel or nick, from the path |
+| `folder_tag`, `target` | Network tag folder and channel or nick, from the path |
+| `tag` | The network the file belongs to: its folder tag, or the [network](#networks) it was linked into |
 | `kind` | `channel` or `query` |
 | `bytes_read`, `lines_read` | How far the file has been imported |
 | `date` | The date in effect after the last imported line |
@@ -474,7 +491,8 @@ a nick someone else took after a nick change is never mistaken for the
 session's. The [History](#history) page finds lines this way.
 
 `file_totals` (`file_id`, `spoken`, `joins`, `first_at`, `last_at`) and
-`channel_totals` (`tag`, `channel`, `identities`, `speakers`) hold the
+`channel_totals` (`tag`, `channel`, `identities`, `speakers`, `duplicates`,
+the second copies of lines logged twice) hold the
 overview's totals, rebuilt with the sessions, so the overview reads a row per
 file and channel instead of adding up millions of sessions. A database
 upgraded since its last rebuild has no totals yet, and `wot analyze` rebuilds
@@ -510,8 +528,9 @@ ticked.
   bots, host groups and cuts, and a table of channels with their log files,
   lines, spoken lines and joins. Identities counts the identities with a
   session in the channel, apart from the logging client; Spoke counts those
-  that said anything; Silent is the share that never did. Private messages are
-  summarized in one line.
+  that said anything; Silent is the share that never did; Merged counts the
+  lines logged twice that were counted once, see [Lines logged
+  twice](#lines-logged-twice). Private messages are summarized in one line.
 - **Channels** (`/channels`): every channel with activity, the busiest over
   the last six months first, with its recent spoken lines and identities,
   the last month anyone was present, its review status and when a user list
@@ -570,6 +589,13 @@ ticked.
   line contains. Below, every day they were present, by month with the
   newest open, with the lines said and the channels; silent days included.
   Linked from identity and person pages. See [History](#history).
+- **Networks** (`/networks`): every network tag folder with its network,
+  files, channels, lines and size, with checkboxes: the ticked tags can be
+  made into a new network, added to an existing one, taken out of their
+  network, or marked as logged through a bouncer or not, and bouncers are
+  labelled "bouncer". Then each network with its tags and a way to delete it,
+  and the ignored tags. Every change rebuilds identities. See
+  [Networks](#networks) and [Bouncers](#bouncers).
 - **Host groups** (`/hosts`): each group with its hosts, how many identities
   used each, and forms to add and remove hosts, change the kind, ident
   setting and note, or delete the group; a form to create a group; and the
@@ -661,6 +687,98 @@ so a session through a bouncer counts on every day it lasted. A session
 longer than a year counts only its first and last days, so one session left
 open by a broken log cannot fill years.
 
+## Lines logged twice
+
+The same channel is often logged more than once at the same time: by a client
+and by a bouncer, or by two irssi instances. Every copy is imported, and each
+rebuild marks the second copies of lines, so everything counted from the logs
+counts each line once: spoken lines, lines heard, activity, trust scores,
+history and the channel pages' daily counts. Lines only one log has are kept,
+so a channel's lines are everything any of its logs saw. The log files and the
+imported lines are never changed.
+
+Logs are of the same channel when they have the same channel name, ignoring
+case, in the same network tag, from any log folder. Linking tags into a
+[network](#networks) makes their channels the same channel too.
+
+Two lines are the same when they have the same nick, ignoring case, are both
+messages or both actions with the same text, and are at most a minute apart,
+since two machines' clocks can differ. They pair off one to one, so someone
+who said the same thing twice still said two lines. Only the days two logs
+share are compared.
+
+### Bouncers
+
+Mark the network tags logged through a bouncer, by tag folder:
+
+```bash
+wot tags bouncer wetfish-bouncer
+wot tags no-bouncer wetfish-bouncer
+```
+
+or with **Mark as bouncer** on the Networks page. Each change rebuilds
+identities. In a bouncer's logs:
+
+- **Replays** are read from ZNC's playback markers, and from nothing else.
+  When a client attaches, ZNC replays what it buffered between two lines of
+  its own, `< ***> Buffer Playback...` and `< ***> Playback Complete.`, and by
+  default puts each line's original time in front of its text, as in
+  `[14:02:11] hello`. irssi logs the replay when it arrives. A line between
+  the markers is compared at the time in front of it, without it, so it
+  matches the line as a direct client logged it; a replay that arrived after
+  midnight of a line from before it is put on the day before. Anywhere else,
+  including other tags, a time in square brackets is just part of the text,
+  as when someone pastes from their own logs.
+- **A replayed line only counts for someone still there** when it was
+  replayed, since it says nothing about who was present then.
+- **The bouncer's own lines**, from its nicks starting with `*` such as the
+  playback markers, are left out of every count.
+- **Its copy of a line logged twice is the one left out**, so the lines kept
+  are the direct client's.
+
+Joins and quits from both logs still build sessions; time present is merged
+where an identity's sessions overlap, so it is not counted twice either.
+
+`left_out_lines` holds the lines left out, rebuilt with the sessions:
+`event_id`, `reason` (`duplicate` or `bouncer`) and, for a duplicate,
+`kept_id`, the copy kept. `replayed_lines` holds the `event_id` of every line
+replayed between a bouncer's markers, and `bouncer_tags` the tags marked as
+bouncers. Upgrading a database to this version clears the overview totals, so
+the next `wot analyze` rebuilds with these rules. The inventory report of
+`wot analyze` reads the log files themselves, so it still counts every copy.
+
+### Checking lines
+
+`wot lines TAG` shows the imported lines of a network tag or network, with
+their file and line number, to track down what the rules above or irssi's
+format did not expect:
+
+```bash
+wot lines example --unparsed
+wot lines example --replayed --channel '#wetfish'
+wot lines example --duplicates --limit 200
+wot lines example --contains 'Playback Complete'
+```
+
+Duplicates come out in pairs:
+
+```text
+kept      /logs/client/wetfish/#wetfish.log:1204  2026-11-01 22:20  <quokka> back now
+left out  /logs/bouncer/wetfish-bouncer/#wetfish.log:877  2026-11-01 22:30  <quokka> [22:20:05] back now
+```
+
+- `--unparsed`: lines irssi's format did not match.
+- `--replayed`: lines a bouncer replayed, between its playback markers, in
+  tags marked as bouncers.
+- `--duplicates`: lines left out as logged twice, each pair shown together:
+  the copy kept, then the copy left out, both with their file and line, to
+  check each match by eye.
+- `--contains TEXT`: lines containing the text, ignoring case for ASCII
+  letters. Combines with the others, and with `--channel`.
+
+It shows 50 lines unless `--limit` says otherwise, and says when there are
+more.
+
 ## Decisions
 
 Identities are built from what the logs show. Decisions record what only a
@@ -739,6 +857,43 @@ People do not change identities, so nothing is rebuilt. When a rebuild merges
 an identity into another, its person follows it. If that puts one identity in
 two people, the identity views show both names as a conflict.
 
+### Networks
+
+Each folder irssi logs a server into is a network tag, named after the server
+or its address. A server can end up under several: its hostname changed, a
+bouncer and a client named it differently, or two irssi instances did.
+Linking those tags into a network makes them one from then on:
+
+```bash
+wot networks create example irc.example.net old.example.net --note "renamed in 2024"
+wot networks add example bouncer.example.net
+wot networks remove old.example.net
+wot networks delete example
+wot networks list
+```
+
+Tags are given as `wot tags list` shows them, ignoring case, and each is in
+at most one network. The network's name replaces the tags everywhere: the
+overview, the channels, rankings and filters show it, identities are linked
+across the tags, and channels of the same name become one channel, with
+[lines logged twice](#lines-logged-twice) counted once. Host groups, channel
+reviews and pasted user lists made under a tag move to the network. A tag that
+has a host group or host of the same name as one already in the network
+cannot join until one of them is renamed or removed.
+
+Identities keep their ids: one person's identity under each tag becomes one
+identity, under the older id, and a person or bot it belonged to follows it.
+Taking a tag out of its network makes it separate again, and its identities
+keep their ids where they can; decisions made while it was linked stay with
+the network. Every change rebuilds identities.
+
+Logs are still named by their folder: `wot cuts add` takes
+`folder/target.log:LINE`, and identity pages name files that way.
+
+`networks`: `id`, `name`, `note` and `created_at`. `network_tags`: `tag`,
+`network_id` and `created_at`. Each file keeps the folder it came from in
+`files.folder_tag`.
+
 ### Cuts
 
 A cut marks a nick change made by someone else at the keyboard, such as
@@ -753,7 +908,9 @@ wot cuts list
 wot cuts remove 1
 ```
 
-The line is given as `tag/target.log:LINE`, or as the full path of the log
+The line is given as `tag/target.log:LINE`, where `tag` is the network tag
+folder the log is in even when it is linked into a network, or as the full
+path of the log
 file and `:LINE` when the same file name is in more than one log folder. Line
 numbers are shown in the nick changes of the identity views. The line must be
 a nick change. A cut stores the nick change it was made on; if the file is
