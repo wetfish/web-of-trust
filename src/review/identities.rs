@@ -1,7 +1,7 @@
 //! Searching identities, and the page of one identity with the decisions
 //! that can be made from it.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use axum::Router;
 use axum::extract::{Query, State};
@@ -10,12 +10,15 @@ use axum::routing::get;
 use maud::{Markup, html};
 use serde::Deserialize;
 
+use super::activity::identity_section;
 use super::layout::{
     self, back_field, channel_href, day, duration, identity_href, number, person_href, search_href,
 };
+use super::people::record_options;
 use super::{App, Flash, PageError, PageResult, filled, internal, with_db};
+use crate::activity::{self, Totals};
 use crate::lookup::{self, Filter, IdentityView, SessionRow};
-use crate::stats::{self, MatchingHost, NickChange};
+use crate::stats::{self, Kind, MatchingHost, NickChange};
 
 /// Search results show at most this many identities.
 const MAX_RESULTS: usize = 500;
@@ -36,9 +39,15 @@ struct Search {
     ident: Option<String>,
     host: Option<String>,
     person: Option<String>,
+    /// `yes` to tick every result.
+    all: Option<String>,
 }
 
 impl Search {
+    fn ticked(&self) -> bool {
+        filled(&self.all) == Some("yes")
+    }
+
     fn filter(&self) -> Filter {
         Filter {
             nick: filled(&self.nick).map(str::to_string),
@@ -62,6 +71,7 @@ async fn search_page(
             Some(lookup::find(conn, &filter).map_err(internal)?)
         };
         let people = stats::people_names(conn).map_err(internal)?;
+        let bots = activity::bots(conn).map_err(internal)?;
         let hosts = match &filter.host {
             Some(pattern) => Some(HostPanel {
                 hosts: stats::matching_hosts(conn, pattern, MAX_HOSTS).map_err(internal)?,
@@ -76,7 +86,14 @@ async fn search_page(
         Ok(layout::page(
             "Identities",
             &flash,
-            self::search(&search, &filter, views.as_deref(), hosts.as_ref(), &people),
+            self::search(
+                &search,
+                &filter,
+                views.as_deref(),
+                hosts.as_ref(),
+                &people,
+                &bots,
+            ),
         ))
     })
     .await
@@ -224,7 +241,8 @@ fn search(
     filter: &Filter,
     views: Option<&[IdentityView]>,
     hosts: Option<&HostPanel>,
-    people: &[String],
+    people: &[(String, Kind)],
+    bots: &HashSet<String>,
 ) -> Markup {
     let here = search.href();
     let value = |field: &Option<String>| field.clone().unwrap_or_default();
@@ -258,27 +276,28 @@ fn search(
                 }
                 form method="post" action="/people/link" {
                     (back_field(&here))
-                    (identity_table(&views[..views.len().min(MAX_RESULTS)], true))
+                    (identity_table(
+                        &views[..views.len().min(MAX_RESULTS)],
+                        &Ticks::toggled(&here, search.ticked()),
+                        bots,
+                    ))
                     div.bulk {
                         span.muted { "With the ticked identities:" }
                         label {
-                            "New person "
-                            input type="text" name="new_person" aria-label="New person's name";
+                            "Name "
+                            input type="text" name="new_person" aria-label="Name of the new person or bot";
                         }
                         button type="submit" name="action" value="create" { "Create person" }
+                        button type="submit" name="action" value="create_bot" { "Create bot" }
                         @if !people.is_empty() {
                             label {
                                 "or add to "
-                                select name="person" {
-                                    @for person in people {
-                                        option value=(person) { (person) }
-                                    }
-                                }
+                                select name="person" { (record_options(people)) }
                             }
-                            button type="submit" name="action" value="add" { "Add to person" }
+                            button type="submit" name="action" value="add" { "Add" }
                         }
                         button.secondary type="submit" name="action" value="remove" {
-                            "Remove from their person"
+                            "Remove from their person or bot"
                         }
                     }
                 }
@@ -287,16 +306,48 @@ fn search(
     }
 }
 
-/// A table of identities with their totals. When `selectable`, each row has
-/// a checkbox named `id`, for a form around the table.
-pub(super) fn identity_table(views: &[IdentityView], selectable: bool) -> Markup {
+/// Whether the rows of an identity table start ticked, and the link that
+/// ticks all of them or none. Pages have no scripts, so the link loads the
+/// page again.
+pub(super) struct Ticks {
+    pub all: bool,
+    /// The same page with the opposite of `all`.
+    pub toggle: String,
+}
+
+impl Ticks {
+    /// For a page at `here`, an address with a query and without `all`, that
+    /// ticks every row when its address has `all=yes`.
+    pub(super) fn toggled(here: &str, all: bool) -> Ticks {
+        Ticks {
+            all,
+            toggle: if all {
+                here.to_string()
+            } else {
+                format!("{here}&all=yes")
+            },
+        }
+    }
+}
+
+/// A table of identities with their totals, labelling those in `bots`. Each
+/// row has a checkbox named `id`, for a form around the table.
+pub(super) fn identity_table(
+    views: &[IdentityView],
+    ticks: &Ticks,
+    bots: &HashSet<String>,
+) -> Markup {
     html! {
         div.scroll {
             table {
                 thead {
                     tr {
-                        @if selectable {
-                            th { span.visually-hidden { "Select" } }
+                        th {
+                            @if ticks.all {
+                                a href=(ticks.toggle) title="Untick every identity" { "None" }
+                            } @else {
+                                a href=(ticks.toggle) title="Tick every identity" { "All" }
+                            }
                         }
                         th { "Identity" }
                         th { "Person" }
@@ -312,13 +363,14 @@ pub(super) fn identity_table(views: &[IdentityView], selectable: bool) -> Markup
                 tbody {
                     @for view in views {
                         tr {
-                            @if selectable {
-                                td {
-                                    input type="checkbox" name="id" value=(view.id)
-                                        aria-label=(format!("Select {}", view.id));
-                                }
+                            td {
+                                input type="checkbox" name="id" value=(view.id) checked[ticks.all]
+                                    aria-label=(format!("Select {}", view.id));
                             }
-                            td { a href=(identity_href(&view.id)) { code { (view.id) } } }
+                            td {
+                                a href=(identity_href(&view.id)) { code { (view.id) } }
+                                @if bots.contains(&view.id) { " " span.warning { "bot" } }
+                            }
                             td { (people_links(&view.people)) }
                             td.wrap { (nick_list(view, 4)) }
                             td.num { (number(view.connections() as i64)) }
@@ -367,9 +419,14 @@ struct IdentityQuery {
 
 /// Everything on an identity's page besides the identity itself.
 struct Context {
-    people: Vec<String>,
+    people: Vec<(String, Kind)>,
     groups: HashMap<(String, String), String>,
     changes: Vec<(usize, Vec<NickChange>)>,
+    /// Channel activity by month.
+    months: Vec<(String, Totals)>,
+    /// Messages sent in private messages to the logging client.
+    private_spoken: i64,
+    bot: bool,
 }
 
 async fn identity_page(
@@ -414,6 +471,13 @@ async fn identity_page(
             people: stats::people_names(conn).map_err(internal)?,
             groups: stats::group_of_hosts(conn).map_err(internal)?,
             changes,
+            months: activity::months(conn, &view.id, None).map_err(internal)?,
+            private_spoken: activity::private_spoken(conn)
+                .map_err(internal)?
+                .get(&view.id)
+                .copied()
+                .unwrap_or(0),
+            bot: activity::bots(conn).map_err(internal)?.contains(&view.id),
         };
         let title = format!("Identity {}", view.id);
         Ok(layout::page(&title, &flash, identity(&view, &context)).into_response())
@@ -445,21 +509,17 @@ fn identity(view: &IdentityView, context: &Context) -> Markup {
         }
 
         section.decision {
-            h2 { "Person" }
+            h2 { "Person or bot" }
             @match view.people.as_slice() {
                 [] => {
-                    p { "This identity does not belong to anyone yet." }
+                    p { "This identity does not belong to a person or bot yet." }
                     @if !context.people.is_empty() {
                         form.inline method="post" action="/people/add" {
                             (back_field(&here))
                             input type="hidden" name="id" value=(view.id);
                             label {
                                 "Add to "
-                                select name="name" {
-                                    @for person in &context.people {
-                                        option value=(person) { (person) }
-                                    }
-                                }
+                                select name="name" { (record_options(&context.people)) }
                             }
                             button type="submit" { "Add" }
                         }
@@ -467,8 +527,9 @@ fn identity(view: &IdentityView, context: &Context) -> Markup {
                     form.inline method="post" action="/people/create" {
                         (back_field(&here))
                         input type="hidden" name="ids" value=(view.id);
-                        label { "New person " input type="text" name="name" required; }
-                        button type="submit" { "Create and add" }
+                        label { "Name " input type="text" name="name" required; }
+                        button type="submit" name="kind" value="person" { "Create person" }
+                        button type="submit" name="kind" value="bot" { "Create bot" }
                     }
                 }
                 people => {
@@ -479,16 +540,20 @@ fn identity(view: &IdentityView, context: &Context) -> Markup {
                                 "since. Remove it from the wrong one. "
                             }
                         }
-                        "Belongs to " (people_links(people)) "."
+                        "Belongs to " @if context.bot { "the bot " } (people_links(people)) "."
                     }
                     form.inline method="post" action="/people/remove" {
                         (back_field(&here))
                         input type="hidden" name="id" value=(view.id);
-                        button type="submit" { "Remove from person" }
+                        button type="submit" {
+                            "Remove from " @if context.bot { "bot" } @else { "person" }
+                        }
                     }
                 }
             }
         }
+
+        (identity_section(&context.months, context.private_spoken, context.bot))
 
         h2 { "Nicks" }
         (nicks_table(view))
@@ -811,8 +876,11 @@ mod tests {
             )],
         };
         let context = Context {
-            people: vec!["rachel".into()],
+            people: vec![("rachel".into(), Kind::Person), ("relay".into(), Kind::Bot)],
             groups: HashMap::new(),
+            months: Vec::new(),
+            private_spoken: 0,
+            bot: false,
             changes: vec![(
                 0,
                 vec![NickChange {
@@ -827,19 +895,36 @@ mod tests {
         assert!(page.contains(r#"value="/logs/wetfish/#dryfish.log:5""#));
         assert!(page.contains(r#"action="/people/add""#));
         assert!(page.contains(r#"<option value="rachel">rachel</option>"#));
+        assert!(page.contains(r#"<optgroup label="Bots"><option value="relay">relay</option>"#));
+        assert!(page.contains(r#"name="kind" value="bot""#));
         assert!(page.contains("/identities?host=bridge.example.net"));
     }
 
     #[test]
     fn shows_search_results_with_links() {
-        let view = IdentityView {
+        let view = || IdentityView {
             id: "1a2b3c4d5e6f".into(),
             tag: "wetfish".into(),
             people: vec!["rachel".into()],
             sessions: vec![session(&["rachel"], "host", Some("hostR"))],
         };
-        let page = identity_table(&[view], true).into_string();
-        assert!(page.contains(r#"<input type="checkbox" name="id" value="1a2b3c4d5e6f""#));
+        let bots = HashSet::from(["1a2b3c4d5e6f".to_string()]);
+        let here = "/identities?nick=rachel";
+        let page = identity_table(&[view()], &Ticks::toggled(here, false), &bots).into_string();
+        assert!(
+            page.contains(r#"<input type="checkbox" name="id" value="1a2b3c4d5e6f" aria-label"#)
+        );
+        assert!(page.contains(r#"href="/identities?nick=rachel&amp;all=yes""#));
+
+        // Every row ticked, with a link back to none.
+        let page = identity_table(&[view()], &Ticks::toggled(here, true), &bots).into_string();
+        assert!(page.contains(r#"value="1a2b3c4d5e6f" checked aria-label"#));
+        assert!(
+            page.contains(
+                r#"href="/identities?nick=rachel" title="Untick every identity">None</a>"#
+            )
+        );
+        assert!(page.contains(r#"<span class="warning">bot</span>"#));
         assert!(page.contains(r#"href="/identity?id=1a2b3c4d5e6f""#));
         assert!(page.contains(r#"href="/person?name=rachel""#));
         assert!(page.contains("1h"));

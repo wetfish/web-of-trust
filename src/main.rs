@@ -1,3 +1,4 @@
+mod activity;
 mod db;
 mod decide;
 mod discover;
@@ -17,6 +18,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use rusqlite::Connection;
 
 use crate::lookup::Filter;
+use crate::stats::Kind;
 
 /// The default database, in the repository folder. `.gitignore` excludes it.
 const DEFAULT_DB: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/wot.sqlite");
@@ -87,7 +89,7 @@ enum Command {
         db: PathBuf,
     },
 
-    /// Say which identities belong to which person
+    /// Say which identities belong to which person or bot
     People {
         #[command(subcommand)]
         action: PeopleAction,
@@ -193,18 +195,25 @@ impl GroupKind {
 
 #[derive(Subcommand)]
 enum PeopleAction {
-    /// Create a person, optionally with identities
+    /// Create a person, or a bot with --bot, optionally with identities
     Create {
         name: String,
 
         /// Identity ids, as shown by wot analyze --nick, --ident or --host
         ids: Vec<String>,
 
+        /// Create a bot, which activity rankings leave out
+        #[arg(long)]
+        bot: bool,
+
         #[arg(long)]
         note: Option<String>,
     },
 
-    /// Add identities to a person
+    /// Make a person a bot, or a bot a person, keeping its identities
+    Kind { name: String, kind: RecordKind },
+
+    /// Add identities to a person or bot
     Add {
         name: String,
 
@@ -212,17 +221,32 @@ enum PeopleAction {
         ids: Vec<String>,
     },
 
-    /// Take identities out of whichever person they belong to
+    /// Take identities out of whichever person or bot they belong to
     Remove {
         #[arg(required = true)]
         ids: Vec<String>,
     },
 
-    /// Delete a person; their identities are kept and belong to no one
+    /// Delete a person or bot; their identities are kept and belong to no one
     Delete { name: String },
 
-    /// List people and their identities
+    /// List people and bots with their identities
     List,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum RecordKind {
+    Person,
+    Bot,
+}
+
+impl RecordKind {
+    fn kind(self) -> Kind {
+        match self {
+            RecordKind::Person => Kind::Person,
+            RecordKind::Bot => Kind::Bot,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -359,9 +383,23 @@ fn hosts(action: HostsAction, tag: Option<&str>, db_path: &Path) -> db::Result<(
 fn people(action: PeopleAction, db_path: &Path) -> db::Result<()> {
     let mut conn = open(db_path)?;
     match action {
-        PeopleAction::Create { name, ids, note } => {
-            decide::create_person(&mut conn, &name, &ids, note.as_deref())?;
-            println!("Created {name} with {} identities.", ids.len());
+        PeopleAction::Create {
+            name,
+            ids,
+            bot,
+            note,
+        } => {
+            let kind = if bot { Kind::Bot } else { Kind::Person };
+            decide::create_person(&mut conn, &name, kind, &ids, note.as_deref())?;
+            println!(
+                "Created the {} {name} with {} identities.",
+                kind.as_str(),
+                ids.len()
+            );
+        }
+        PeopleAction::Kind { name, kind } => {
+            decide::set_kind(&conn, &name, kind.kind())?;
+            println!("{name} is a {} now.", kind.kind().as_str());
         }
         PeopleAction::Add { name, ids } => {
             decide::add_to_person(&mut conn, &name, &ids)?;
@@ -369,7 +407,7 @@ fn people(action: PeopleAction, db_path: &Path) -> db::Result<()> {
         }
         PeopleAction::Remove { ids } => {
             decide::remove_from_person(&mut conn, &ids)?;
-            println!("Took {} out of their person.", ids.join(", "));
+            println!("Took {} out of their person or bot.", ids.join(", "));
         }
         PeopleAction::Delete { name } => {
             decide::delete_person(&conn, &name)?;

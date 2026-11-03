@@ -12,10 +12,12 @@ irssi log folders, imports every line into a SQLite database, groups the lines
 into sessions and identities, and prints an inventory grouped by network tag
 and channel, the day by day activity of one channel, or the identities behind a
 nick, ident, host or person. `wot hosts`, `wot people` and `wot cuts` record
-decisions about who is who. `wot review` serves a web interface on this
-computer for reviewing the imported data and making the same decisions in a
-browser. A trust score based on how long people are present compared with how
-much they contribute comes next.
+decisions about who is who, people and bots alike. Every identity's
+channel activity is tracked by channel and month: how long it was present, how
+much was said while it was there, and how much it said itself. `wot review`
+serves a web interface on this computer for reviewing all of it, ranking the
+most and least active identities, and making the same decisions in a browser.
+Labels or a trust score built on the activity come next.
 
 ## Requirements
 
@@ -407,6 +409,7 @@ nick-only keys), and `identity_id`. Sessions started by a cut have an empty
 | `minutes` | Time present |
 | `spoken` | Messages and actions |
 | `logger` | 1 for the logging client's own session |
+| `heard` | Messages and actions in the channel while the session was present, its own included |
 
 ## Reviewing in a browser
 
@@ -435,7 +438,7 @@ ticked.
 ### Pages
 
 - **Overview** (`/`): for each network tag, the number of identities, people,
-  host groups and cuts, and a table of channels with their log files, lines,
+  bots, host groups and cuts, and a table of channels with their log files, lines,
   spoken lines and joins. Identities counts the identities with a session in
   the channel, apart from the logging client; Spoke counts those that said
   anything; Silent is the share that never did. Private messages are
@@ -449,29 +452,33 @@ ticked.
   `--person`. Results show the identity, its person, nicks, number of
   `ident@host` combinations, sessions, channel time, spoken lines, and first
   and last seen, most recently seen first, up to 500. Each result has a
-  checkbox: the ticked identities can be made into a new person, added to an
-  existing one, or taken out of their person, all at once and without
-  leaving the search. Adding an identity to the person it already belongs to
-  changes nothing, and taking out identities that belong to no one skips
-  them. A search by host also
-  lists the matching hosts, up to 50, each with its host group: an ungrouped
-  host can be added to an existing group, a grouped one taken out, and a new
-  group can be created for the ungrouped hosts. These actions come back to
-  the same search, so the identities on a host can be checked before and
-  after grouping it.
+  checkbox, and the **All** link at the top of the column loads the results
+  again with every box ticked (**None** clears them): the ticked identities
+  can be made into a new person or a new bot, added to an existing one, or
+  taken out of their person or bot, all at once and without leaving the
+  search. Identities that belong to a bot are labelled "bot". Adding an
+  identity to the person or bot it already belongs to changes nothing, and
+  taking out identities that belong to no one skips them. A search by host
+  also lists the matching hosts, up to 50, each with its host group: an
+  ungrouped host can be added to an existing group, a grouped one taken out,
+  and a new group can be created for the ungrouped hosts. These actions come
+  back to the same search, so the identities on a host can be checked before
+  and after grouping it.
 - **Identity** (`/identity?id=ID`): one identity in full: its person, nicks,
   connections with their host group, channels and private messages, nick
   changes and inferred sessions. Nicks, idents, hosts and channels link to
   their own searches and pages. From here an identity can be added to an
-  existing person, to a new one, or removed from its person, and a session
-  can be cut at any of its nick changes. Connections on hosts that are not in
-  a group link to a search by that host, where it can be grouped. An id
-  merged into another identity leads to that identity.
-- **People** (`/people`): everyone with their identities, nicks and last
-  seen, and a form to create a person, optionally with identity ids.
-- **Person** (`/person?name=NAME`): a person's identities with their totals,
-  with checkboxes to remove several at once, and forms to add identities by
-  id or delete the person.
+  existing person or bot, to a new one, or removed from its person or bot, and
+  a session can be cut at any of its nick changes. Connections on hosts that
+  are not in a group link to a search by that host, where it can be grouped.
+  An id merged into another identity leads to that identity.
+- **People and bots** (`/people`): people, then bots, with their identities,
+  nicks and last seen, and a form to create either, optionally with identity
+  ids.
+- **Person or bot** (`/person?name=NAME`): its identities with their totals,
+  with checkboxes and an **All** link to remove several at once, a button to
+  make a person a bot or a bot a person, and forms to add identities by id or
+  delete it.
 - **Host groups** (`/hosts`): each group with its hosts, how many identities
   used each, and forms to add and remove hosts, change the kind, ident
   setting and note, or delete the group; a form to create a group; and the
@@ -481,6 +488,15 @@ ticked.
   group it.
 - **Cuts** (`/cuts`): every cut with its nick change and whether it still
   applies, with forms to remove one or add one by line.
+- **Activity** (`/activity`): identities ranked by their channel activity,
+  see [Activity](#activity). Filters choose a channel or all channels, a
+  year or all time, the order (least active, most active or longest present
+  first), the days present an identity needs to be ranked (7 unless chosen),
+  and whether to include bots, which are labelled "bot". Over all channels,
+  each row shows the identity's network tag. Channel pages link to their own
+  ranking. The
+  identity page shows the identity's activity by year, with each month behind
+  a fold, and notes private messages when it never spoke in a channel.
 
 ### Code
 
@@ -488,9 +504,51 @@ The code is in `src/review/`. `mod.rs` sets up the server, the routes and
 what the pages share: errors, database access, notices and redirects.
 `layout.rs` has the page frame and helpers, and `style.css` the styles. Each
 area has its own module with its pages and actions: `pages.rs` for the
-overview and channels, then `identities.rs`, `people.rs`, `hosts.rs` and
-`cuts.rs`. The data comes from `src/stats.rs` and `src/lookup.rs`, and the
-actions call the same functions in `src/decide.rs` as the commands.
+overview and channels, then `identities.rs`, `people.rs`, `hosts.rs`,
+`cuts.rs` and `activity.rs`. The data comes from `src/stats.rs`,
+`src/lookup.rs` and `src/activity.rs`, and the actions call the same
+functions in `src/decide.rs` as the commands.
+
+## Activity
+
+Activity is tracked for each identity, never merged into people, so the
+numbers stay right however identities are linked later. It only counts
+channels: private messages only show conversations with the logging client,
+so they are left out, and so are the logging client's own sessions.
+
+For each identity, channel and month:
+
+- **Days present:** days with a session in the channel, however short.
+- **Active days:** days on which it said anything.
+- **Time:** minutes present. Overlapping sessions of one identity count once.
+- **Heard:** messages and actions in the channel while it was present, its
+  own included.
+- **Spoken:** its own messages and actions.
+- **Share:** spoken as a share of heard. An identity present for a long time
+  with a share near zero listens but does not talk; one that used to talk and
+  went quiet shows a high share in earlier years.
+
+Each identity also has rows for all channels together, where days and time
+are not counted twice for being in two channels at once. Years and all time
+are sums of months. Sessions are split over the days and months they cover,
+so a session that lasted weeks through a bouncer counts on every day of it.
+
+Activity is rebuilt with the identities. A session can only be seen while
+irssi was logging: someone already in a channel when irssi joined, who never
+speaks, parts or quits before irssi stops logging, leaves no trace.
+
+The activity ranking leaves out identities that belong to a bot, see
+[Bots](#bots), unless asked to include them. Next to an identity that never
+spoke in a channel, the review pages show how many private messages it sent
+the logging client, which tells a shy member from someone who never talks.
+
+`activity` table: `identity_id`, `tag`, `channel` (`*` for all channels
+together), `month` (`YYYY-MM`), `days_present`, `active_days`, `minutes`,
+`heard` and `spoken`.
+
+Upgrading a database to this version empties `sessions` so that the next
+`wot analyze` rebuilds them with heard lines and activity. Run it once before
+`wot review`.
 
 ## Decisions
 
@@ -549,7 +607,8 @@ wot people list
 
 Adding an identity to the person it already belongs to changes nothing.
 `wot people remove` with several ids skips those that belong to no one, and
-only fails when none of them belong to a person.
+only fails when none of them belong to a person. The same commands work for
+bots.
 
 People do not change identities, so nothing is rebuilt. When a rebuild merges
 an identity into another, its person follows it. If that puts one identity in
@@ -576,6 +635,24 @@ a nick change. A cut stores the nick change it was made on; if the file is
 replaced and that line no longer holds it, the cut is stale and not applied,
 and `wot cuts list` says so. Changes rebuild identities straight away.
 
+### Bots
+
+A bot is a person record for a program instead of a human: its identities
+are joined the same way, under one name, and activity rankings leave them out
+unless asked to include bots. People and bots share names, so a bot cannot
+take the name of a person.
+
+```bash
+wot people create relay 1a2b3c4d5e6f 9f8e7d6c5b4a --bot --note "announces builds"
+wot people add relay 0a1b2c3d4e5f
+wot people kind relay person
+wot people kind relay bot
+```
+
+`wot people kind` turns a person into a bot or back, keeping its identities.
+`wot people list` lists people, then bots. In `wot review`, tick identities in
+a search and choose **Create bot**, or add them to an existing bot.
+
 ### Decision tables
 
 `host_groups`: `id`, `tag`, `name`, `kind` (`bridge` or `bouncer`),
@@ -584,7 +661,7 @@ and `wot cuts list` says so. Changes rebuild identities straight away.
 
 `host_group_members`: `group_id`, `tag`, `host`, `note` and `created_at`.
 
-`people`: `id`, `name`, `note` and `created_at`.
+`people`: `id`, `name`, `note`, `created_at` and `kind` (`person` or `bot`).
 
 `person_identities`: `identity_id`, `person_id`, `note` and `created_at`.
 

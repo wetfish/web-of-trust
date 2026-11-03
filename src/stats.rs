@@ -23,7 +23,10 @@ pub struct TagSummary {
     pub tag: String,
     /// Identities with at least one session.
     pub identities: i64,
+    /// People with an identity in the tag.
     pub people: i64,
+    /// Bots with an identity in the tag.
+    pub bots: i64,
     pub host_groups: i64,
     pub cuts: i64,
     pub channels: Vec<TargetSummary>,
@@ -151,7 +154,13 @@ fn tag_summary(conn: &Connection, tag: &str) -> Result<TagSummary> {
         )?,
         people: count(
             "SELECT count(DISTINCT pi.person_id) FROM person_identities pi
-             JOIN identities i ON i.id = pi.identity_id WHERE i.tag = ?1",
+             JOIN identities i ON i.id = pi.identity_id
+             JOIN people p ON p.id = pi.person_id WHERE i.tag = ?1 AND p.kind = 'person'",
+        )?,
+        bots: count(
+            "SELECT count(DISTINCT pi.person_id) FROM person_identities pi
+             JOIN identities i ON i.id = pi.identity_id
+             JOIN people p ON p.id = pi.person_id WHERE i.tag = ?1 AND p.kind = 'bot'",
         )?,
         host_groups: count("SELECT count(*) FROM host_groups WHERE tag = ?1")?,
         cuts: count(
@@ -443,8 +452,42 @@ pub fn shared_hosts(conn: &Connection, limit: i64) -> Result<Vec<SharedHost>> {
     Ok(rows)
 }
 
+/// What a person record stands for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    /// A human.
+    Person,
+    /// A bot, left out of activity rankings unless they ask for bots.
+    Bot,
+}
+
+impl Kind {
+    /// The value stored in `people.kind`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Kind::Person => "person",
+            Kind::Bot => "bot",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Kind> {
+        match value {
+            "person" => Some(Kind::Person),
+            "bot" => Some(Kind::Bot),
+            _ => None,
+        }
+    }
+
+    /// The stored value read back, which the schema limits to the two kinds.
+    fn stored(value: &str) -> Kind {
+        Kind::parse(value).unwrap_or(Kind::Person)
+    }
+}
+
+/// A person record: a human or a bot, with its identities.
 pub struct Person {
     pub name: String,
+    pub kind: Kind,
     pub note: Option<String>,
     pub created_at: String,
     pub identities: Vec<PersonIdentity>,
@@ -461,7 +504,7 @@ pub struct PersonIdentity {
     pub last_seen: Option<String>,
 }
 
-/// Everyone, by name.
+/// Everyone, humans and bots, by name.
 pub fn people(conn: &Connection) -> Result<Vec<Person>> {
     load_people(conn, None)
 }
@@ -473,14 +516,20 @@ pub fn person(conn: &Connection, name: &str) -> Result<Option<Person>> {
 
 fn load_people(conn: &Connection, name: Option<&str>) -> Result<Vec<Person>> {
     let merges = lookup::merges(conn)?;
-    let rows: Vec<(i64, String, Option<String>, String)> = {
+    let rows: Vec<(i64, String, String, Option<String>, String)> = {
         let mut stmt = conn.prepare(
-            "SELECT id, name, note, created_at FROM people
+            "SELECT id, name, kind, note, created_at FROM people
              WHERE ?1 IS NULL OR name = ?1 ORDER BY name",
         )?;
         let rows = stmt
             .query_map(params![name], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
             })?
             .collect::<rusqlite::Result<_>>()?;
         rows
@@ -495,7 +544,7 @@ fn load_people(conn: &Connection, name: Option<&str>) -> Result<Vec<Person>> {
     )?;
 
     let mut people = Vec::with_capacity(rows.len());
-    for (id, name, note, created_at) in rows {
+    for (id, name, kind, note, created_at) in rows {
         let recorded: Vec<String> = members
             .query_map(params![id], |row| row.get(0))?
             .collect::<rusqlite::Result<_>>()?;
@@ -519,6 +568,7 @@ fn load_people(conn: &Connection, name: Option<&str>) -> Result<Vec<Person>> {
         }
         people.push(Person {
             name,
+            kind: Kind::stored(&kind),
             note,
             created_at,
             identities,
@@ -527,13 +577,16 @@ fn load_people(conn: &Connection, name: Option<&str>) -> Result<Vec<Person>> {
     Ok(people)
 }
 
-/// The names of everyone, sorted.
-pub fn people_names(conn: &Connection) -> Result<Vec<String>> {
-    let mut stmt = conn.prepare("SELECT name FROM people ORDER BY name")?;
-    let rows = stmt
-        .query_map([], |row| row.get(0))?
+/// The names of everyone, humans and bots, with their kind, sorted by name.
+pub fn people_names(conn: &Connection) -> Result<Vec<(String, Kind)>> {
+    let mut stmt = conn.prepare("SELECT name, kind FROM people ORDER BY name")?;
+    let rows: Vec<(String, String)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
         .collect::<rusqlite::Result<_>>()?;
-    Ok(rows)
+    Ok(rows
+        .into_iter()
+        .map(|(name, kind)| (name, Kind::stored(&kind)))
+        .collect())
 }
 
 pub struct Cut {
@@ -758,11 +811,15 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        decide::create_person(&mut conn, "marlowe", &[marlowe.clone()], None).unwrap();
+        decide::create_person(&mut conn, "marlowe", Kind::Bot, &[marlowe.clone()], None).unwrap();
         let person = person(&conn, "MARLOWE").unwrap().unwrap();
+        assert_eq!(person.kind, Kind::Bot);
         assert_eq!(person.identities[0].current, marlowe);
         assert_eq!(person.identities[0].nicks, ["marlowe"]);
-        assert_eq!(people_names(&conn).unwrap(), ["marlowe"]);
+        assert_eq!(
+            people_names(&conn).unwrap(),
+            [("marlowe".to_string(), Kind::Bot)]
+        );
         assert_eq!(tags(&conn).unwrap(), ["wetfish"]);
     }
 }

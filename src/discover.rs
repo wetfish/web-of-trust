@@ -153,14 +153,22 @@ fn file_name(path: &Path) -> String {
 
 #[cfg(test)]
 pub mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
 
     /// A scratch folder that is removed when the test ends.
     pub struct TempDir(pub PathBuf);
 
+    /// Numbers each temporary folder, so tests running at the same time never
+    /// share one, even when they use the same name.
+    static NEXT_TEMP_DIR: AtomicUsize = AtomicUsize::new(0);
+
     impl TempDir {
         pub fn new(name: &str) -> Self {
-            let path = std::env::temp_dir().join(format!("wot-test-{}-{name}", std::process::id()));
+            let n = NEXT_TEMP_DIR.fetch_add(1, Ordering::Relaxed);
+            let path =
+                std::env::temp_dir().join(format!("wot-test-{}-{n}-{name}", std::process::id()));
             let _ = fs::remove_dir_all(&path);
             fs::create_dir_all(&path).unwrap();
             TempDir(path)

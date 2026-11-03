@@ -8,6 +8,7 @@
 //! reloading a page never repeats an action. Each request opens the database
 //! on a blocking thread, since SQLite calls block.
 
+mod activity;
 mod cuts;
 mod hosts;
 mod identities;
@@ -59,6 +60,7 @@ pub fn run(db_path: &Path, port: u16) -> db::Result<()> {
         .merge(people::routes())
         .merge(hosts::routes())
         .merge(cuts::routes())
+        .merge(activity::routes())
         .route("/style.css", get(style))
         .fallback(not_found)
         .with_state(app);

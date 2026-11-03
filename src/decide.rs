@@ -4,8 +4,8 @@
 //! - **Host groups:** hosts that are one bridge or bouncer, which count as
 //!   one host when identities are built, optionally with the ident as the
 //!   person. Changing them needs an identity rebuild.
-//! - **People:** the humans behind identities. A person holds identities from
-//!   any network tag. Nothing needs rebuilding.
+//! - **People:** who is behind identities, a human or a bot. A person holds
+//!   identities from any network tag. Nothing needs rebuilding.
 //! - **Cuts:** nick changes made by someone else at the keyboard. Changing
 //!   them needs an identity rebuild.
 
@@ -18,7 +18,7 @@ use crate::db::Result;
 use crate::identity;
 use crate::lookup::{self, current_id};
 use crate::report::{day, heading, table, thousands};
-use crate::stats;
+use crate::stats::{self, Kind};
 
 /// The network tag to use: the one given, or the only one imported.
 pub fn resolve_tag(conn: &Connection, tag: Option<&str>) -> Result<String> {
@@ -251,7 +251,19 @@ fn person_id(conn: &Connection, name: &str) -> Result<i64> {
         |row| row.get(0),
     )
     .optional()?
-    .ok_or_else(|| format!("there is no person named {name}").into())
+    .ok_or_else(|| format!("there is no person or bot named {name}").into())
+}
+
+/// The kind of the person record with this name, ignoring case, if any.
+fn kind_of(conn: &Connection, name: &str) -> Result<Option<Kind>> {
+    let kind: Option<String> = conn
+        .query_row(
+            "SELECT kind FROM people WHERE name = ?1",
+            params![name],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(kind.as_deref().and_then(Kind::parse))
 }
 
 /// The current id of an identity, following merges, or an error when the
@@ -276,22 +288,42 @@ fn existing_identity(
     Ok(current_id(merges, id))
 }
 
+/// Creates a person record, a human or a bot, with identities. Names are
+/// shared by both kinds, so a bot cannot have the name of a person.
 pub fn create_person(
     conn: &mut Connection,
     name: &str,
+    kind: Kind,
     ids: &[String],
     note: Option<&str>,
 ) -> Result<()> {
-    if person_id(conn, name).is_ok() {
-        return Err(format!("a person named {name} already exists").into());
+    if let Some(existing) = kind_of(conn, name)? {
+        return Err(format!("a {} named {name} already exists", existing.as_str()).into());
     }
     // Check the identities before creating anything.
     check_unassigned(conn, ids, None)?;
     conn.execute(
-        "INSERT INTO people (name, note) VALUES (?1, ?2)",
-        params![name, note],
+        "INSERT INTO people (name, kind, note) VALUES (?1, ?2, ?3)",
+        params![name, kind.as_str(), note],
     )?;
     add_to_person(conn, name, ids)
+}
+
+/// Makes a person record a human or a bot, keeping its identities.
+pub fn set_kind(conn: &Connection, name: &str, kind: Kind) -> Result<()> {
+    match kind_of(conn, name)? {
+        None => Err(format!("there is no person or bot named {name}").into()),
+        Some(current) if current == kind => {
+            Err(format!("{name} is already a {}", kind.as_str()).into())
+        }
+        Some(_) => {
+            conn.execute(
+                "UPDATE people SET kind = ?1 WHERE name = ?2",
+                params![kind.as_str(), name],
+            )?;
+            Ok(())
+        }
+    }
 }
 
 /// Fails when an identity does not exist or belongs to a person other than
@@ -369,8 +401,8 @@ pub fn remove_from_person(conn: &mut Connection, ids: &[String]) -> Result<()> {
     }
     if removed == 0 {
         return Err(match ids {
-            [id] => format!("identity {id} does not belong to a person"),
-            _ => "none of these identities belong to a person".to_string(),
+            [id] => format!("identity {id} does not belong to a person or bot"),
+            _ => "none of these identities belong to a person or bot".to_string(),
         }
         .into());
     }
@@ -378,20 +410,42 @@ pub fn remove_from_person(conn: &mut Connection, ids: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// Deletes a person. Their identities are kept and belong to no one.
+/// Deletes a person or bot. Their identities are kept and belong to no one.
 pub fn delete_person(conn: &Connection, name: &str) -> Result<()> {
     let id = person_id(conn, name)?;
     conn.execute("DELETE FROM people WHERE id = ?1", params![id])?;
     Ok(())
 }
 
+/// Lists people, then bots, with their identities.
 pub fn list_people(conn: &Connection, out: &mut impl Write) -> Result<()> {
-    let people = stats::people(conn)?;
-    heading(out, "People", '=')?;
-    if people.is_empty() {
-        writeln!(out, "No people yet. Create one with wot people create.")?;
-        return Ok(());
+    let everyone = stats::people(conn)?;
+    for (title, kind, empty) in [
+        (
+            "People",
+            Kind::Person,
+            "No people yet. Create one with wot people create NAME.",
+        ),
+        (
+            "Bots",
+            Kind::Bot,
+            "No bots yet. Create one with wot people create NAME --bot.",
+        ),
+    ] {
+        if kind == Kind::Bot {
+            writeln!(out)?;
+        }
+        heading(out, title, '=')?;
+        let records: Vec<&stats::Person> = everyone.iter().filter(|p| p.kind == kind).collect();
+        if records.is_empty() {
+            writeln!(out, "{empty}")?;
+        }
+        list_records(out, &records)?;
     }
+    Ok(())
+}
+
+fn list_records(out: &mut impl Write, people: &[&stats::Person]) -> Result<()> {
     for person in people {
         writeln!(out)?;
         heading(out, &person.name, '-')?;
@@ -565,7 +619,7 @@ mod tests {
 
     use super::*;
     use crate::discover::{self, tests::TempDir};
-    use crate::{db, identity};
+    use crate::{activity, db, identity};
 
     fn setup(name: &str) -> (TempDir, Connection) {
         let root = TempDir::new(name);
@@ -654,16 +708,16 @@ mod tests {
         };
         assert_eq!(ids.len(), 2);
 
-        create_person(&mut conn, "rachel", &ids[..1], None).unwrap();
+        create_person(&mut conn, "rachel", Kind::Person, &ids[..1], None).unwrap();
         assert!(
-            create_person(&mut conn, "RACHEL", &[], None).is_err(),
+            create_person(&mut conn, "RACHEL", Kind::Person, &[], None).is_err(),
             "names ignore case"
         );
         // Adding an identity to the person it belongs to changes nothing.
         add_to_person(&mut conn, "RACHEL", &ids[..1]).unwrap();
         assert!(add_to_person(&mut conn, "rachel", &["nope".into()]).is_err());
 
-        create_person(&mut conn, "marlowe", &ids[1..], None).unwrap();
+        create_person(&mut conn, "marlowe", Kind::Person, &ids[1..], None).unwrap();
         assert!(
             add_to_person(&mut conn, "rachel", &ids[1..]).is_err(),
             "belongs to marlowe"
@@ -681,5 +735,43 @@ mod tests {
             })
             .unwrap();
         assert_eq!(left, 0);
+    }
+
+    #[test]
+    fn makes_bots_out_of_people_records() {
+        let (_root, mut conn) = setup("decide-bots");
+        let ids: Vec<String> = {
+            let mut stmt = conn
+                .prepare("SELECT DISTINCT identity_id FROM sessions ORDER BY 1")
+                .unwrap();
+            let rows = stmt
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            rows
+        };
+        create_person(
+            &mut conn,
+            "relay",
+            Kind::Bot,
+            &ids,
+            Some("announces builds"),
+        )
+        .unwrap();
+        assert_eq!(activity::bots(&conn).unwrap().len(), 2);
+        assert!(
+            create_person(&mut conn, "RELAY", Kind::Person, &[], None).is_err(),
+            "names are shared by people and bots"
+        );
+
+        set_kind(&conn, "relay", Kind::Person).unwrap();
+        assert!(activity::bots(&conn).unwrap().is_empty());
+        assert!(set_kind(&conn, "relay", Kind::Person).is_err(), "no change");
+        assert!(set_kind(&conn, "nobody", Kind::Bot).is_err());
+
+        set_kind(&conn, "RELAY", Kind::Bot).unwrap();
+        remove_from_person(&mut conn, &ids[..1]).unwrap();
+        assert_eq!(activity::bots(&conn).unwrap().len(), 1);
     }
 }

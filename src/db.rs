@@ -11,8 +11,10 @@
 //!
 //! The decision tables hold what a person decided by hand, and nothing
 //! rebuilds them: `host_groups` and `host_group_members` for bridges and
-//! bouncers, `people` and `person_identities` for who is who, and
-//! `session_cuts` for nick changes made by someone else at the keyboard.
+//! bouncers, `people` and `person_identities` for who is who, humans and bots
+//! alike, and `session_cuts` for nick changes made by someone else at the
+//! keyboard. The `activity` table is rebuilt with the identities, by the
+//! `activity` module.
 
 use std::error::Error;
 use std::fs::{self, File};
@@ -33,7 +35,7 @@ const HEAD_LEN: u64 = 1024;
 /// The schema, as the steps that build it. SQLite's `user_version` stores how
 /// many steps a database has had, so an older database is brought up to date
 /// by running the steps it is missing.
-const MIGRATIONS: [&str; 3] = [SCHEMA_V1, SCHEMA_V2, SCHEMA_V3];
+const MIGRATIONS: [&str; 4] = [SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4];
 
 const SCHEMA_V1: &str = "
 CREATE TABLE files (
@@ -199,6 +201,44 @@ CREATE TABLE session_cuts (
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     UNIQUE (path, line)
 );
+";
+
+const SCHEMA_V4: &str = "
+-- Messages and actions in the channel while each session was present, its
+-- own included.
+ALTER TABLE sessions ADD COLUMN heard INTEGER NOT NULL DEFAULT 0;
+
+-- Sessions are built again, with heard lines and activity, by the next
+-- wot analyze.
+DELETE FROM sessions;
+
+-- Channel activity of each identity by channel and month, rebuilt with the
+-- identities. The channel '*' holds all channels together. The logging
+-- client and private messages are left out.
+CREATE TABLE activity (
+    identity_id TEXT NOT NULL,
+    tag TEXT NOT NULL,
+    channel TEXT NOT NULL,
+    -- YYYY-MM.
+    month TEXT NOT NULL,
+    -- Days with a session in the channel.
+    days_present INTEGER NOT NULL,
+    -- Days with at least one message or action.
+    active_days INTEGER NOT NULL,
+    minutes INTEGER NOT NULL,
+    -- Messages and actions in the channel while present, its own included.
+    heard INTEGER NOT NULL,
+    -- Its own messages and actions.
+    spoken INTEGER NOT NULL,
+    PRIMARY KEY (identity_id, channel, month)
+);
+
+CREATE INDEX activity_by_channel ON activity (channel, tag, month);
+
+-- What each person record stands for: a human, or a bot. A bot's identities
+-- are left out of activity rankings unless they ask for bots.
+ALTER TABLE people ADD COLUMN kind TEXT NOT NULL DEFAULT 'person'
+    CHECK (kind IN ('person', 'bot'));
 ";
 
 const INSERT_EVENT: &str = "
@@ -732,7 +772,9 @@ mod tests {
         let tables: i64 = conn
             .query_row(
                 "SELECT (SELECT count(*) FROM sessions) + (SELECT count(*) FROM host_groups)
-                        + (SELECT count(*) FROM people) + (SELECT count(*) FROM session_cuts)",
+                        + (SELECT count(*) FROM people) + (SELECT count(*) FROM session_cuts)
+                        + (SELECT count(*) FROM activity)
+                        + (SELECT count(*) FROM people WHERE kind <> 'person')",
                 [],
                 |row| row.get(0),
             )

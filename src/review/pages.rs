@@ -84,6 +84,7 @@ fn tag_section(tag: &TagSummary) -> Markup {
             ul.stats {
                 li { a href="/identities" { strong { (number(tag.identities)) } " identities" } }
                 li { a href="/people" { strong { (number(tag.people)) } " people" } }
+                li { a href="/people" { strong { (number(tag.bots)) } " bots" } }
                 li { a href="/hosts" { strong { (number(tag.host_groups)) } " host groups" } }
                 li { a href="/cuts" { strong { (number(tag.cuts)) } " cuts" } }
             }
@@ -149,6 +150,12 @@ pub fn channel(channel: &ChannelDays) -> Markup {
     html! {
         p.crumbs { a href="/" { "Overview" } " / " (channel.tag) }
         h1 { (channel.name) }
+        p {
+            a href=(format!(
+                "/activity?channel={}",
+                layout::url_encode(&format!("{} {}", channel.tag, channel.name))
+            )) { "Who is active and who is quiet in " (channel.name) }
+        }
         @if channel.days.is_empty() {
             p.lead { "Nobody has spoken in this channel." }
         } @else {
@@ -228,6 +235,7 @@ mod tests {
                 tag: "wetfish".into(),
                 identities: 2,
                 people: 0,
+                bots: 0,
                 host_groups: 0,
                 cuts: 0,
                 channels: vec![TargetSummary {

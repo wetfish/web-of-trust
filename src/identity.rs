@@ -33,11 +33,12 @@
 //! `ident@host` combinations belong to which id. When two identities merge,
 //! the older id wins and the other records `merged_into`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime, TimeDelta};
 use rusqlite::{Connection, params};
 
+use crate::activity;
 use crate::db::Result;
 
 /// The event kinds that open, change or close sessions.
@@ -175,7 +176,7 @@ pub fn is_built(conn: &Connection) -> Result<bool> {
 pub fn rebuild(conn: &mut Connection) -> Result<RebuildSummary> {
     let tx = conn.transaction()?;
     let mut rules = load_rules(&tx)?;
-    let sessions = replay_events(&tx, &mut rules.cuts)?;
+    let (sessions, day_marks) = replay_events(&tx, &mut rules.cuts)?;
 
     let mut summary = RebuildSummary {
         sessions: sessions.len(),
@@ -187,12 +188,15 @@ pub fn rebuild(conn: &mut Connection) -> Result<RebuildSummary> {
     let ids = assign_ids(&tx, &links, &mut summary)?;
 
     tx.execute("DELETE FROM sessions", [])?;
+    // The identity of each session, for its activity.
+    let mut identity_of: Vec<&str> = Vec::with_capacity(sessions.len());
     {
         let mut insert = tx.prepare(
             "INSERT INTO sessions (id, file_id, identity_id, link, inferred_from, nicks, ident,
                  host, start_at, start_line, joined, end_at, end_line, end_reason, minutes,
-                 spoken, logger)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+                 spoken, logger, heard)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
+                     ?18)",
         )?;
         for (index, session) in sessions.iter().enumerate() {
             let (identity, link, inferred_from) = match links.of_session[index] {
@@ -240,9 +244,32 @@ pub fn rebuild(conn: &mut Connection) -> Result<RebuildSummary> {
                 minutes,
                 session.spoken,
                 session.logger,
+                session.heard_to - session.heard_from,
             ])?;
+            identity_of.push(identity.as_str());
         }
     }
+
+    // Channel activity, leaving out private messages and the logging client.
+    let presences: Vec<activity::Presence> = sessions
+        .iter()
+        .zip(identity_of.iter().copied())
+        .filter(|(session, _)| session.channel && !session.logger)
+        .map(|(session, identity)| activity::Presence {
+            identity,
+            tag: &session.tag,
+            channel: &session.target,
+            start: session.start,
+            end: session.end,
+            heard_from: session.heard_from,
+            heard_to: session.heard_to,
+            day_marks: day_marks
+                .get(&session.file_id)
+                .map_or(&[][..], Vec::as_slice),
+            spoken_days: &session.spoken_days,
+        })
+        .collect();
+    activity::rebuild(&tx, &presences)?;
 
     tx.commit()?;
     Ok(summary)
@@ -280,6 +307,16 @@ struct Session {
     logger: bool,
     /// The cut that started this session, if one did.
     cut: Option<i64>,
+    /// Whether the file is a channel log rather than a private message log.
+    channel: bool,
+    /// The channel or private message target.
+    target: String,
+    /// The file's count of spoken lines when the session started and ended,
+    /// so the session heard the lines in between, its own included.
+    heard_from: i64,
+    heard_to: i64,
+    /// Messages and actions by day.
+    spoken_days: BTreeMap<NaiveDate, i64>,
 }
 
 /// One event, as read back from the database.
@@ -296,15 +333,22 @@ struct Row {
     detail: Option<String>,
 }
 
-/// Replays every file's events in line order and returns their sessions.
-fn replay_events(conn: &Connection, cuts: &mut Cuts) -> Result<Vec<Session>> {
-    let tags: HashMap<i64, String> = {
-        let mut stmt = conn.prepare("SELECT id, tag FROM files")?;
+/// For each file, the count of spoken lines at the start of each day.
+type DayMarks = HashMap<i64, Vec<(NaiveDate, i64)>>;
+
+/// Replays every file's events in line order and returns their sessions, and
+/// each file's day marks.
+fn replay_events(conn: &Connection, cuts: &mut Cuts) -> Result<(Vec<Session>, DayMarks)> {
+    let files: HashMap<i64, (String, bool, String)> = {
+        let mut stmt = conn.prepare("SELECT id, tag, kind = 'channel', target FROM files")?;
         let rows = stmt
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .query_map([], |row| {
+                Ok((row.get(0)?, (row.get(1)?, row.get(2)?, row.get(3)?)))
+            })?
             .collect::<rusqlite::Result<_>>()?;
         rows
     };
+    let mut day_marks: DayMarks = HashMap::new();
 
     let mut stmt = conn.prepare(&format!(
         "SELECT file_id, line, date, time, kind, nick, ident, host, other_nick, text, detail
@@ -337,19 +381,21 @@ fn replay_events(conn: &Connection, cuts: &mut Cuts) -> Result<Vec<Session>> {
 
         if replay.as_ref().is_none_or(|r| r.file_id != event.file_id) {
             if let Some(finished) = replay.take() {
-                finished.finish(&mut sessions);
+                let (file_id, marks) = finished.finish(&mut sessions);
+                day_marks.insert(file_id, marks);
             }
-            let tag = tags.get(&event.file_id).cloned().unwrap_or_default();
-            replay = Some(FileReplay::new(event.file_id, tag));
+            let (tag, channel, target) = files.get(&event.file_id).cloned().unwrap_or_default();
+            replay = Some(FileReplay::new(event.file_id, tag, channel, target));
         }
         if let Some(replay) = replay.as_mut() {
             replay.event(&event, &mut sessions, cuts);
         }
     }
     if let Some(finished) = replay.take() {
-        finished.finish(&mut sessions);
+        let (file_id, marks) = finished.finish(&mut sessions);
+        day_marks.insert(file_id, marks);
     }
-    Ok(sessions)
+    Ok((sessions, day_marks))
 }
 
 fn parse_at(date: &str, time: &str) -> Option<NaiveDateTime> {
@@ -378,6 +424,13 @@ struct FileReplay {
     candidate: Option<RecentJoin>,
     /// The logging client's own session, once recognized.
     own: Option<usize>,
+    /// Whether the file is a channel log, and its channel or nick.
+    channel: bool,
+    target: String,
+    /// Messages and actions so far in the file.
+    said: i64,
+    /// `said` at the start of each day, in file order.
+    day_marks: Vec<(NaiveDate, i64)>,
 }
 
 struct RecentJoin {
@@ -389,7 +442,7 @@ struct RecentJoin {
 }
 
 impl FileReplay {
-    fn new(file_id: i64, tag: String) -> Self {
+    fn new(file_id: i64, tag: String, channel: bool, target: String) -> Self {
         FileReplay {
             file_id,
             tag,
@@ -399,11 +452,19 @@ impl FileReplay {
             last_join: None,
             candidate: None,
             own: None,
+            channel,
+            target,
+            said: 0,
+            day_marks: Vec::new(),
         }
     }
 
     fn event(&mut self, event: &Row, sessions: &mut Vec<Session>, cuts: &mut Cuts) {
         let nick = event.nick.as_deref().unwrap_or_default();
+        let date = event.at.date();
+        if self.day_marks.last().is_none_or(|&(last, _)| last != date) {
+            self.day_marks.push((date, self.said));
+        }
         match event.kind.as_str() {
             "log_opened" => {
                 // Without a close line, the logger's view ended at the last
@@ -415,7 +476,7 @@ impl FileReplay {
             "log_closed" => self.close_all(sessions, event.at, Some(event.line), "log_closed"),
             "join" => {
                 if let Some(index) = self.open.remove(&nick.to_lowercase()) {
-                    close(&mut sessions[index], event, "rejoined");
+                    close(&mut sessions[index], event, "rejoined", self.said);
                 }
                 let index = self.start(sessions, nick, event, true);
                 learn_host(&mut sessions[index], event);
@@ -428,7 +489,10 @@ impl FileReplay {
             }
             "message" | "action" => {
                 let index = self.session_for(sessions, nick, event);
-                sessions[index].spoken += 1;
+                self.said += 1;
+                let session = &mut sessions[index];
+                session.spoken += 1;
+                *session.spoken_days.entry(date).or_default() += 1;
             }
             "part" | "quit" | "kick" => {
                 let index = self.session_for(sessions, nick, event);
@@ -439,7 +503,7 @@ impl FileReplay {
                     "quit" => "quit",
                     _ => "kick",
                 };
-                close(&mut sessions[index], event, reason);
+                close(&mut sessions[index], event, reason, self.said);
             }
             "nick_change" => {
                 let new = event.other_nick.as_deref().unwrap_or_default();
@@ -522,11 +586,13 @@ impl FileReplay {
         }
     }
 
-    /// Closes the sessions still open when the file ends.
-    fn finish(mut self, sessions: &mut [Session]) {
+    /// Closes the sessions still open when the file ends, and gives the
+    /// file's day marks.
+    fn finish(mut self, sessions: &mut [Session]) -> (i64, Vec<(NaiveDate, i64)>) {
         if let Some(end) = self.last_seen {
             self.close_all(sessions, end, None, "end_of_log");
         }
+        (self.file_id, self.day_marks)
     }
 
     /// The open session for a nick, or a new one if the nick was already
@@ -565,6 +631,11 @@ impl FileReplay {
             spoken: 0,
             logger: false,
             cut: None,
+            channel: self.channel,
+            target: self.target.clone(),
+            heard_from: self.said,
+            heard_to: self.said,
+            spoken_days: BTreeMap::new(),
         });
         let index = sessions.len() - 1;
         self.open.insert(nick.to_lowercase(), index);
@@ -583,9 +654,9 @@ impl FileReplay {
         cut: i64,
     ) {
         self.open.remove(&old.to_lowercase());
-        close(&mut sessions[index], event, "cut");
+        close(&mut sessions[index], event, "cut", self.said);
         if let Some(stale) = self.open.remove(&new.to_lowercase()) {
-            close(&mut sessions[stale], event, "nick_taken");
+            close(&mut sessions[stale], event, "nick_taken", self.said);
         }
         let logger = sessions[index].logger;
         // Started as if joined, so it starts at the cut rather than when
@@ -611,7 +682,7 @@ impl FileReplay {
     ) {
         self.open.remove(&old.to_lowercase());
         if let Some(stale) = self.open.remove(&new.to_lowercase()) {
-            close(&mut sessions[stale], event, "nick_taken");
+            close(&mut sessions[stale], event, "nick_taken", self.said);
         }
         sessions[index].nicks.push(new.to_string());
         self.open.insert(new.to_lowercase(), index);
@@ -629,6 +700,7 @@ impl FileReplay {
             session.end = end;
             session.end_line = line;
             session.end_reason = reason;
+            session.heard_to = self.said;
         }
         self.last_join = None;
         self.candidate = None;
@@ -644,10 +716,13 @@ fn parse_synced(text: &str) -> Option<(&str, i64)> {
     Some((channel, secs))
 }
 
-fn close(session: &mut Session, event: &Row, reason: &'static str) {
+/// Ends a session at an event. `said` is the file's count of spoken lines so
+/// far, which ends what the session heard.
+fn close(session: &mut Session, event: &Row, reason: &'static str, said: i64) {
     session.end = event.at;
     session.end_line = Some(event.line);
     session.end_reason = reason;
+    session.heard_to = said;
 }
 
 /// Records the `ident@host` from a join, part or quit line, if the session
@@ -1400,5 +1475,29 @@ mod tests {
             Some("You're now known as rachel_")
         );
         assert_eq!(nick_change_text("join", Some("quokka"), None), None);
+    }
+
+    #[test]
+    fn counts_the_lines_each_session_heard() {
+        let root = TempDir::new("id-heard");
+        let log = format!(
+            "{OPEN}\
+             01:00 -!- quokka [q@hostQ] has joined #analysis\n\
+             01:01 <alice> one\n\
+             01:02 -!- marlowe [m@hostM] has joined #analysis\n\
+             01:03 <alice> two\n\
+             01:04 -!- quokka [q@hostQ] has quit [bye]\n\
+             01:05 <marlowe> three\n"
+        );
+        let (conn, _) = build(&root, &[("#analysis.log", log.as_str())]);
+        let mut stmt = conn
+            .prepare("SELECT nicks || ' ' || heard FROM sessions ORDER BY id")
+            .unwrap();
+        let heard: Vec<String> = stmt
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(heard, ["quokka 2", "alice 3", "marlowe 2"]);
     }
 }
