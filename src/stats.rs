@@ -484,13 +484,119 @@ impl Kind {
     }
 }
 
+/// How well you know a person, from the least trusted to the most.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Rating {
+    Distrusted,
+    Wary,
+    Neutral,
+    Vouched,
+    Known,
+}
+
+impl Rating {
+    /// From the least trusted to the most.
+    pub const ALL: [Rating; 5] = [
+        Rating::Distrusted,
+        Rating::Wary,
+        Rating::Neutral,
+        Rating::Vouched,
+        Rating::Known,
+    ];
+
+    /// The value stored in `people.rating`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Rating::Distrusted => "distrusted",
+            Rating::Wary => "wary",
+            Rating::Neutral => "neutral",
+            Rating::Vouched => "vouched",
+            Rating::Known => "known",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Rating> {
+        Rating::ALL
+            .into_iter()
+            .find(|rating| rating.as_str() == value)
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Rating::Distrusted => "Distrusted",
+            Rating::Wary => "Wary",
+            Rating::Neutral => "Neutral",
+            Rating::Vouched => "Vouched",
+            Rating::Known => "Known",
+        }
+    }
+
+    /// What the rating means, for whoever chooses it.
+    pub fn explanation(self) -> &'static str {
+        match self {
+            Rating::Distrusted => {
+                "You know they are not who they claim to be, or should not be here."
+            }
+            Rating::Wary => "Something about them seems off.",
+            Rating::Neutral => "No opinion yet. Everyone starts here.",
+            Rating::Vouched => "Someone you trust invited them or vouches for them.",
+            Rating::Known => "You know them personally, or have for years.",
+        }
+    }
+
+    /// Vouched and known.
+    pub fn trusted(self) -> bool {
+        self >= Rating::Vouched
+    }
+
+    /// Wary and distrusted.
+    pub fn untrusted(self) -> bool {
+        self <= Rating::Wary
+    }
+
+    /// The stored value read back, which the schema limits to the five.
+    fn stored(value: &str) -> Rating {
+        Rating::parse(value).unwrap_or(Rating::Neutral)
+    }
+}
+
 /// A person record: a human or a bot, with its identities.
 pub struct Person {
     pub name: String,
     pub kind: Kind,
+    /// Always neutral for bots.
+    pub rating: Rating,
+    /// The person who invited or vouches for this one.
+    pub invited_by: Option<String>,
+    /// The people this one invited, by name.
+    pub invited: Vec<String>,
+    /// The note given when the record was created.
     pub note: Option<String>,
+    /// Notes added since, oldest first.
+    pub notes: Vec<Note>,
     pub created_at: String,
     pub identities: Vec<PersonIdentity>,
+}
+
+impl Person {
+    /// The current ids of its identities.
+    pub fn identity_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self
+            .identities
+            .iter()
+            .map(|identity| identity.current.clone())
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+}
+
+pub struct Note {
+    pub id: i64,
+    pub text: String,
+    /// UTC, as `YYYY-MM-DD HH:MM:SS`.
+    pub created_at: String,
 }
 
 pub struct PersonIdentity {
@@ -514,26 +620,46 @@ pub fn person(conn: &Connection, name: &str) -> Result<Option<Person>> {
     Ok(load_people(conn, Some(name))?.into_iter().next())
 }
 
+/// A row of `people`, with the name of whoever invited them.
+struct PersonRow {
+    id: i64,
+    name: String,
+    kind: String,
+    rating: String,
+    invited_by: Option<String>,
+    note: Option<String>,
+    created_at: String,
+}
+
 fn load_people(conn: &Connection, name: Option<&str>) -> Result<Vec<Person>> {
     let merges = lookup::merges(conn)?;
-    let rows: Vec<(i64, String, String, Option<String>, String)> = {
+    let rows: Vec<PersonRow> = {
         let mut stmt = conn.prepare(
-            "SELECT id, name, kind, note, created_at FROM people
-             WHERE ?1 IS NULL OR name = ?1 ORDER BY name",
+            "SELECT p.id, p.name, p.kind, p.rating, i.name, p.note, p.created_at
+             FROM people p LEFT JOIN people i ON i.id = p.invited_by
+             WHERE ?1 IS NULL OR p.name = ?1 ORDER BY p.name",
         )?;
         let rows = stmt
             .query_map(params![name], |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                ))
+                Ok(PersonRow {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    kind: row.get(2)?,
+                    rating: row.get(3)?,
+                    invited_by: row.get(4)?,
+                    note: row.get(5)?,
+                    created_at: row.get(6)?,
+                })
             })?
             .collect::<rusqlite::Result<_>>()?;
         rows
     };
+    let mut notes = conn.prepare(
+        "SELECT id, text, created_at FROM person_notes WHERE person_id = ?1
+         ORDER BY created_at, id",
+    )?;
+    let mut invited =
+        conn.prepare("SELECT name FROM people WHERE invited_by = ?1 ORDER BY name")?;
     let mut members =
         conn.prepare("SELECT identity_id FROM person_identities WHERE person_id = ?1 ORDER BY 1")?;
     let mut nicks = conn
@@ -544,9 +670,9 @@ fn load_people(conn: &Connection, name: Option<&str>) -> Result<Vec<Person>> {
     )?;
 
     let mut people = Vec::with_capacity(rows.len());
-    for (id, name, kind, note, created_at) in rows {
+    for row in rows {
         let recorded: Vec<String> = members
-            .query_map(params![id], |row| row.get(0))?
+            .query_map(params![row.id], |row| row.get(0))?
             .collect::<rusqlite::Result<_>>()?;
         let mut identities = Vec::with_capacity(recorded.len());
         for recorded in recorded {
@@ -566,11 +692,29 @@ fn load_people(conn: &Connection, name: Option<&str>) -> Result<Vec<Person>> {
                 last_seen,
             });
         }
+        let kind = Kind::stored(&row.kind);
         people.push(Person {
-            name,
-            kind: Kind::stored(&kind),
-            note,
-            created_at,
+            name: row.name,
+            kind,
+            rating: match kind {
+                Kind::Person => Rating::stored(&row.rating),
+                Kind::Bot => Rating::Neutral,
+            },
+            invited_by: row.invited_by,
+            invited: invited
+                .query_map(params![row.id], |row| row.get(0))?
+                .collect::<rusqlite::Result<_>>()?,
+            note: row.note,
+            notes: notes
+                .query_map(params![row.id], |row| {
+                    Ok(Note {
+                        id: row.get(0)?,
+                        text: row.get(1)?,
+                        created_at: row.get(2)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<_>>()?,
+            created_at: row.created_at,
             identities,
         });
     }

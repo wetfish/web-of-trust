@@ -9,6 +9,7 @@ use serde::Deserialize;
 use super::layout::{self, duration, identity_href, number, person_href};
 use super::{App, Flash, PageResult, filled, internal, with_db};
 use crate::activity::{self, Order, RankFilter, RankRow, Totals};
+use crate::trust::ActivityScore;
 
 /// Identities shown in a ranking.
 const MAX_ROWS: usize = 200;
@@ -211,10 +212,28 @@ pub(super) fn share(totals: &Totals) -> String {
     }
 }
 
+/// What an activity score was made from.
+pub(super) fn activity_breakdown(activity: &ActivityScore) -> Markup {
+    html! {
+        p.note {
+            @if activity.tenure_months == 0 {
+                "No channel activity yet."
+            } @else {
+                "Seen in channels over " (number(activity.tenure_months)) " months, spoke in "
+                (number(activity.active_months)) " of them, on " (number(activity.active_days))
+                " days: " (number(activity.spoken)) " lines. The activity score gives up to 40 "
+                "points for months with spoken lines, 20 for months seen and 40 for days with "
+                "spoken lines."
+            }
+        }
+    }
+}
+
 /// The activity section of an identity's page: channel activity by year and
 /// month, and private messages when it never spoke in channels.
 pub(super) fn identity_section(
     months: &[(String, Totals)],
+    score: &ActivityScore,
     private_spoken: i64,
     bot: bool,
 ) -> Markup {
@@ -243,8 +262,10 @@ pub(super) fn identity_section(
             p.lead {
                 "Present on " (number(total.days_present)) " days, spoke on "
                 (number(total.active_days)) ", " (number(total.spoken)) " of "
-                (number(total.heard)) " lines heard (" (share(&total)) ")."
+                (number(total.heard)) " lines heard (" (share(&total)) "). "
+                "Activity score " strong { (score.score) } " of 100."
             }
+            (activity_breakdown(score))
         }
         @if total.spoken == 0 {
             p.note {
@@ -394,7 +415,7 @@ mod tests {
     #[test]
     fn notes_private_messages_of_identities_silent_in_channels() {
         let months = [("2026-11".to_string(), totals(40, 0))];
-        let page = identity_section(&months, 12, true).into_string();
+        let page = identity_section(&months, &ActivityScore::default(), 12, true).into_string();
         assert!(page.contains("Never spoke in a channel, but sent 12 private messages"));
         assert!(page.contains("belongs to a bot"));
         assert!(page.contains("<td>2026</td>"));

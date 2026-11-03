@@ -19,6 +19,7 @@ use super::{App, Flash, PageError, PageResult, filled, internal, with_db};
 use crate::activity::{self, Totals};
 use crate::lookup::{self, Filter, IdentityView, SessionRow};
 use crate::stats::{self, Kind, MatchingHost, NickChange};
+use crate::trust::{self, ActivityScore};
 
 /// Search results show at most this many identities.
 const MAX_RESULTS: usize = 500;
@@ -427,6 +428,10 @@ struct Context {
     /// Messages sent in private messages to the logging client.
     private_spoken: i64,
     bot: bool,
+    /// The identity's own activity score.
+    score: ActivityScore,
+    /// Real names `/who` showed, with when each was last seen.
+    real_names: Vec<(String, String)>,
 }
 
 async fn identity_page(
@@ -478,6 +483,8 @@ async fn identity_page(
                 .copied()
                 .unwrap_or(0),
             bot: activity::bots(conn).map_err(internal)?.contains(&view.id),
+            score: trust::activity_score(conn, std::slice::from_ref(&view.id)).map_err(internal)?,
+            real_names: trust::real_names(conn, &view.id).map_err(internal)?,
         };
         let title = format!("Identity {}", view.id);
         Ok(layout::page(&title, &flash, identity(&view, &context)).into_response())
@@ -553,10 +560,20 @@ fn identity(view: &IdentityView, context: &Context) -> Markup {
             }
         }
 
-        (identity_section(&context.months, context.private_spoken, context.bot))
+        (identity_section(&context.months, &context.score, context.private_spoken, context.bot))
 
         h2 { "Nicks" }
         (nicks_table(view))
+        @if !context.real_names.is_empty() {
+            p.note {
+                "Real names from channel user lists: "
+                @for (i, (name, seen)) in context.real_names.iter().enumerate() {
+                    @if i > 0 { ", " }
+                    strong { (name) } " (" (day(Some(seen.as_str()))) ")"
+                }
+                "."
+            }
+        }
 
         h2 { "Connections" }
         (connections_table(view, &context.groups))
@@ -881,6 +898,8 @@ mod tests {
             months: Vec::new(),
             private_spoken: 0,
             bot: false,
+            score: ActivityScore::default(),
+            real_names: vec![("Quokka Wet".into(), "2026-11-03 07:00:00".into())],
             changes: vec![(
                 0,
                 vec![NickChange {
@@ -898,6 +917,7 @@ mod tests {
         assert!(page.contains(r#"<optgroup label="Bots"><option value="relay">relay</option>"#));
         assert!(page.contains(r#"name="kind" value="bot""#));
         assert!(page.contains("/identities?host=bridge.example.net"));
+        assert!(page.contains("<strong>Quokka Wet</strong> (2026-11-03)"));
     }
 
     #[test]

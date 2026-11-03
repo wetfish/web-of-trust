@@ -1,7 +1,7 @@
 //! People and bots: who is behind identities, as decided by hand. Both are
 //! person records, told apart by their kind.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use axum::Router;
 use axum::extract::{Form, Query, State};
@@ -10,12 +10,14 @@ use axum::routing::{get, post};
 use maud::{Markup, html};
 use serde::Deserialize;
 
+use super::activity::activity_breakdown;
 use super::identities::{Ticks, identity_table};
 use super::layout::{self, back_field, day, number, person_href};
 use super::{App, Flash, PageError, PageResult, back_to, done, failed, filled, internal, with_db};
 use crate::decide;
 use crate::lookup::{self, Filter};
-use crate::stats::{self, Kind, Person};
+use crate::stats::{self, Kind, Person, Rating};
+use crate::trust::{self, ActivityScore};
 
 pub(super) fn routes() -> Router<App> {
     Router::new()
@@ -26,18 +28,31 @@ pub(super) fn routes() -> Router<App> {
         .route("/people/remove", post(remove))
         .route("/people/delete", post(delete))
         .route("/people/kind", post(set_kind))
+        .route("/people/rate", post(rate))
+        .route("/people/invited-by", post(invited_by))
+        .route("/people/notes/add", post(add_note))
+        .route("/people/notes/delete", post(delete_note))
         .route("/people/link", post(link))
 }
 
 async fn people_page(State(app): State<App>, Query(flash): Query<Flash>) -> PageResult {
     with_db(&app, move |conn| {
         let people = stats::people(conn).map_err(internal)?;
-        Ok(layout::page("People and bots", &flash, list(&people)))
+        let mut scores = HashMap::new();
+        for person in &people {
+            let score = trust::activity_score(conn, &person.identity_ids()).map_err(internal)?;
+            scores.insert(person.name.clone(), score);
+        }
+        Ok(layout::page(
+            "People and bots",
+            &flash,
+            list(&people, &scores),
+        ))
     })
     .await
 }
 
-fn list(people: &[Person]) -> Markup {
+fn list(people: &[Person], scores: &HashMap<String, ActivityScore>) -> Markup {
     let of = |kind: Kind| {
         people
             .iter()
@@ -53,9 +68,13 @@ fn list(people: &[Person]) -> Markup {
             "or by id here."
         }
         h2 { "People" }
-        (records_table(&of(Kind::Person), "No people yet."))
+        p.note {
+            "Most trusted first. The trust score, 0 to 99, is your rating, which sets a band of "
+            "20 points, and the activity score, which places them within it."
+        }
+        (records_table(&of(Kind::Person), "No people yet.", scores))
         h2 { "Bots" }
-        (records_table(&of(Kind::Bot), "No bots yet."))
+        (records_table(&of(Kind::Bot), "No bots yet.", scores))
         h2 { "New person or bot" }
         form.stacked method="post" action="/people/create" {
             (back_field("/people"))
@@ -77,7 +96,26 @@ fn list(people: &[Person]) -> Markup {
     }
 }
 
-fn records_table(records: &[&Person], empty: &str) -> Markup {
+/// People most trusted first, or bots most active first.
+fn records_table(
+    records: &[&Person],
+    empty: &str,
+    scores: &HashMap<String, ActivityScore>,
+) -> Markup {
+    let activity = |person: &Person| scores.get(&person.name).map_or(0, |score| score.score);
+    let trust = |person: &Person| trust::trust_score(person.rating, activity(person));
+    let people = records.iter().any(|person| person.kind == Kind::Person);
+    let mut records = records.to_vec();
+    records.sort_by(|a, b| {
+        let key = |person: &Person| {
+            if people {
+                trust(person)
+            } else {
+                activity(person)
+            }
+        };
+        key(b).cmp(&key(a)).then(a.name.cmp(&b.name))
+    });
     html! {
         @if records.is_empty() {
             p.muted { (empty) }
@@ -87,6 +125,11 @@ fn records_table(records: &[&Person], empty: &str) -> Markup {
                     thead {
                         tr {
                             th { "Name" }
+                            @if people {
+                                th { "Rating" }
+                                th.num title="Rating band plus activity, 0 to 99" { "Trust" }
+                            }
+                            th.num title="Out of 100" { "Activity" }
                             th.num { "Identities" }
                             th { "Nicks" }
                             th { "Last seen" }
@@ -94,13 +137,18 @@ fn records_table(records: &[&Person], empty: &str) -> Markup {
                         }
                     }
                     tbody {
-                        @for person in records {
+                        @for person in &records {
                             tr {
                                 td { a href=(person_href(&person.name)) { (person.name) } }
+                                @if people {
+                                    td { (person.rating.label()) }
+                                    td.num { (trust(person)) }
+                                }
+                                td.num { (activity(person)) }
                                 td.num { (number(person.identities.len() as i64)) }
                                 td.wrap { (nick_summary(person)) }
                                 td { (day(last_seen(person))) }
-                                td.wrap { (person.note.clone().unwrap_or_default()) }
+                                td.wrap { (latest_note(person)) }
                             }
                         }
                     }
@@ -108,6 +156,16 @@ fn records_table(records: &[&Person], empty: &str) -> Markup {
             }
         }
     }
+}
+
+/// The newest note, or the one given when the record was created.
+fn latest_note(person: &Person) -> &str {
+    person
+        .notes
+        .last()
+        .map(|note| note.text.as_str())
+        .or(person.note.as_deref())
+        .unwrap_or_default()
 }
 
 /// Options for choosing a person or bot by name, with bots in their own
@@ -156,17 +214,35 @@ async fn person_page(
             ..Filter::default()
         };
         let views = lookup::find(conn, &filter).map_err(internal)?;
-        let all = filled(&query.all) == Some("yes");
+        let context = PersonContext {
+            all: filled(&query.all) == Some("yes"),
+            activity: trust::activity_score(conn, &person.identity_ids()).map_err(internal)?,
+            inviters: stats::people_names(conn)
+                .map_err(internal)?
+                .into_iter()
+                .filter(|(name, kind)| *kind == Kind::Person && *name != person.name)
+                .map(|(name, _)| name)
+                .collect(),
+        };
         Ok(layout::page(
             &person.name,
             &flash,
-            page(&person, &views, all),
+            page(&person, &views, &context),
         ))
     })
     .await
 }
 
-fn page(person: &Person, views: &[lookup::IdentityView], all: bool) -> Markup {
+/// What the person page shows besides the person.
+struct PersonContext {
+    /// Whether every identity starts ticked.
+    all: bool,
+    activity: ActivityScore,
+    /// Everyone who could have invited the person.
+    inviters: Vec<String>,
+}
+
+fn page(person: &Person, views: &[lookup::IdentityView], context: &PersonContext) -> Markup {
     let here = person_href(&person.name);
     let spoken: i64 = views.iter().map(|view| view.spoken()).sum();
     let minutes: i64 = views.iter().map(|view| view.channel_minutes()).sum();
@@ -198,12 +274,65 @@ fn page(person: &Person, views: &[lookup::IdentityView], all: bool) -> Markup {
                 }
             }
         }
+
+        section.decision {
+            h2 { "Trust" }
+            @if person.kind == Kind::Person {
+                p.lead {
+                    "Trust score " strong { (trust::trust_score(person.rating, context.activity.score)) }
+                    ", out of 99: rated " (person.rating.label()) ", activity score "
+                    (context.activity.score) " of 100."
+                }
+            } @else {
+                p.lead {
+                    "Activity score " strong { (context.activity.score) } " of 100. "
+                    "Bots are not rated and have no trust score."
+                }
+            }
+            (activity_breakdown(&context.activity))
+            @if person.kind == Kind::Person {
+                (rating_slider(&person.name, person.rating))
+                (invited_by_form(person, &context.inviters))
+            }
+        }
+
+        section.decision {
+            h2 { "Notes" }
+            @if person.notes.is_empty() {
+                p.muted { "No notes yet." }
+            } @else {
+                ul.notes {
+                    @for note in &person.notes {
+                        li {
+                            span.muted { (day(Some(note.created_at.as_str()))) " " }
+                            span.note-text { (note.text) }
+                            form.inline method="post" action="/people/notes/delete" {
+                                input type="hidden" name="name" value=(person.name);
+                                input type="hidden" name="id" value=(note.id);
+                                button.secondary type="submit" title="Delete this note" { "Delete" }
+                            }
+                        }
+                    }
+                }
+            }
+            form.stacked method="post" action="/people/notes/add" {
+                input type="hidden" name="name" value=(person.name);
+                label {
+                    "New note "
+                    textarea name="text" rows="3" required
+                        placeholder="How you know them, who introduced them, what they work on" {}
+                }
+                button type="submit" { "Add note" }
+            }
+        }
+
+        h2 { "Identities" }
         @if views.is_empty() {
             p { "None of this " (kind) "'s identities have sessions." }
         } @else {
             form method="post" action="/people/link" {
                 (back_field(&here))
-                (identity_table(views, &Ticks::toggled(&here, all), &HashSet::new()))
+                (identity_table(views, &Ticks::toggled(&here, context.all), &HashSet::new()))
                 div.bulk {
                     span.muted { "With the ticked identities:" }
                     button.secondary type="submit" name="action" value="remove" {
@@ -227,6 +356,67 @@ fn page(person: &Person, views: &[lookup::IdentityView], all: bool) -> Markup {
                 " Delete " (person.name) "; their identities are kept and belong to no one"
             }
             button.danger type="submit" { "Delete " (kind) }
+        }
+    }
+}
+
+/// The rating, as radio buttons drawn as stops on a slider. The chosen
+/// rating's explanation shows below it, with no script: the stylesheet
+/// shows the one whose button is checked.
+fn rating_slider(name: &str, current: Rating) -> Markup {
+    html! {
+        form.rating method="post" action="/people/rate" {
+            input type="hidden" name="name" value=(name);
+            fieldset.slider {
+                legend { "How well you know them" }
+                div.stops {
+                    @for rating in Rating::ALL {
+                        label {
+                            input type="radio" name="rating" value=(rating.as_str())
+                                checked[rating == current];
+                            span { (rating.label()) }
+                        }
+                    }
+                }
+                @for rating in Rating::ALL {
+                    p class=(format!("explain explain-{}", rating.as_str())) {
+                        strong { (rating.label()) ": " } (rating.explanation())
+                    }
+                }
+            }
+            button type="submit" { "Save rating" }
+        }
+    }
+}
+
+fn invited_by_form(person: &Person, inviters: &[String]) -> Markup {
+    html! {
+        form.inline method="post" action="/people/invited-by" {
+            input type="hidden" name="name" value=(person.name);
+            label {
+                "Invited or vouched for by "
+                select name="by" {
+                    option value="" selected[person.invited_by.is_none()] { "nobody recorded" }
+                    @for name in inviters {
+                        option value=(name)
+                            selected[person.invited_by.as_deref() == Some(name.as_str())] { (name) }
+                    }
+                }
+            }
+            button.secondary type="submit" { "Save" }
+        }
+        @if let Some(by) = &person.invited_by {
+            p.note { "Invited by " a href=(person_href(by)) { (by) } "." }
+        }
+        @if !person.invited.is_empty() {
+            p.note {
+                "Invited "
+                @for (i, name) in person.invited.iter().enumerate() {
+                    @if i > 0 { ", " }
+                    a href=(person_href(name)) { (name) }
+                }
+                "."
+            }
         }
     }
 }
@@ -450,6 +640,92 @@ async fn set_kind(
     .await
 }
 
+#[derive(Deserialize)]
+struct RateForm {
+    name: String,
+    rating: String,
+}
+
+async fn rate(State(app): State<App>, Form(form): Form<RateForm>) -> Result<Redirect, PageError> {
+    with_db(&app, move |conn| {
+        let back = person_href(&form.name);
+        let Some(rating) = Rating::parse(&form.rating) else {
+            return Ok(failed(&back, "Choose a rating."));
+        };
+        Ok(match decide::set_rating(conn, &form.name, rating) {
+            Ok(()) => done(&back, &format!("Rated {} {}.", form.name, rating.label())),
+            Err(err) => failed(&back, err),
+        })
+    })
+    .await
+}
+
+#[derive(Deserialize)]
+struct InvitedByForm {
+    name: String,
+    /// Empty to clear it.
+    by: Option<String>,
+}
+
+async fn invited_by(
+    State(app): State<App>,
+    Form(form): Form<InvitedByForm>,
+) -> Result<Redirect, PageError> {
+    with_db(&app, move |conn| {
+        let back = person_href(&form.name);
+        let by = filled(&form.by);
+        let notice = match by {
+            Some(by) => format!("{} was invited by {by}.", form.name),
+            None => format!("Cleared who invited {}.", form.name),
+        };
+        Ok(match decide::set_invited_by(conn, &form.name, by) {
+            Ok(()) => done(&back, &notice),
+            Err(err) => failed(&back, err),
+        })
+    })
+    .await
+}
+
+#[derive(Deserialize)]
+struct NoteForm {
+    name: String,
+    text: String,
+}
+
+async fn add_note(
+    State(app): State<App>,
+    Form(form): Form<NoteForm>,
+) -> Result<Redirect, PageError> {
+    with_db(&app, move |conn| {
+        let back = person_href(&form.name);
+        Ok(match decide::add_note(conn, &form.name, &form.text) {
+            Ok(()) => done(&back, "Added the note."),
+            Err(err) => failed(&back, err),
+        })
+    })
+    .await
+}
+
+#[derive(Deserialize)]
+struct DeleteNoteForm {
+    name: String,
+    id: i64,
+}
+
+async fn delete_note(
+    State(app): State<App>,
+    Form(form): Form<DeleteNoteForm>,
+) -> Result<Redirect, PageError> {
+    with_db(&app, move |conn| {
+        let back = person_href(&form.name);
+        Ok(match decide::delete_note(conn, &form.name, form.id) {
+            Ok(()) => done(&back, "Deleted the note."),
+            Err(err) => failed(&back, err),
+        })
+    })
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -460,16 +736,35 @@ mod tests {
         assert!(ids("").is_empty());
     }
 
+    fn record(name: &str, kind: Kind) -> Person {
+        Person {
+            name: name.into(),
+            kind,
+            rating: Rating::Neutral,
+            invited_by: None,
+            invited: Vec::new(),
+            note: None,
+            notes: Vec::new(),
+            created_at: "2026-11-02 12:00:00".into(),
+            identities: Vec::new(),
+        }
+    }
+
+    fn context() -> PersonContext {
+        PersonContext {
+            all: false,
+            activity: ActivityScore::default(),
+            inviters: vec!["rachel".into()],
+        }
+    }
+
     #[test]
     fn asks_to_confirm_a_deletion() {
         let person = Person {
-            name: "rachel".into(),
-            kind: Kind::Person,
             note: Some("the logs' owner".into()),
-            created_at: "2026-11-02 12:00:00".into(),
-            identities: Vec::new(),
+            ..record("rachel", Kind::Person)
         };
-        let page = page(&person, &[], false).into_string();
+        let page = page(&person, &[], &context()).into_string();
         assert!(page.contains(r#"action="/people/delete""#));
         // With no identities there is nothing to tick.
         assert!(!page.contains(r#"action="/people/link""#));
@@ -481,18 +776,51 @@ mod tests {
     }
 
     #[test]
-    fn lists_people_and_bots_apart() {
-        let record = |name: &str, kind: Kind| Person {
-            name: name.into(),
-            kind,
-            note: None,
-            created_at: "2026-11-02 12:00:00".into(),
-            identities: Vec::new(),
+    fn rates_people_and_keeps_notes() {
+        let person = Person {
+            rating: Rating::Vouched,
+            invited_by: Some("rachel".into()),
+            notes: vec![stats::Note {
+                id: 7,
+                text: "met at a <meetup>".into(),
+                created_at: "2026-11-03 07:00:00".into(),
+            }],
+            ..record("quokka", Kind::Person)
         };
-        let records = [record("rachel", Kind::Person), record("relay", Kind::Bot)];
-        let page = list(&records).into_string();
+        let page = page(&person, &[], &context()).into_string();
+        // The slider has every rating, the current one checked, and each
+        // explanation for the stylesheet to show.
+        assert!(page.contains(r#"value="vouched" checked"#));
+        assert_eq!(page.matches(r#"type="radio" name="rating""#).count(), 5);
+        assert!(page.contains("explain-distrusted"));
+        assert!(page.contains("Trust score <strong>60</strong>"));
+        assert!(page.contains(r#"<option value="rachel" selected>rachel</option>"#));
+        assert!(page.contains("met at a &lt;meetup&gt;"));
+        assert!(page.contains(r#"name="id" value="7""#));
+
+        // Bots have no rating.
+        let bot = self::page(&record("relay", Kind::Bot), &[], &context()).into_string();
+        assert!(!bot.contains(r#"name="rating""#));
+        assert!(bot.contains("Bots are not rated"));
+    }
+
+    #[test]
+    fn lists_people_and_bots_apart() {
+        let quokka = Person {
+            rating: Rating::Known,
+            ..record("quokka", Kind::Person)
+        };
+        let records = [
+            record("rachel", Kind::Person),
+            quokka,
+            record("relay", Kind::Bot),
+        ];
+        let page = list(&records, &HashMap::new()).into_string();
         let bots = page.find("<h2>Bots</h2>").unwrap();
-        assert!(page.find(r#"href="/person?name=rachel""#).unwrap() < bots);
+        let rachel = page.find(r#"href="/person?name=rachel""#).unwrap();
+        // Most trusted first.
+        assert!(page.find(r#"href="/person?name=quokka""#).unwrap() < rachel);
+        assert!(rachel < bots);
         assert!(page.find(r#"href="/person?name=relay""#).unwrap() > bots);
 
         let options =

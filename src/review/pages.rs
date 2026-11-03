@@ -7,8 +7,9 @@ use maud::{Markup, html};
 use serde::Deserialize;
 
 use super::layout::{self, channel_href, day, number};
-use super::{App, Flash, PageError, PageResult, internal, with_db};
+use super::{App, Flash, PageError, PageResult, channels, internal, with_db};
 use crate::stats::{self, ChannelDays, Overview, TagSummary};
+use crate::trust;
 
 pub(super) fn routes() -> Router<App> {
     Router::new()
@@ -44,8 +45,25 @@ async fn channel_page(
                     query.name, query.tag
                 ))
             })?;
+        let review = trust::review(conn, &channel.tag, &channel.name).map_err(internal)?;
+        let who = trust::latest_who(conn, &channel.tag, &channel.name).map_err(internal)?;
+        let checked = match &who {
+            Some(list) => trust::check(conn, &channel.tag, &list.entries).map_err(internal)?,
+            None => Vec::new(),
+        };
+        let section = channels::trust_section(
+            &channel.tag,
+            &channel.name,
+            review.as_ref(),
+            who.as_ref(),
+            &checked,
+        );
         let title = format!("{} ({})", channel.name, channel.tag);
-        Ok(layout::page(&title, &flash, self::channel(&channel)))
+        Ok(layout::page(
+            &title,
+            &flash,
+            self::channel(&channel, section),
+        ))
     })
     .await
 }
@@ -144,12 +162,15 @@ fn silent_share(identities: i64, speakers: i64) -> String {
     format!("{:.0}%", silent * 100.0)
 }
 
-pub fn channel(channel: &ChannelDays) -> Markup {
+/// A channel's page: its review, then its activity day by day.
+pub fn channel(channel: &ChannelDays, review: Markup) -> Markup {
     let spoken: i64 = channel.days.iter().map(|day| day.spoken).sum();
     let busiest = channel.days.iter().map(|day| day.spoken).max().unwrap_or(0);
     html! {
-        p.crumbs { a href="/" { "Overview" } " / " (channel.tag) }
+        p.crumbs { a href="/channels" { "Channels" } " / " (channel.tag) }
         h1 { (channel.name) }
+        (review)
+        h2 { "Activity" }
         p {
             a href=(format!(
                 "/activity?channel={}",
@@ -277,7 +298,7 @@ mod tests {
             ],
             nicks: 2,
         };
-        let page = super::channel(&channel).into_string();
+        let page = super::channel(&channel, html! {}).into_string();
         assert!(page.contains("width: 100.0%"));
         assert!(page.contains("width: 25.0%"));
         assert!(page.contains("from 2026-11-01 to 2026-11-02"));

@@ -280,6 +280,7 @@ form label:has(input[type="checkbox"]) {
 }
 
 input[type="text"],
+textarea,
 select {
     font: inherit;
     color: var(--text);
@@ -345,11 +346,127 @@ button:hover {
     align-items: center;
 }
 
-/* The bot mark on an identity's page. */
-div.bot {
+textarea {
+    resize: vertical;
+}
+
+/* The rating slider: radio buttons drawn as stops on a track. The arrow
+   keys move between them, and the chosen one's explanation shows below,
+   without any script. */
+fieldset.slider {
+    max-width: 36rem;
+    margin: 0.5rem 0;
+    padding: 0;
+    border: 0;
+}
+
+fieldset.slider legend {
+    padding: 0;
+    margin-bottom: 0.5rem;
+    font-weight: 600;
+}
+
+.slider .stops {
+    position: relative;
+    display: grid;
+    grid-template-columns: repeat(5, 1fr);
+}
+
+/* The track, from the first stop's centre to the last's. */
+.slider .stops::before {
+    content: "";
+    position: absolute;
+    top: 0.6rem;
+    left: 10%;
+    right: 10%;
+    height: 2px;
+    background: var(--border);
+}
+
+.slider label {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0.3rem;
+    color: var(--muted);
+    font-size: 0.9rem;
+    cursor: pointer;
+}
+
+.slider input {
+    appearance: none;
+    width: 1.2rem;
+    height: 1.2rem;
+    margin: 0;
+    border: 2px solid var(--border);
+    border-radius: 50%;
+    background: var(--background);
+    cursor: pointer;
+}
+
+.slider input:checked {
+    border-color: var(--accent);
+    background: var(--accent);
+}
+
+.slider input:focus-visible {
+    outline: 2px solid var(--link);
+    outline-offset: 2px;
+}
+
+.slider label:has(input:checked) {
+    color: var(--text);
+    font-weight: 600;
+}
+
+.slider .explain {
+    display: none;
+    margin: 0.6rem 0 0;
+}
+
+.slider:has(input[value="distrusted"]:checked) .explain-distrusted,
+.slider:has(input[value="wary"]:checked) .explain-wary,
+.slider:has(input[value="neutral"]:checked) .explain-neutral,
+.slider:has(input[value="vouched"]:checked) .explain-vouched,
+.slider:has(input[value="known"]:checked) .explain-known {
+    display: block;
+}
+
+form.rating {
+    margin-bottom: 1rem;
+}
+
+/* Notes about a person, oldest first. */
+ul.notes {
+    padding-left: 1.2rem;
+}
+
+ul.notes li {
+    margin-bottom: 0.4rem;
+}
+
+.note-text {
+    white-space: pre-wrap;
+}
+
+/* A channel's review status, with the button to mark it reviewed. */
+.review-status {
     display: flex;
     flex-wrap: wrap;
-    gap: 0.5rem;
+    gap: 0.4rem 0.8rem;
     align-items: center;
-    margin-bottom: 0.5rem;
+}
+
+.review-status form.inline {
+    margin: 0;
+}
+
+/* The users of a channel, checked against the logs. */
+.verdict-trusted {
+    color: var(--accent);
+}
+
+.verdict-untrusted {
+    color: var(--danger);
 }

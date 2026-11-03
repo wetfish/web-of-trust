@@ -9,6 +9,7 @@ mod report;
 mod review;
 mod scan;
 mod stats;
+mod trust;
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -18,7 +19,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use rusqlite::Connection;
 
 use crate::lookup::Filter;
-use crate::stats::Kind;
+use crate::stats::{Kind, Rating};
 
 /// The default database, in the repository folder. `.gitignore` excludes it.
 const DEFAULT_DB: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/wot.sqlite");
@@ -213,6 +214,18 @@ enum PeopleAction {
     /// Make a person a bot, or a bot a person, keeping its identities
     Kind { name: String, kind: RecordKind },
 
+    /// Rate how well you know a person
+    Rate { name: String, rating: RatingArg },
+
+    /// Add a note to a person or bot, such as how you know them
+    Note { name: String, text: String },
+
+    /// Delete a note, by the number wot people list shows
+    DeleteNote { name: String, id: i64 },
+
+    /// Record who invited or vouches for a person; leave BY out to clear it
+    InvitedBy { name: String, by: Option<String> },
+
     /// Add identities to a person or bot
     Add {
         name: String,
@@ -245,6 +258,28 @@ impl RecordKind {
         match self {
             RecordKind::Person => Kind::Person,
             RecordKind::Bot => Kind::Bot,
+        }
+    }
+}
+
+/// How well you know a person, from the least trusted to the most.
+#[derive(Clone, Copy, ValueEnum)]
+enum RatingArg {
+    Distrusted,
+    Wary,
+    Neutral,
+    Vouched,
+    Known,
+}
+
+impl RatingArg {
+    fn rating(self) -> Rating {
+        match self {
+            RatingArg::Distrusted => Rating::Distrusted,
+            RatingArg::Wary => Rating::Wary,
+            RatingArg::Neutral => Rating::Neutral,
+            RatingArg::Vouched => Rating::Vouched,
+            RatingArg::Known => Rating::Known,
         }
     }
 }
@@ -400,6 +435,26 @@ fn people(action: PeopleAction, db_path: &Path) -> db::Result<()> {
         PeopleAction::Kind { name, kind } => {
             decide::set_kind(&conn, &name, kind.kind())?;
             println!("{name} is a {} now.", kind.kind().as_str());
+        }
+        PeopleAction::Rate { name, rating } => {
+            let rating = rating.rating();
+            decide::set_rating(&conn, &name, rating)?;
+            println!("Rated {name} {}: {}", rating.label(), rating.explanation());
+        }
+        PeopleAction::Note { name, text } => {
+            decide::add_note(&conn, &name, &text)?;
+            println!("Added a note to {name}.");
+        }
+        PeopleAction::DeleteNote { name, id } => {
+            decide::delete_note(&conn, &name, id)?;
+            println!("Deleted note {id} of {name}.");
+        }
+        PeopleAction::InvitedBy { name, by } => {
+            decide::set_invited_by(&conn, &name, by.as_deref())?;
+            match by {
+                Some(by) => println!("{name} was invited by {by}."),
+                None => println!("Cleared who invited {name}."),
+            }
         }
         PeopleAction::Add { name, ids } => {
             decide::add_to_person(&mut conn, &name, &ids)?;

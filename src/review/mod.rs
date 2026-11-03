@@ -9,6 +9,7 @@
 //! on a blocking thread, since SQLite calls block.
 
 mod activity;
+mod channels;
 mod cuts;
 mod hosts;
 mod identities;
@@ -61,6 +62,7 @@ pub fn run(db_path: &Path, port: u16) -> db::Result<()> {
         .merge(hosts::routes())
         .merge(cuts::routes())
         .merge(activity::routes())
+        .merge(channels::routes())
         .route("/style.css", get(style))
         .fallback(not_found)
         .with_state(app);

@@ -5,7 +5,9 @@
 //!   one host when identities are built, optionally with the ident as the
 //!   person. Changing them needs an identity rebuild.
 //! - **People:** who is behind identities, a human or a bot. A person holds
-//!   identities from any network tag. Nothing needs rebuilding.
+//!   identities from any network tag, and has your rating of them, notes and
+//!   who invited them. Nothing needs rebuilding.
+//! - **Channel reviews:** when you last went through a channel's users.
 //! - **Cuts:** nick changes made by someone else at the keyboard. Changing
 //!   them needs an identity rebuild.
 
@@ -18,7 +20,7 @@ use crate::db::Result;
 use crate::identity;
 use crate::lookup::{self, current_id};
 use crate::report::{day, heading, table, thousands};
-use crate::stats::{self, Kind};
+use crate::stats::{self, Kind, Rating};
 
 /// The network tag to use: the one given, or the only one imported.
 pub fn resolve_tag(conn: &Connection, tag: Option<&str>) -> Result<String> {
@@ -326,6 +328,91 @@ pub fn set_kind(conn: &Connection, name: &str, kind: Kind) -> Result<()> {
     }
 }
 
+/// Sets how well you know a person. Bots are not rated.
+pub fn set_rating(conn: &Connection, name: &str, rating: Rating) -> Result<()> {
+    match kind_of(conn, name)? {
+        None => Err(format!("there is no person or bot named {name}").into()),
+        Some(Kind::Bot) => Err(format!("{name} is a bot, and bots are not rated").into()),
+        Some(Kind::Person) => {
+            conn.execute(
+                "UPDATE people SET rating = ?1 WHERE name = ?2",
+                params![rating.as_str(), name],
+            )?;
+            Ok(())
+        }
+    }
+}
+
+/// Adds a note to a person or bot.
+pub fn add_note(conn: &Connection, name: &str, text: &str) -> Result<()> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Err("the note is empty".into());
+    }
+    let id = person_id(conn, name)?;
+    conn.execute(
+        "INSERT INTO person_notes (person_id, text) VALUES (?1, ?2)",
+        params![id, text],
+    )?;
+    Ok(())
+}
+
+/// Deletes one of a person's or bot's notes.
+pub fn delete_note(conn: &Connection, name: &str, note: i64) -> Result<()> {
+    let id = person_id(conn, name)?;
+    let deleted = conn.execute(
+        "DELETE FROM person_notes WHERE id = ?1 AND person_id = ?2",
+        params![note, id],
+    )?;
+    if deleted == 0 {
+        return Err(format!("{name} has no note {note}").into());
+    }
+    Ok(())
+}
+
+/// Records who invited or vouches for a person, or clears it with `None`.
+/// Only a person can invite, and never in a circle.
+pub fn set_invited_by(conn: &Connection, name: &str, by: Option<&str>) -> Result<()> {
+    let id = person_id(conn, name)?;
+    let by_id = match by {
+        None => None,
+        Some(by) => {
+            let by_id = person_id(conn, by)?;
+            if kind_of(conn, by)? != Some(Kind::Person) {
+                return Err(format!("{by} is a bot, and only people invite").into());
+            }
+            // Walk up from the inviter: reaching this person would make a
+            // circle. The step limit only guards against a circle already
+            // in the database.
+            let mut next = Some(by_id);
+            for _ in 0..1000 {
+                let Some(current) = next else { break };
+                if current == id {
+                    return Err(if by_id == id {
+                        format!("{name} cannot invite themselves")
+                    } else {
+                        format!(
+                            "{by} was invited through {name}, so {name} cannot be invited by them"
+                        )
+                    }
+                    .into());
+                }
+                next = conn.query_row(
+                    "SELECT invited_by FROM people WHERE id = ?1",
+                    params![current],
+                    |row| row.get(0),
+                )?;
+            }
+            Some(by_id)
+        }
+    };
+    conn.execute(
+        "UPDATE people SET invited_by = ?1 WHERE id = ?2",
+        params![by_id, id],
+    )?;
+    Ok(())
+}
+
 /// Fails when an identity does not exist or belongs to a person other than
 /// `person`. Returns the ids, as they are now, that do not belong to `person`
 /// yet.
@@ -449,8 +536,23 @@ fn list_records(out: &mut impl Write, people: &[&stats::Person]) -> Result<()> {
     for person in people {
         writeln!(out)?;
         heading(out, &person.name, '-')?;
+        if person.kind == Kind::Person {
+            writeln!(out, "Rating: {}", person.rating.label())?;
+        }
+        if let Some(by) = &person.invited_by {
+            writeln!(out, "Invited by: {by}")?;
+        }
         if let Some(note) = &person.note {
             writeln!(out, "Note: {note}")?;
+        }
+        for note in &person.notes {
+            writeln!(
+                out,
+                "Note {} ({}): {}",
+                note.id,
+                day(&note.created_at),
+                note.text
+            )?;
         }
         if person.identities.is_empty() {
             writeln!(
@@ -490,6 +592,27 @@ fn list_records(out: &mut impl Write, people: &[&stats::Person]) -> Result<()> {
             &[false, false, false, false],
         )?;
     }
+    Ok(())
+}
+
+// Channel reviews
+
+/// Records that you went through a channel's users now. A review stays valid
+/// for six months.
+pub fn mark_reviewed(conn: &Connection, tag: &str, channel: &str) -> Result<()> {
+    let known: bool = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM files WHERE tag = ?1 AND target = ?2 COLLATE NOCASE
+                                              AND kind = 'channel')",
+        params![tag, channel],
+        |row| row.get(0),
+    )?;
+    if !known {
+        return Err(format!("no log of {channel} in network tag {tag} has been imported").into());
+    }
+    conn.execute(
+        "INSERT INTO channel_reviews (tag, channel) VALUES (?1, ?2)",
+        params![tag, channel],
+    )?;
     Ok(())
 }
 
@@ -735,6 +858,61 @@ mod tests {
             })
             .unwrap();
         assert_eq!(left, 0);
+    }
+
+    #[test]
+    fn rates_notes_and_invites_people() {
+        let (_root, mut conn) = setup("decide-trust");
+        for name in ["rachel", "quokka", "marlowe"] {
+            create_person(&mut conn, name, Kind::Person, &[], None).unwrap();
+        }
+        create_person(&mut conn, "relay", Kind::Bot, &[], None).unwrap();
+
+        set_rating(&conn, "quokka", Rating::Vouched).unwrap();
+        assert!(
+            set_rating(&conn, "relay", Rating::Known).is_err(),
+            "bots are not rated"
+        );
+        assert!(set_rating(&conn, "nobody", Rating::Known).is_err());
+
+        add_note(&conn, "quokka", "  met at a meetup  ").unwrap();
+        assert!(add_note(&conn, "quokka", "   ").is_err());
+        let person = stats::person(&conn, "quokka").unwrap().unwrap();
+        assert_eq!(person.rating, Rating::Vouched);
+        assert_eq!(person.notes.len(), 1);
+        assert_eq!(person.notes[0].text, "met at a meetup");
+        assert!(
+            delete_note(&conn, "marlowe", person.notes[0].id).is_err(),
+            "not theirs"
+        );
+        delete_note(&conn, "quokka", person.notes[0].id).unwrap();
+
+        set_invited_by(&conn, "quokka", Some("rachel")).unwrap();
+        set_invited_by(&conn, "marlowe", Some("quokka")).unwrap();
+        assert!(
+            set_invited_by(&conn, "rachel", Some("marlowe")).is_err(),
+            "a circle"
+        );
+        assert!(set_invited_by(&conn, "rachel", Some("rachel")).is_err());
+        assert!(
+            set_invited_by(&conn, "rachel", Some("relay")).is_err(),
+            "bots do not invite"
+        );
+        let rachel = stats::person(&conn, "rachel").unwrap().unwrap();
+        assert_eq!(rachel.invited, ["quokka"]);
+        assert_eq!(
+            stats::person(&conn, "marlowe")
+                .unwrap()
+                .unwrap()
+                .invited_by
+                .as_deref(),
+            Some("quokka")
+        );
+        // Deleting the inviter leaves the invited without one.
+        delete_person(&conn, "quokka").unwrap();
+        let marlowe = stats::person(&conn, "marlowe").unwrap().unwrap();
+        assert_eq!(marlowe.invited_by, None);
+        set_invited_by(&conn, "marlowe", None).unwrap();
     }
 
     #[test]

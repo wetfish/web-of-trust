@@ -21,6 +21,7 @@ pub fn page(title: &str, flash: &Flash, body: Markup) -> Markup {
                     nav {
                         a.brand href="/" { "wot review" }
                         a href="/" { "Overview" }
+                        a href="/channels" { "Channels" }
                         a href="/activity" { "Activity" }
                         a href="/identities" { "Identities" }
                         a href="/people" { "People and bots" }

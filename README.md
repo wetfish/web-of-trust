@@ -17,7 +17,10 @@ channel activity is tracked by channel and month: how long it was present, how
 much was said while it was there, and how much it said itself. `wot review`
 serves a web interface on this computer for reviewing all of it, ranking the
 most and least active identities, and making the same decisions in a browser.
-Labels or a trust score built on the activity come next.
+People get your own rating, notes and who invited them, which together with
+their activity make a trust score, and a channel's current users, pasted from
+irssi's `/who`, are sorted into trusted, untrusted and undecided. The social
+graph of who talks to whom comes next.
 
 ## Requirements
 
@@ -438,15 +441,22 @@ ticked.
 ### Pages
 
 - **Overview** (`/`): for each network tag, the number of identities, people,
-  bots, host groups and cuts, and a table of channels with their log files, lines,
-  spoken lines and joins. Identities counts the identities with a session in
-  the channel, apart from the logging client; Spoke counts those that said
-  anything; Silent is the share that never did. Private messages are
+  bots, host groups and cuts, and a table of channels with their log files,
+  lines, spoken lines and joins. Identities counts the identities with a
+  session in the channel, apart from the logging client; Spoke counts those
+  that said anything; Silent is the share that never did. Private messages are
   summarized in one line.
-- **Channel** (`/channel?tag=TAG&name=CHANNEL`): spoken lines and nicks for
-  each day with spoken lines, most recent first, with a bar comparing each
-  day with the busiest one. The log files read for the channel are listed at
-  the end.
+- **Channels** (`/channels`): every channel with activity, the busiest over
+  the last six months first, with its recent spoken lines and identities,
+  the last month anyone was present, its review status and when a user list
+  was last pasted. See [Trust](#trust).
+- **Channel** (`/channel?tag=TAG&name=CHANNEL`): the channel's review status
+  with a button to mark it reviewed, a box to paste `/who` output into, and
+  the users of the latest list in trusted, untrusted, undecided and bots,
+  see [Checking a channel's users](#checking-a-channels-users). Below that,
+  spoken lines and nicks for each day with spoken lines, most recent first,
+  with a bar comparing each day with the busiest one. The log files read for
+  the channel are listed at the end.
 - **Identities** (`/identities`): a search by nick, ident, host and person,
   matched the same way as `wot analyze --nick`, `--ident`, `--host` and
   `--person`. Results show the identity, its person, nicks, number of
@@ -467,18 +477,23 @@ ticked.
 - **Identity** (`/identity?id=ID`): one identity in full: its person, nicks,
   connections with their host group, channels and private messages, nick
   changes and inferred sessions. Nicks, idents, hosts and channels link to
-  their own searches and pages. From here an identity can be added to an
-  existing person or bot, to a new one, or removed from its person or bot, and
-  a session can be cut at any of its nick changes. Connections on hosts that
-  are not in a group link to a search by that host, where it can be grouped.
-  An id merged into another identity leads to that identity.
-- **People and bots** (`/people`): people, then bots, with their identities,
-  nicks and last seen, and a form to create either, optionally with identity
-  ids.
-- **Person or bot** (`/person?name=NAME`): its identities with their totals,
-  with checkboxes and an **All** link to remove several at once, a button to
-  make a person a bot or a bot a person, and forms to add identities by id or
-  delete it.
+  their own searches and pages. Its Activity section shows its activity score,
+  and real names from pasted user lists are listed under its nicks. From here
+  an identity can be added to an existing person or bot, to a new one, or
+  removed from its person or bot, and a session can be cut at any of its nick
+  changes. Connections on hosts that are not in a group link to a search by
+  that host, where it can be grouped. An id merged into another identity leads
+  to that identity.
+- **People and bots** (`/people`): people, most trusted first, with their
+  rating, trust score, activity score, identities, nicks, last seen and
+  latest note; then bots, most active first; and a form to create either,
+  optionally with identity ids.
+- **Person or bot** (`/person?name=NAME`): its trust score and what it was
+  made from, a slider to rate a person that explains each rating as it is
+  chosen, who invited them and whom they invited, and notes to add and
+  delete. Then its identities with their totals, with checkboxes and an
+  **All** link to remove several at once, a button to make a person a bot or
+  a bot a person, and forms to add identities by id or delete it.
 - **Host groups** (`/hosts`): each group with its hosts, how many identities
   used each, and forms to add and remove hosts, change the kind, ident
   setting and note, or delete the group; a form to create a group; and the
@@ -488,15 +503,15 @@ ticked.
   group it.
 - **Cuts** (`/cuts`): every cut with its nick change and whether it still
   applies, with forms to remove one or add one by line.
-- **Activity** (`/activity`): identities ranked by their channel activity,
-  see [Activity](#activity). Filters choose a channel or all channels, a
-  year or all time, the order (least active, most active or longest present
-  first), the days present an identity needs to be ranked (7 unless chosen),
-  and whether to include bots, which are labelled "bot". Over all channels,
-  each row shows the identity's network tag. Channel pages link to their own
-  ranking. The
-  identity page shows the identity's activity by year, with each month behind
-  a fold, and notes private messages when it never spoke in a channel.
+- **Activity** (`/activity`): identities ranked by their channel activity, see
+  [Activity](#activity). Filters choose a channel or all channels, a year or
+  all time, the order (least active, most active or longest present first),
+  the days present an identity needs to be ranked (7 unless chosen), and
+  whether to include bots, which are labelled "bot". Over all channels, each
+  row shows the identity's network tag. Channel pages link to their own
+  ranking. The identity page shows the identity's activity by year, with each
+  month behind a fold, and notes private messages when it never spoke in a
+  channel.
 
 ### Code
 
@@ -505,9 +520,9 @@ what the pages share: errors, database access, notices and redirects.
 `layout.rs` has the page frame and helpers, and `style.css` the styles. Each
 area has its own module with its pages and actions: `pages.rs` for the
 overview and channels, then `identities.rs`, `people.rs`, `hosts.rs`,
-`cuts.rs` and `activity.rs`. The data comes from `src/stats.rs`,
-`src/lookup.rs` and `src/activity.rs`, and the actions call the same
-functions in `src/decide.rs` as the commands.
+`cuts.rs`, `activity.rs` and `channels.rs`. The data comes from
+`src/stats.rs`, `src/lookup.rs`, `src/activity.rs` and `src/trust.rs`, and
+the actions call the same functions in `src/decide.rs` as the commands.
 
 ## Activity
 
@@ -610,6 +625,20 @@ Adding an identity to the person it already belongs to changes nothing.
 only fails when none of them belong to a person. The same commands work for
 bots.
 
+Rate how well you know someone, note how you know them, and record who invited
+or vouches for them, see [Trust](#trust):
+
+```bash
+wot people rate quokka vouched
+wot people note quokka "met at a meetup in 2019"
+wot people delete-note quokka 3
+wot people invited-by quokka rachel
+wot people invited-by quokka
+```
+
+Note numbers are shown by `wot people list`. `wot people invited-by` without
+a second name clears it. Only people invite, and never in a circle.
+
 People do not change identities, so nothing is rebuilt. When a rebuild merges
 an identity into another, its person follows it. If that puts one identity in
 two people, the identity views show both names as a conflict.
@@ -650,6 +679,7 @@ wot people kind relay bot
 ```
 
 `wot people kind` turns a person into a bot or back, keeping its identities.
+Bots are not rated and have no trust score.
 `wot people list` lists people, then bots. In `wot review`, tick identities in
 a search and choose **Create bot**, or add them to an existing bot.
 
@@ -661,9 +691,108 @@ a search and choose **Create bot**, or add them to an existing bot.
 
 `host_group_members`: `group_id`, `tag`, `host`, `note` and `created_at`.
 
-`people`: `id`, `name`, `note`, `created_at` and `kind` (`person` or `bot`).
+`people`: `id`, `name`, `note`, `created_at`, `kind` (`person` or `bot`),
+`rating` (`distrusted`, `wary`, `neutral`, `vouched` or `known`) and
+`invited_by` (the id of the person who invited them).
+
+`person_notes`: `id`, `person_id`, `text` and `created_at`.
+
+`channel_reviews`: `id`, `tag`, `channel` and `reviewed_at`.
 
 `person_identities`: `identity_id`, `person_id`, `note` and `created_at`.
 
 `session_cuts`: `id`, `path` (the log file), `line`, `expected` (the nick
 change on that line), `note` and `created_at`.
+
+`who_lists`: `id`, `tag`, `channel` and `pasted_at`.
+
+`who_entries`: `list_id`, `nick`, `ident`, `host`, `status` (`H` here or `G`
+away, `*` for an IRC operator, then channel modes and server flags) and
+`realname`.
+
+## Trust
+
+Trust puts what you know about people together with what the logs show.
+Ratings, notes and invitations are decisions like the others, kept in their
+own tables. Pasted user lists are kept too, since they hold real names the
+logs never show.
+
+### Ratings
+
+Each person has a rating, set on their page with a slider or with
+`wot people rate`. Everyone starts neutral. Bots are not rated.
+
+| Rating | Meaning |
+|---|---|
+| Known | You know them personally, or have for years. |
+| Vouched | Someone you trust invited them or vouches for them. |
+| Neutral | No opinion yet. Everyone starts here. |
+| Wary | Something about them seems off. |
+| Distrusted | You know they are not who they claim to be, or should not be here. |
+
+Notes are dated and kept in order, for how you know someone, who introduced
+them or anything worth remembering. Invited by links a person to the person
+who invited or vouches for them, so chains of invitations can be followed
+from either end.
+
+### Scores
+
+The **activity score**, 0 to 100, comes from the channel activity of all of
+a person's identities, or of one identity not linked to anyone:
+
+- **Consistency**, up to 40 points: months with spoken lines, all 40 at 24
+  months.
+- **Tenure**, up to 20 points: months from first to last seen in a channel,
+  all 20 at 36 months.
+- **Participation**, up to 40 points: days with spoken lines, on a log scale
+  so the first weeks count the most, all 40 at 365 days.
+
+Long-time regulars score high; accounts that joined recently or never talk
+score low. The person and identity pages show what the score was made from.
+
+The **trust score**, 0 to 99, is the rating's band of 20 points, from
+distrusted at 0 to 19 up to known at 80 to 99, plus the activity score scaled
+to 0 to 19. The bands never overlap, so the rating always comes first: a known
+friend who rarely talks ranks above the busiest stranger, and among people
+rated the same, activity decides. Bots have no trust score.
+
+### Checking a channel's users
+
+On a channel's page, run `/who #channel` in irssi and paste what it prints.
+irssi shows each user as `#channel nick status hops ident@host [real name]`,
+after any timestamp; other lines, such as `End of /WHO list`, are ignored,
+and so are replies for other channels. irssi cuts the channel name to 10
+characters, which is allowed for.
+
+Each user is matched against the identity keys of the channel's network tag:
+
+1. **Exact:** the same nick from an `ident@host` the identity used, counting
+   the hosts of its host group as one.
+2. **New nick:** an `ident@host` the identity used, with a nick it never used
+   there. In a host group whose ident does not identify the person, the
+   ident only counts together with the nick.
+3. **Nick only:** the nick was seen, but never from this `ident@host`.
+   Anyone can take a nick, so this gives no trust.
+4. **Never seen.**
+
+When several identities match, the most recently seen is used. Its person or
+bot then decides the list:
+
+- **Trusted:** an exact or new nick match to a person rated vouched or known.
+- **Untrusted:** never seen, or matched to someone rated wary or distrusted,
+  including by nick only.
+- **Undecided:** everyone else: rated neutral, not linked to a person, or
+  matched by nick only.
+- **Bots:** matched to a bot.
+
+Each list shows the nick and status, `ident@host`, real name, person or bot
+and rating, trust and activity scores, the identity, and how it was matched.
+Unknown users link to a search by their host. Each pasted list is kept, so
+the real names it holds show on the identity pages; a list can be deleted
+from the channel page.
+
+### Channel reviews
+
+**Mark reviewed** on a channel's page records that you went through its users.
+A review stays valid for six months, after which the Channels page shows it
+as expired.

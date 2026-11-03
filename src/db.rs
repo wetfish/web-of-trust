@@ -12,8 +12,10 @@
 //! The decision tables hold what a person decided by hand, and nothing
 //! rebuilds them: `host_groups` and `host_group_members` for bridges and
 //! bouncers, `people` and `person_identities` for who is who, humans and bots
-//! alike, and `session_cuts` for nick changes made by someone else at the
-//! keyboard. The `activity` table is rebuilt with the identities, by the
+//! alike, with `person_notes`, `session_cuts` for nick changes made by someone
+//! else at the keyboard, and `channel_reviews`. `who_lists` and `who_entries`
+//! hold channel user lists pasted into `wot review`, which nothing rebuilds
+//! either. The `activity` table is rebuilt with the identities, by the
 //! `activity` module.
 
 use std::error::Error;
@@ -35,7 +37,7 @@ const HEAD_LEN: u64 = 1024;
 /// The schema, as the steps that build it. SQLite's `user_version` stores how
 /// many steps a database has had, so an older database is brought up to date
 /// by running the steps it is missing.
-const MIGRATIONS: [&str; 4] = [SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4];
+const MIGRATIONS: [&str; 5] = [SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5];
 
 const SCHEMA_V1: &str = "
 CREATE TABLE files (
@@ -241,6 +243,60 @@ ALTER TABLE people ADD COLUMN kind TEXT NOT NULL DEFAULT 'person'
     CHECK (kind IN ('person', 'bot'));
 ";
 
+const SCHEMA_V5: &str = "
+-- How well you know each person, from distrusted to known. Bots keep the
+-- default and are not rated.
+ALTER TABLE people ADD COLUMN rating TEXT NOT NULL DEFAULT 'neutral'
+    CHECK (rating IN ('distrusted', 'wary', 'neutral', 'vouched', 'known'));
+
+-- The person who invited or vouches for this one.
+ALTER TABLE people ADD COLUMN invited_by INTEGER REFERENCES people (id) ON DELETE SET NULL;
+
+-- Notes about a person or bot, such as how you know them.
+CREATE TABLE person_notes (
+    id INTEGER PRIMARY KEY,
+    person_id INTEGER NOT NULL REFERENCES people (id) ON DELETE CASCADE,
+    text TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX person_notes_by_person ON person_notes (person_id);
+
+-- Each time a channel's users were reviewed. A review stays valid for six
+-- months.
+CREATE TABLE channel_reviews (
+    id INTEGER PRIMARY KEY,
+    tag TEXT NOT NULL,
+    channel TEXT NOT NULL COLLATE NOCASE,
+    reviewed_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX channel_reviews_by_channel ON channel_reviews (tag, channel);
+
+-- A channel's users as irssi's /who listed them, pasted into wot review.
+CREATE TABLE who_lists (
+    id INTEGER PRIMARY KEY,
+    tag TEXT NOT NULL,
+    channel TEXT NOT NULL COLLATE NOCASE,
+    pasted_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX who_lists_by_channel ON who_lists (tag, channel);
+
+CREATE TABLE who_entries (
+    list_id INTEGER NOT NULL REFERENCES who_lists (id) ON DELETE CASCADE,
+    nick TEXT NOT NULL,
+    ident TEXT NOT NULL,
+    host TEXT NOT NULL,
+    -- 'H' when here or 'G' when away, then '*' for an IRC operator, channel
+    -- modes such as '@' and '+', and any flags the server adds.
+    status TEXT NOT NULL,
+    -- The real name, which the logs never show.
+    realname TEXT NOT NULL,
+    PRIMARY KEY (list_id, nick)
+);
+";
+
 const INSERT_EVENT: &str = "
 INSERT INTO events (file_id, line, date, time, kind, nick, ident, host, other_nick, text, detail)
 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
@@ -257,8 +313,8 @@ pub fn open(path: &Path) -> Result<Connection> {
     if !(0..=latest).contains(&version) {
         return Err(format!(
             "it uses database schema version {version}, but this version of wot only knows \
-             up to {latest}. The database is rebuilt from the logs, so delete it or pass a \
-             different --db"
+             up to {latest}. It holds your decisions and notes, so use a newer wot rather than \
+             deleting it, or pass a different --db"
         )
         .into());
     }
@@ -774,7 +830,10 @@ mod tests {
                 "SELECT (SELECT count(*) FROM sessions) + (SELECT count(*) FROM host_groups)
                         + (SELECT count(*) FROM people) + (SELECT count(*) FROM session_cuts)
                         + (SELECT count(*) FROM activity)
-                        + (SELECT count(*) FROM people WHERE kind <> 'person')",
+                        + (SELECT count(*) FROM people WHERE kind <> 'person')
+                        + (SELECT count(*) FROM person_notes)
+                        + (SELECT count(*) FROM channel_reviews)
+                        + (SELECT count(*) FROM who_lists) + (SELECT count(*) FROM who_entries)",
                 [],
                 |row| row.get(0),
             )
