@@ -40,9 +40,9 @@ const HEAD_LEN: u64 = 1024;
 /// The schema, as the steps that build it. SQLite's `user_version` stores how
 /// many steps a database has had, so an older database is brought up to date
 /// by running the steps it is missing.
-const MIGRATIONS: [&str; 11] = [
+const MIGRATIONS: [&str; 12] = [
     SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8,
-    SCHEMA_V9, SCHEMA_V10, SCHEMA_V11,
+    SCHEMA_V9, SCHEMA_V10, SCHEMA_V11, SCHEMA_V12,
 ];
 
 const SCHEMA_V1: &str = "
@@ -436,6 +436,36 @@ const SCHEMA_V11: &str = "
 -- The logging client's own sessions now count like anyone else's, in
 -- activity, nick spans and channel totals. Without totals, the next
 -- wot analyze rebuilds them.
+DELETE FROM file_totals;
+";
+
+const SCHEMA_V12: &str = "
+-- Spoken lines by file and nick, so finding what a session said reads only
+-- its own lines, not every line it heard. Nicks compare ignoring case, as
+-- lower() does.
+CREATE INDEX events_spoken ON events (file_id, nick COLLATE NOCASE, line)
+    WHERE kind IN ('message', 'action');
+
+-- An identity's nicks, and the identities seen on a host, for the pages that
+-- look these up once per row and for checking a channel's users.
+CREATE INDEX identity_keys_by_identity ON identity_keys (identity_id, nick);
+CREATE INDEX identity_keys_by_host ON identity_keys (tag, host COLLATE NOCASE, ident);
+
+-- Spoken lines and distinct nicks by channel and day, and distinct nicks by
+-- channel, rebuilt with the sessions, so a channel's page reads a row a day
+-- instead of every line.
+CREATE TABLE channel_days (
+    tag TEXT NOT NULL,
+    channel TEXT NOT NULL,
+    -- YYYY-MM-DD.
+    date TEXT NOT NULL,
+    spoken INTEGER NOT NULL,
+    nicks INTEGER NOT NULL,
+    PRIMARY KEY (tag, channel, date)
+) WITHOUT ROWID;
+ALTER TABLE channel_totals ADD COLUMN nicks INTEGER NOT NULL DEFAULT 0;
+
+-- Without totals, the next wot analyze rebuilds and fills channel_days.
 DELETE FROM file_totals;
 ";
 
@@ -1064,7 +1094,8 @@ mod tests {
                         + (SELECT count(*) FROM ignored_tags)
                         + (SELECT count(*) FROM networks) + (SELECT count(*) FROM network_tags)
                         + (SELECT count(*) FROM left_out_lines)
-                        + (SELECT count(*) FROM replayed_lines) + (SELECT count(*) FROM bouncer_tags)",
+                        + (SELECT count(*) FROM replayed_lines) + (SELECT count(*) FROM bouncer_tags)
+                        + (SELECT count(*) FROM channel_days)",
                 [],
                 |row| row.get(0),
             )

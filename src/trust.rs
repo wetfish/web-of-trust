@@ -611,12 +611,13 @@ fn identities_matching(
         conditions.push(format!("k.ident = ?{}", values.len()));
     }
     if !hosts.is_empty() {
+        // An IN list rather than ORs, so the host index can be used.
         let mut any = Vec::new();
         for host in hosts {
             values.push(host.clone());
-            any.push(format!("k.host = ?{} COLLATE NOCASE", values.len()));
+            any.push(format!("?{}", values.len()));
         }
-        conditions.push(format!("({})", any.join(" OR ")));
+        conditions.push(format!("k.host COLLATE NOCASE IN ({})", any.join(", ")));
     }
     let mut stmt = conn.prepare(&format!(
         "SELECT k.identity_id, max(s.end_at) AS seen FROM identity_keys k

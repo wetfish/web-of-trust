@@ -417,20 +417,20 @@ pub fn years(months: &[(String, Totals)]) -> Vec<(String, Totals)> {
 
 /// The years and the channels, by tag, that have any activity, for filters.
 pub fn choices(conn: &Connection) -> Result<(Vec<String>, Vec<(String, String)>)> {
+    // From the small tables rebuilt with the sessions rather than from the
+    // activity table, which has a row for every identity, channel and month.
     let years = {
         let mut stmt =
-            conn.prepare("SELECT DISTINCT substr(month, 1, 4) FROM activity ORDER BY 1 DESC")?;
+            conn.prepare("SELECT DISTINCT substr(date, 1, 4) FROM channel_days ORDER BY 1 DESC")?;
         let rows = stmt
             .query_map([], |row| row.get(0))?
             .collect::<rusqlite::Result<_>>()?;
         rows
     };
     let channels = {
-        let mut stmt = conn.prepare(
-            "SELECT DISTINCT tag, channel FROM activity WHERE channel <> ?1 ORDER BY 1, 2",
-        )?;
+        let mut stmt = conn.prepare("SELECT tag, channel FROM channel_totals ORDER BY 1, 2")?;
         let rows = stmt
-            .query_map(params![ALL_CHANNELS], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
             .collect::<rusqlite::Result<_>>()?;
         rows
     };

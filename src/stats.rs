@@ -208,16 +208,14 @@ pub fn channel_days(conn: &Connection, tag: &str, name: &str) -> Result<Option<C
         return Ok(None);
     }
 
-    // Second copies of lines logged twice, and a bouncer's own lines, are
-    // left out.
-    let spoken_in = "file_id IN (SELECT id FROM files WHERE tag = ?1 AND target = ?2)
-                     AND kind IN ('message', 'action') AND date IS NOT NULL
-                     AND NOT EXISTS (SELECT 1 FROM left_out_lines d WHERE d.event_id = events.id)";
+    // Counted when the sessions were rebuilt, leaving out second copies of
+    // lines logged twice and a bouncer's own lines, so a busy channel reads a
+    // row a day rather than every line it ever had.
     let days: Vec<Day> = {
-        let mut stmt = conn.prepare(&format!(
-            "SELECT date, count(*), count(DISTINCT lower(nick)) FROM events
-             WHERE {spoken_in} GROUP BY date ORDER BY date"
-        ))?;
+        let mut stmt = conn.prepare(
+            "SELECT date, spoken, nicks FROM channel_days
+             WHERE tag = ?1 AND channel = ?2 ORDER BY date",
+        )?;
         let rows = stmt
             .query_map(params![tag, name], |row| {
                 Ok(Day {
@@ -229,11 +227,14 @@ pub fn channel_days(conn: &Connection, tag: &str, name: &str) -> Result<Option<C
             .collect::<rusqlite::Result<_>>()?;
         rows
     };
-    let nicks = conn.query_row(
-        &format!("SELECT count(DISTINCT lower(nick)) FROM events WHERE {spoken_in}"),
-        params![tag, name],
-        |row| row.get(0),
-    )?;
+    let nicks = conn
+        .query_row(
+            "SELECT nicks FROM channel_totals WHERE tag = ?1 AND channel = ?2",
+            params![tag, name],
+            |row| row.get(0),
+        )
+        .optional()?
+        .unwrap_or(0);
 
     Ok(Some(ChannelDays {
         tag: tag.to_string(),

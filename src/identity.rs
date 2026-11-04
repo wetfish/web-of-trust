@@ -33,6 +33,7 @@
 //! `ident@host` combinations belong to which id. When two identities merge,
 //! the older id wins and the other records `merged_into`.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime, TimeDelta};
@@ -199,7 +200,8 @@ pub fn rebuild_with_progress(
     let mut rules = load_rules(&tx)?;
     // Second copies of lines logged twice are left out of everything below.
     let duplicates = duplicates::find(&tx, progress)?;
-    let (sessions, day_marks) = replay_events(&tx, &mut rules.cuts, &duplicates, progress)?;
+    let (sessions, day_marks, spoken_days) =
+        replay_events(&tx, &mut rules.cuts, &duplicates, progress)?;
 
     let mut summary = RebuildSummary {
         sessions: sessions.len(),
@@ -302,7 +304,13 @@ pub fn rebuild_with_progress(
         }
     }
 
-    save_totals(&tx, &sessions, &identity_of, &duplicates.by_target)?;
+    save_totals(
+        &tx,
+        &sessions,
+        &identity_of,
+        &duplicates.by_target,
+        &spoken_days,
+    )?;
     duplicates::save(&tx, &duplicates)?;
     progress.done(&format!("{} sessions", thousands(sessions.len() as u64)));
 
@@ -339,17 +347,20 @@ pub fn rebuild_with_progress(
     Ok(summary)
 }
 
-/// Saves the totals the overview shows: per file, its spoken lines, joins and
-/// first and last session; per channel, its identities and those that spoke,
-/// the logging client included.
+/// Saves the totals the overview and channel pages show: per file, its
+/// spoken lines, joins and first and last session; per channel, its
+/// identities and those that spoke, the logging client included, and its
+/// distinct nicks; and per channel and day, its spoken lines and nicks.
 fn save_totals(
     tx: &Connection,
     sessions: &[Session],
     identity_of: &[&str],
     duplicates: &HashMap<(String, String), i64>,
+    spoken_days: &SpokenDays,
 ) -> Result<()> {
     tx.execute("DELETE FROM file_totals", [])?;
     tx.execute("DELETE FROM channel_totals", [])?;
+    tx.execute("DELETE FROM channel_days", [])?;
 
     let mut files: HashMap<i64, (i64, i64, NaiveDateTime, NaiveDateTime)> = HashMap::new();
     type People<'a> = (HashSet<&'a str>, HashSet<&'a str>);
@@ -387,8 +398,9 @@ fn save_totals(
         ])?;
     }
     let mut insert = tx.prepare(
-        "INSERT OR REPLACE INTO channel_totals (tag, channel, identities, speakers, duplicates)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
+        "INSERT OR REPLACE INTO channel_totals
+             (tag, channel, identities, speakers, duplicates, nicks)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
     )?;
     for ((tag, channel), (identities, speakers)) in channels {
         let merged = duplicates
@@ -400,10 +412,95 @@ fn save_totals(
             channel,
             identities.len() as i64,
             speakers.len() as i64,
-            merged
+            merged,
+            spoken_days.nicks(tag, channel)
         ])?;
     }
+    let mut insert = tx.prepare(
+        "INSERT INTO channel_days (tag, channel, date, spoken, nicks)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+    )?;
+    for ((tag, channel), days) in &spoken_days.by_channel {
+        for (date, (spoken, nicks)) in days {
+            insert.execute(params![tag, channel, date, spoken, nicks.len() as i64])?;
+        }
+    }
     Ok(())
+}
+
+/// Spoken lines and the nicks that said them, by channel and day, gathered
+/// while the events are replayed, for the channel pages. Lines left out, such
+/// as second copies of lines logged twice, are not counted, as everywhere.
+#[derive(Default)]
+struct SpokenDays {
+    /// Each nick, lowercased as SQLite's `lower()` does, numbered so that a
+    /// day holds numbers rather than names.
+    numbers: HashMap<String, u32>,
+    /// By file while replaying: by day, the lines and the nicks that said
+    /// them.
+    by_file: HashMap<i64, BTreeMap<String, (i64, HashSet<u32>)>>,
+    /// The same by network tag and channel, once replaying is done.
+    by_channel: HashMap<(String, String), BTreeMap<String, (i64, HashSet<u32>)>>,
+}
+
+impl SpokenDays {
+    /// Counts a message or action said in a channel log.
+    fn add(&mut self, file_id: i64, date: &str, nick: Option<&str>) {
+        let number = nick.map(|nick| {
+            let lower = if nick.bytes().any(|b| b.is_ascii_uppercase()) {
+                Cow::Owned(nick.to_ascii_lowercase())
+            } else {
+                Cow::Borrowed(nick)
+            };
+            match self.numbers.get(lower.as_ref()) {
+                Some(number) => *number,
+                None => {
+                    let number = self.numbers.len() as u32;
+                    self.numbers.insert(lower.into_owned(), number);
+                    number
+                }
+            }
+        });
+        let days = self.by_file.entry(file_id).or_default();
+        if !days.contains_key(date) {
+            days.insert(date.to_string(), (0, HashSet::new()));
+        }
+        if let Some((spoken, nicks)) = days.get_mut(date) {
+            *spoken += 1;
+            nicks.extend(number);
+        }
+    }
+
+    /// Puts the files' days together by channel: the logs of one channel in
+    /// two folders linked into one network count as one channel.
+    fn by_channel(&mut self, files: &HashMap<i64, (String, bool, String)>) {
+        for (file_id, days) in self.by_file.drain() {
+            let Some((tag, _, target)) = files.get(&file_id) else {
+                continue;
+            };
+            let channel = self
+                .by_channel
+                .entry((tag.clone(), target.clone()))
+                .or_default();
+            for (date, (spoken, nicks)) in days {
+                let day = channel.entry(date).or_default();
+                day.0 += spoken;
+                day.1.extend(nicks);
+            }
+        }
+    }
+
+    /// Distinct nicks in a channel over all days.
+    fn nicks(&self, tag: &str, channel: &str) -> i64 {
+        self.by_channel
+            .get(&(tag.to_string(), channel.to_string()))
+            .map_or(0, |days| {
+                days.values()
+                    .flat_map(|(_, nicks)| nicks)
+                    .collect::<HashSet<_>>()
+                    .len() as i64
+            })
+    }
 }
 
 /// The lines over which a session held each of its nicks: the lowercased
@@ -497,7 +594,7 @@ fn replay_events(
     cuts: &mut Cuts,
     duplicates: &duplicates::Duplicates,
     progress: &mut Progress,
-) -> Result<(Vec<Session>, DayMarks)> {
+) -> Result<(Vec<Session>, DayMarks, SpokenDays)> {
     let files: HashMap<i64, (String, bool, String)> = {
         let mut stmt = conn.prepare("SELECT id, tag, kind = 'channel', target FROM files")?;
         let rows = stmt
@@ -523,6 +620,7 @@ fn replay_events(
     let mut rows = stmt.query([])?;
 
     let mut sessions = Vec::new();
+    let mut spoken_days = SpokenDays::default();
     let mut replay: Option<FileReplay> = None;
     while let Some(row) = rows.next()? {
         events += 1;
@@ -561,6 +659,11 @@ fn replay_events(
             detail: row.get(10)?,
             replayed: duplicates.replayed.contains(&id),
         };
+        if matches!(event.kind.as_str(), "message" | "action")
+            && files.get(&event.file_id).is_some_and(|file| file.1)
+        {
+            spoken_days.add(event.file_id, &date, event.nick.as_deref());
+        }
 
         if replay.as_ref().is_none_or(|r| r.file_id != event.file_id) {
             if let Some(finished) = replay.take() {
@@ -585,7 +688,8 @@ fn replay_events(
         thousands(files.len() as u64),
         thousands(sessions.len() as u64)
     ));
-    Ok((sessions, day_marks))
+    spoken_days.by_channel(&files);
+    Ok((sessions, day_marks, spoken_days))
 }
 
 fn parse_at(date: &str, time: &str) -> Option<NaiveDateTime> {
@@ -1238,6 +1342,28 @@ mod tests {
     use super::*;
     use crate::db;
     use crate::discover::{self, tests::TempDir};
+
+    #[test]
+    fn counts_spoken_days_by_channel_across_files() {
+        let mut days = SpokenDays::default();
+        days.add(1, "2026-11-01", Some("Quokka"));
+        days.add(1, "2026-11-01", Some("quokka"));
+        // The same channel in a second folder of the network.
+        days.add(2, "2026-11-01", Some("QUOKKA"));
+        days.add(2, "2026-11-01", Some("marlowe"));
+        days.add(2, "2026-11-02", None);
+        let files = HashMap::from([
+            (1, ("wetfish".to_string(), true, "#a".to_string())),
+            (2, ("wetfish".to_string(), true, "#a".to_string())),
+        ]);
+        days.by_channel(&files);
+        let channel = &days.by_channel[&("wetfish".to_string(), "#a".to_string())];
+        assert_eq!(channel["2026-11-01"].0, 4);
+        assert_eq!(channel["2026-11-01"].1.len(), 2, "quokka once, any case");
+        assert_eq!(channel["2026-11-02"], (1, HashSet::new()));
+        assert_eq!(days.nicks("wetfish", "#a"), 2);
+        assert_eq!(days.nicks("wetfish", "#b"), 0);
+    }
 
     /// Writes log files under one tag, imports them and rebuilds identities.
     fn build(root: &TempDir, files: &[(&str, &str)]) -> (Connection, RebuildSummary) {

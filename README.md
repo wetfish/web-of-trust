@@ -334,6 +334,13 @@ depend on the kind:
 `time` is `HH:MM` for events, `HH:MM:SS` for `log_opened` and `log_closed`, and
 empty for `unparsed` lines.
 
+`events` is indexed by file and line, by file and date, and, for messages and
+actions only, by file, nick ignoring case, and line. The last one,
+`events_spoken`, finds the lines a session said without reading every line it
+heard, which is what makes the history and person pages quick for someone
+present for years. It takes about 20 bytes a message; upgrading a database to
+schema version 12 builds it, which takes a few minutes for gigabytes of logs.
+
 `sessions`, `identities` and `identity_keys` are described under
 [Identities](#identities).
 
@@ -466,7 +473,10 @@ the lines behind any link.
 
 `identity_keys`: `tag`, `nick` (lowercased), `ident` and `host` (both empty for
 nick-only keys), and `identity_id`. Sessions started by a cut have an empty
-`ident` and a `host` of `#cut:` and the cut's id.
+`ident` and a `host` of `#cut:` and the cut's id. Besides its key, it is
+indexed by identity, for the pages that list each identity's nicks, and by
+tag, host ignoring case, and ident, for checking a channel's users and
+counting the identities on a host.
 
 `sessions`:
 
@@ -497,11 +507,16 @@ session's. The [History](#history) page finds lines this way.
 
 `file_totals` (`file_id`, `spoken`, `joins`, `first_at`, `last_at`) and
 `channel_totals` (`tag`, `channel`, `identities`, `speakers`, `duplicates`,
-the second copies of lines logged twice) hold the
-overview's totals, rebuilt with the sessions, so the overview reads a row per
-file and channel instead of adding up millions of sessions. A database
-upgraded since its last rebuild has no totals yet, and `wot analyze` rebuilds
-on its next run.
+the second copies of lines logged twice, and `nicks`, the distinct nicks that
+spoke, ignoring case) hold the overview's totals, rebuilt with the sessions,
+so the overview reads a row per file and channel instead of adding up
+millions of sessions. `channel_days` (`tag`, `channel`, `date`, `spoken`,
+`nicks`) holds each channel's spoken lines and distinct nicks by day, counted
+while the events are replayed, so a channel's page reads a row a day instead
+of every line the channel ever had; lines left out are not counted. A
+database upgraded since its last rebuild has no totals yet, and `wot analyze`
+rebuilds on its next run. Upgrading to schema version 12 clears them, so run
+`wot analyze` once before `wot review`.
 
 ## Reviewing in a browser
 
@@ -703,6 +718,14 @@ Lines are found through each session's nick spans in `session_nicks`, kept
 with the sessions: a line belongs to a session when its nick is the one the
 session held on that line. Someone who takes a nick after its owner changed
 away from it is never mistaken for the owner.
+
+A page of lines reads the sessions that ended most recently first, each
+newest line first, through the `events_spoken` index, and stops once no
+older session can add a line to the page: no line is later than the end of
+its session. So a page takes the same short time however much someone said,
+while sorting everything a talkative person ever said would mean sorting
+over a million lines. Searching for text reads every line until a page is
+found, so a search for something rare takes longer.
 
 A day counts as present when a session in a channel covered any part of it,
 so a session through a bouncer counts on every day it lasted. A session
