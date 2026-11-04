@@ -796,8 +796,8 @@ fn event_row<'a>(line: &Line<'a>, raw: &'a str) -> Option<EventRow<'a>> {
     Some(row)
 }
 
-/// The columns for an event. The README lists what each column holds for
-/// each kind.
+/// The columns for an event. `docs/database.md` lists what each column holds
+/// for each kind.
 fn event_columns<'a>(event: &Event<'a>) -> EventRow<'a> {
     let row = EventRow::default();
     match *event {
