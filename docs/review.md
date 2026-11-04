@@ -38,10 +38,10 @@ identities rebuild them, which the terminal shows step by step.
 - **Identities:** search by nick, ident, host or person. Tick results to
   make them a person or bot, or add them to one. A search by host also lists
   the matching hosts, to group them.
-- **Identity:** one identity: who it is, the line marking it for lurker,
-  its activity by month, its nicks, hosts, channels and nick changes, where a
-  [cut](identities.md#cuts) can be made. An identity that belongs to a person
-  gets the person's line.
+- **Identity:** one identity: who they are, the line marking them for
+  lurker, their activity by month, their nicks, hosts, channels and nick
+  changes, where a [cut](identities.md#cuts) can be made. An identity that
+  belongs to a person gets the person's line.
 - **People and bots:** everyone you recorded, most trusted first.
 - **Person:** who they are across all their identities, when they were last
   active, the line marking them for lurker, the last lines they said, their

@@ -93,7 +93,7 @@ fn page(
             "Activity in channels, by identity. Private messages are left out, since they only "
             "show conversations with the logging client, which counts like anyone else. "
             strong { "Heard" } " counts the lines said in a channel while the identity was there, "
-            "its own included; " strong { "share" } " is how much of that it said itself. "
+            "their own included; " strong { "share" } " is how much of that they said themselves. "
             "Someone present for a long time with a share near zero is listening, not talking; "
             "present on " (trust::SILENT_DAYS) " days or more without a single line, they get a "
             "red flag."
@@ -161,9 +161,9 @@ fn page(
                             th { "Person" }
                             th { "Nicks" }
                             th.num title="Days with a session in the channel" { "Days present" }
-                            th.num title="Days on which it said anything" { "Active days" }
+                            th.num title="Days on which they said anything" { "Active days" }
                             th.num { "Time" }
-                            th.num title="Lines said while it was present, its own included" { "Heard" }
+                            th.num title="Lines said while they were present, their own included" { "Heard" }
                             th.num { "Spoken" }
                             th.num title="Spoken lines as a share of the lines heard" { "Share" }
                             th.num title="Messages sent in private messages to the logging client" { "Private" }
@@ -280,7 +280,7 @@ pub(super) fn identity_section(
     html! {
         h2 { "Activity" }
         @if bot {
-            p.note { "It belongs to a bot, so activity rankings leave it out." }
+            p.note { "This identity belongs to a bot, which activity rankings leave out." }
         }
         @if months.is_empty() {
             p.muted { "No channel activity." }
@@ -298,7 +298,7 @@ pub(super) fn identity_section(
                 (silent_flag(total.days_present))
                 " Present in channels on " (number(total.days_present))
                 " days without saying a line: watching, not taking part. Pasted user lists "
-                "count it as untrusted until it belongs to someone rated vouched or known."
+                "count them as untrusted until they belong to someone rated vouched or known."
             }
         }
         @if total.spoken == 0 {
@@ -317,7 +317,7 @@ pub(super) fn identity_section(
                 summary { "By month" }
                 p.note {
                     "Each bar is the month's days present, in grey, compared with the busiest "
-                    "month. The days it spoke fill it in "
+                    "month. The days they spoke fill it in "
                     span.legend-spoke { "green" } ", so a bar with no green is a month of "
                     "listening without a word."
                 }

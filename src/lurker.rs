@@ -4,14 +4,15 @@
 //! #FBI_watchlist as untrusted ones.
 //!
 //! A line is a command for lurker, such as
-//! `/msg lurker trusted marlowe grace=5m silent=2025-08-04 activity=daily year=2024`,
+//! `/msg lurker trusted marlowe grace=0m silent=2025-08-04 activity=daily year=2024`,
 //! for you to check, change and paste into irssi, which sends it to lurker
 //! in a private message, so channels don't see who is marked. Its fields are
 //! lurker's own:
 //!
 //! - **Room:** trusted for someone rated vouched or known, untrusted for
 //!   everyone else, including identities linked to no one.
-//! - **grace:** always 5 minutes, to change before sending.
+//! - **grace:** always 0 minutes, so lurker acts as soon as it warns them,
+//!   to change before sending when someone should have longer.
 //! - **silent:** the last day they spoke in a channel, or the first day they
 //!   were seen if they never spoke.
 //! - **activity** and **year**, for trusted lurkers only: how often they
@@ -128,7 +129,7 @@ impl Lurker {
     }
 
     /// The command to send, such as
-    /// `/msg lurker untrusted quokka grace=5m silent=2024-03-11`.
+    /// `/msg lurker untrusted quokka grace=0m silent=2024-03-11`.
     pub fn line(&self) -> String {
         let mut line = format!(
             "{PREFIX} {} {} grace={GRACE}",
@@ -409,27 +410,27 @@ mod tests {
         active.insert(date("2025-08-04"), Day::default());
         assert_eq!(
             Lurker::new("marlowe", Rating::Vouched, &active).line(),
-            "/msg lurker trusted marlowe grace=5m silent=2024-02-29 activity=daily year=2024"
+            "/msg lurker trusted marlowe grace=0m silent=2024-02-29 activity=daily year=2024"
         );
         // Untrusted lurkers get no activity, which lurker refuses for them.
         assert_eq!(
             Lurker::new("quokka", Rating::Neutral, &active).line(),
-            "/msg lurker untrusted quokka grace=5m silent=2024-02-29"
+            "/msg lurker untrusted quokka grace=0m silent=2024-02-29"
         );
         let quiet = spoke_on(on(&["2024-03-11"]));
         assert_eq!(
             Lurker::new("quokka", Rating::Wary, &quiet).line(),
-            "/msg lurker untrusted quokka grace=5m silent=2024-03-11"
+            "/msg lurker untrusted quokka grace=0m silent=2024-03-11"
         );
         let mut never = BTreeMap::new();
         never.insert(date("2023-06-01"), Day::default());
         assert_eq!(
             Lurker::new("lindqvist", Rating::Known, &never).line(),
-            "/msg lurker trusted lindqvist grace=5m silent=2023-06-01"
+            "/msg lurker trusted lindqvist grace=0m silent=2023-06-01"
         );
         assert_eq!(
             Lurker::new("lindqvist", Rating::Distrusted, &BTreeMap::new()).line(),
-            "/msg lurker untrusted lindqvist grace=5m"
+            "/msg lurker untrusted lindqvist grace=0m"
         );
     }
 }

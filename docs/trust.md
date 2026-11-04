@@ -50,10 +50,10 @@ wot people invited-by quokka rachel
 For each identity, channel and month, `wot` counts:
 
 - **Days present:** days with a session in the channel.
-- **Active days:** days it said anything.
+- **Active days:** days they said anything.
 - **Time:** time present, counting overlapping sessions once.
-- **Heard:** lines said in the channel while it was there.
-- **Spoken:** lines it said itself.
+- **Heard:** lines said in the channel while they were there.
+- **Spoken:** lines they said themselves.
 - **Share:** spoken as a share of heard. Present for months with a share
   near zero means listening, not talking.
 
@@ -130,8 +130,8 @@ Paste it into irssi, which sends it to lurker in a private message, so
 channels don't see who is being marked:
 
 ```text
-/msg lurker untrusted quokka grace=5m silent=2024-03-11
-/msg lurker trusted marlowe grace=5m silent=2025-08-04 activity=daily year=2024
+/msg lurker untrusted quokka grace=0m silent=2024-03-11
+/msg lurker trusted marlowe grace=0m silent=2025-08-04 activity=daily year=2024
 ```
 
 - **Room:** `trusted`, for #purgatory, when rated vouched or known;
@@ -139,8 +139,8 @@ channels don't see who is being marked:
   that belong to no one. Bots get no line. An identity that belongs to a
   person gets the person's line, from all their identities.
 - **Nick:** the nick they used most recently.
-- **grace:** always `5m`. Change it before sending if they should have
-  longer.
+- **grace:** always `0m`, so lurker moves them as soon as it has warned
+  them. Change it before sending if they should have longer.
 - **silent:** the last day they spoke in a channel, or the first day they
   were seen if they never spoke.
 - **activity** and **year**, for trusted lurkers only: how often they

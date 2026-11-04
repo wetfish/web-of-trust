@@ -69,8 +69,8 @@ From there:
   person as far as the logs can tell.
 - **People:** identities you say are one human, with your rating, notes and
   who invited them. Bots are recorded the same way.
-- **Activity:** for each identity, how many days it was present in each
-  channel, how much it heard and how much it said.
+- **Activity:** for each identity, how many days they were present in each
+  channel, how much they heard and how much they said.
 - **Trust:** your rating together with an activity score, which flags
   accounts that watch without taking part.
 

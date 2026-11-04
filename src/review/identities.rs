@@ -458,7 +458,7 @@ async fn identity_page(
             .ok_or_else(|| {
                 PageError::not_found(format!(
                     "There is no identity {} with sessions. Identities change when logs are \
-                     imported or decisions are made; search for it by nick instead.",
+                     imported or decisions are made; search for them by nick instead.",
                     query.id
                 ))
             })?;
@@ -624,7 +624,7 @@ fn identity(view: &IdentityView, context: &Context) -> Markup {
             @if !context.changes.is_empty() {
                 a href="#changes" { "Nick changes" }
             }
-            a href=(identity_history_href(&view.id)) { "Everything it said" }
+            a href=(identity_history_href(&view.id)) { "Everything they said" }
         }
 
         section.decision id="person" {
@@ -656,7 +656,7 @@ fn identity(view: &IdentityView, context: &Context) -> Markup {
                         @if people.len() > 1 {
                             span.warning {
                                 "Conflict: identities added to different people were merged "
-                                "since. Remove it from the wrong one. "
+                                "since. Remove this identity from the wrong one. "
                             }
                         }
                         "Belongs to " @if context.bot { "the bot " } (people_links(people)) "."
@@ -674,7 +674,7 @@ fn identity(view: &IdentityView, context: &Context) -> Markup {
 
         section id="activity" {
             (identity_section(&context.months, &context.score, context.private_spoken, context.bot))
-            p { a href=(identity_history_href(&view.id)) { "Everything it said, and the days it was present" } }
+            p { a href=(identity_history_href(&view.id)) { "Everything they said, and the days they were present" } }
         }
 
         section id="nicks" {
@@ -1153,6 +1153,9 @@ pub(super) mod tests {
         assert!(page.contains("/identities?host=bridge.example.net"));
         assert!(page.contains("<strong>Quokka Wet</strong> (2026-11-03)"));
         assert!(page.contains(r#"href="/history?id=1a2b3c4d5e6f""#));
+        // Identities are they, not it.
+        assert!(page.contains("Everything they said, and the days they were present"));
+        assert!(!page.contains("Everything it said"));
 
         // The page is named after the most recent nick, and says who the
         // identity is before asking what to do with it.
@@ -1166,7 +1169,7 @@ pub(super) mod tests {
         // Belonging to no one, it is marked untrusted by its latest nick,
         // with a copy button the script shows.
         assert!(
-            page.contains(r#"value="/msg lurker untrusted rachelaway grace=5m silent=2026-11-01""#)
+            page.contains(r#"value="/msg lurker untrusted rachelaway grace=0m silent=2026-11-01""#)
         );
         assert!(page.contains(r#"<button type="button" data-copy="lurker-line" hidden>Copy"#));
         assert!(!page.contains("across all their identities"));

@@ -1110,7 +1110,7 @@ mod tests {
         assert!(!page.contains("Silent"));
 
         // The command for lurker, by their latest nick, in the summary.
-        assert!(page.contains(r#"value="/msg lurker trusted quokka grace=5m silent=2026-10-01""#));
+        assert!(page.contains(r#"value="/msg lurker trusted quokka grace=0m silent=2026-10-01""#));
         assert!(at(r#"id="lurker-line""#) < at(r#"<section id="said">"#));
         // Bots are not lurkers.
         let bot = self::page(&record("relay", Kind::Bot), &views, &context).into_string();
