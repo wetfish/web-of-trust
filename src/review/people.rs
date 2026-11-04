@@ -11,7 +11,7 @@ use chrono::NaiveDate;
 use maud::{Markup, html};
 use serde::Deserialize;
 
-use super::activity::activity_breakdown;
+use super::activity::{activity_breakdown, person_section};
 use super::history::{person_history_href, said};
 use super::identities::{
     Ticks, identity_table, lurker_of, nick_rows, recent_connections, summary_connections,
@@ -22,6 +22,7 @@ use super::layout::{
     url_encode,
 };
 use super::{App, Flash, PageError, PageResult, back_to, done, failed, filled, internal, with_db};
+use crate::activity::{self, Totals};
 use crate::decide;
 use crate::history::{self, Day, Line};
 use crate::lookup::{self, Filter};
@@ -249,6 +250,8 @@ async fn person_page(
         let today: String = conn
             .query_row("SELECT date('now')", [], |row| row.get(0))
             .map_err(internal)?;
+        let days = history::days(conn, &ids).map_err(internal)?;
+        let spans = lookup::channel_spans(views.iter().flat_map(|view| &view.sessions));
         let context = PersonContext {
             all: filled(&query.all) == Some("yes"),
             activity: trust::activity_score(
@@ -263,7 +266,8 @@ async fn person_page(
                 .filter(|(name, kind)| *kind == Kind::Person && *name != person.name)
                 .map(|(name, _)| name)
                 .collect(),
-            days: history::days(conn, &ids).map_err(internal)?,
+            months: activity::combined_months(&days, &spans),
+            days,
             last_said,
             real_names,
             today: NaiveDate::parse_from_str(&today, "%Y-%m-%d").ok(),
@@ -291,6 +295,8 @@ struct PersonContext {
     inviters: Vec<String>,
     /// The days any of their identities was present in a channel.
     days: BTreeMap<NaiveDate, Day>,
+    /// Their channel activity by month, all their identities together.
+    months: Vec<(String, Totals)>,
     /// The most recent lines they said in channels, newest first.
     last_said: Vec<Line>,
     /// Real names `/who` showed for any of their identities, with when each
@@ -499,6 +505,7 @@ fn page(person: &Person, views: &[lookup::IdentityView], context: &PersonContext
 
         nav.on-page aria-label="On this page" {
             a href="#said" { "Last said" }
+            a href="#activity" { "Activity" }
             a href="#trust" { "Trust" }
             a href="#notes" { "Notes" }
             a href="#identities" { "Identities" }
@@ -509,6 +516,11 @@ fn page(person: &Person, views: &[lookup::IdentityView], context: &PersonContext
         section id="said" {
             h2 { "Last said" }
             (last_said(person, &context.last_said))
+        }
+
+        section id="activity" {
+            h2 { "Activity" }
+            (person_section(&context.months))
         }
 
         section.decision id="trust" {
@@ -1009,6 +1021,7 @@ mod tests {
             activity: ActivityScore::default(),
             inviters: vec!["rachel".into()],
             days: BTreeMap::new(),
+            months: Vec::new(),
             last_said: Vec::new(),
             real_names: Vec::new(),
             today: NaiveDate::from_ymd_opt(2026, 11, 3),
@@ -1061,8 +1074,11 @@ mod tests {
                 },
             )
         };
+        let days = BTreeMap::from([day("2024-12-11", 0), day("2026-10-01", 2)]);
+        let spans = lookup::channel_spans(views.iter().flat_map(|view| &view.sessions));
         let context = PersonContext {
-            days: BTreeMap::from([day("2024-12-11", 0), day("2026-10-01", 2)]),
+            months: activity::combined_months(&days, &spans),
+            days,
             last_said: vec![Line {
                 date: "2026-10-01".into(),
                 time: "11:30".into(),
@@ -1108,6 +1124,17 @@ mod tests {
         assert!(at(r#"id="trust""#) < at(r#"id="manage""#));
         assert!(at(r#"id="manage""#) < at(r#"name="kind" value="bot""#));
         assert!(!page.contains("Silent"));
+
+        // Activity by month of both identities together, after the last
+        // lines: the hour in two channels at once counts once, and there is
+        // no column of lines heard.
+        assert!(at(r#"<section id="said">"#) < at(r#"<section id="activity">"#));
+        assert!(at(r#"<section id="activity">"#) < at(r#"id="trust""#));
+        assert!(page.contains(
+            r#"<td>2026-10</td><td class="num">1</td><td class="num">1</td><td class="num">2h</td><td class="num">2</td>"#
+        ));
+        assert!(page.contains("<td>2024-12</td>"));
+        assert!(page.contains(r##"<a href="#activity">Activity</a>"##));
 
         // The command for lurker, by their latest nick, in the summary.
         assert!(page.contains(r#"value="/msg lurker trusted quokka grace=0m silent=2026-10-01""#));

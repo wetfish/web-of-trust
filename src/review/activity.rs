@@ -1,4 +1,5 @@
-//! The activity ranking and the activity section of an identity's page.
+//! The activity ranking, and the activity sections of identity and person
+//! pages.
 
 use axum::Router;
 use axum::extract::{Query, State};
@@ -312,24 +313,76 @@ pub(super) fn identity_section(
             }
         }
         @if !months.is_empty() {
-            (totals_table("Year", &years, None))
+            (totals_table("Year", &years, None, Columns::All))
             details {
                 summary { "By month" }
-                p.note {
-                    "Each bar is the month's days present, in grey, compared with the busiest "
-                    "month. The days they spoke fill it in "
-                    span.legend-spoke { "green" } ", so a bar with no green is a month of "
-                    "listening without a word."
-                }
-                (totals_table("Month", months, Some(busiest)))
+                (bar_note())
+                (totals_table("Month", months, Some(busiest), Columns::All))
             }
         }
     }
 }
 
+/// The activity of a person or bot, all their identities together, by year
+/// and by month, as `activity::combined_months` adds it up. Lines heard and
+/// the share are left out, since identities present at once heard the same
+/// lines. The months show without being opened.
+pub(super) fn person_section(months: &[(String, Totals)]) -> Markup {
+    let years = activity::years(months);
+    let busiest = months
+        .iter()
+        .map(|(_, totals)| totals.days_present)
+        .max()
+        .unwrap_or(0);
+    html! {
+        @if months.is_empty() {
+            p.muted { "No channel activity." }
+        } @else {
+            p.note {
+                "All their identities together. A day or an hour two of them were present counts "
+                "once, so being online from two devices at once doesn't count twice."
+            }
+            (totals_table("Year", &years, None, Columns::Spoken))
+            details open {
+                summary { "By month" }
+                (bar_note())
+                (totals_table("Month", months, Some(busiest), Columns::Spoken))
+            }
+        }
+    }
+}
+
+/// How to read the bars of activity by month.
+fn bar_note() -> Markup {
+    html! {
+        p.note {
+            "Each bar is the month's days present, in grey, compared with the busiest "
+            "month. The days they spoke fill it in "
+            span.legend-spoke { "green" } ", so a bar with no green is a month of "
+            "listening without a word."
+        }
+    }
+}
+
+/// Which columns an activity table has.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Columns {
+    /// Every column, for one identity.
+    All,
+    /// Without lines heard and the share, for several identities together,
+    /// whose lines heard can't be added up.
+    Spoken,
+}
+
 /// A table of activity by period. With `busiest`, each row also has a bar of
 /// its days present compared with the busiest period.
-fn totals_table(period: &str, rows: &[(String, Totals)], busiest: Option<i64>) -> Markup {
+fn totals_table(
+    period: &str,
+    rows: &[(String, Totals)],
+    busiest: Option<i64>,
+    columns: Columns,
+) -> Markup {
+    let heard = columns == Columns::All;
     html! {
         div.scroll {
             table {
@@ -339,9 +392,9 @@ fn totals_table(period: &str, rows: &[(String, Totals)], busiest: Option<i64>) -
                         th.num { "Days present" }
                         th.num { "Active days" }
                         th.num { "Time" }
-                        th.num { "Heard" }
+                        @if heard { th.num { "Heard" } }
                         th.num { "Spoken" }
-                        th.num { "Share" }
+                        @if heard { th.num { "Share" } }
                         @if busiest.is_some() {
                             th.bar-cell { "Present, and spoke" }
                         }
@@ -354,9 +407,9 @@ fn totals_table(period: &str, rows: &[(String, Totals)], busiest: Option<i64>) -
                             td.num { (number(totals.days_present)) }
                             td.num { (number(totals.active_days)) }
                             td.num { (duration(totals.minutes)) }
-                            td.num { (number(totals.heard)) }
+                            @if heard { td.num { (number(totals.heard)) } }
                             td.num { (number(totals.spoken)) }
-                            td.num { (share(totals)) }
+                            @if heard { td.num { (share(totals)) } }
                             @if let Some(busiest) = busiest {
                                 td.bar-cell {
                                     (presence_bar(totals, busiest))
@@ -493,5 +546,26 @@ mod tests {
         assert!(page.contains("Never spoke in a channel, but sent 12 private messages"));
         assert!(page.contains("belongs to a bot"));
         assert!(page.contains("<td>2026</td>"));
+        assert!(page.contains("<th class=\"num\">Heard</th>"));
+    }
+
+    #[test]
+    fn shows_a_persons_months_open_without_lines_heard() {
+        let months = [
+            ("2025-12".to_string(), totals(0, 4)),
+            ("2026-11".to_string(), totals(0, 2)),
+        ];
+        let page = person_section(&months).into_string();
+        assert!(page.contains("<details open>"));
+        assert!(page.contains("<td>2025-12</td>"));
+        assert!(page.contains("<td>2025</td>"));
+        assert!(page.contains("<th class=\"num\">Spoken</th>"));
+        assert!(!page.contains("Heard"));
+        assert!(!page.contains("Share"));
+        assert!(page.contains(r#"class="presence""#));
+        assert_eq!(
+            person_section(&[]).into_string(),
+            r#"<p class="muted">No channel activity.</p>"#
+        );
     }
 }

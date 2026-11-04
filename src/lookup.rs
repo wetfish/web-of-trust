@@ -48,17 +48,25 @@ impl Filter {
     }
 }
 
-/// Minutes present in channels. Sessions that overlap, such as one in each
-/// of several channels or the same channel logged twice, count once, so the
-/// time can never be more than the time from the first session to the last.
-pub fn present_minutes<'a>(sessions: impl IntoIterator<Item = &'a SessionRow>) -> i64 {
+/// When channel sessions started and ended, leaving out private messages and
+/// sessions that lasted no time.
+pub fn channel_spans<'a>(
+    sessions: impl IntoIterator<Item = &'a SessionRow>,
+) -> Vec<(NaiveDateTime, NaiveDateTime)> {
     let at = |at: &str| NaiveDateTime::parse_from_str(at, "%Y-%m-%d %H:%M").ok();
-    let mut spans: Vec<(NaiveDateTime, NaiveDateTime)> = sessions
+    sessions
         .into_iter()
         .filter(|session| session.channel)
         .filter_map(|session| Some((at(&session.start_at)?, at(&session.end_at)?)))
         .filter(|(start, end)| end > start)
-        .collect();
+        .collect()
+}
+
+/// Minutes present in channels. Sessions that overlap, such as one in each
+/// of several channels or the same channel logged twice, count once, so the
+/// time can never be more than the time from the first session to the last.
+pub fn present_minutes<'a>(sessions: impl IntoIterator<Item = &'a SessionRow>) -> i64 {
+    let mut spans = channel_spans(sessions);
     spans.sort();
     let mut minutes = 0;
     let mut open: Option<(NaiveDateTime, NaiveDateTime)> = None;

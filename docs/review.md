@@ -45,7 +45,8 @@ identities rebuild them, which the terminal shows step by step.
 - **People and bots:** everyone you recorded, most trusted first.
 - **Person:** who they are across all their identities, when they were last
   active, the line marking them for lurker, the last lines they said, their
-  trust score, rating, notes and identities.
+  activity by year and month with all their identities together, their trust
+  score, rating, notes and identities.
 - **History:** everything an identity or person said in channels, newest
   first, with filters for a channel, a day and text, and the days they were
   present.

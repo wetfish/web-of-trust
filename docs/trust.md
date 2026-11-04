@@ -60,6 +60,12 @@ For each identity, channel and month, `wot` counts:
 Private messages are left out, since they only show conversations with the
 logging client.
 
+A person's page adds up the activity of all their identities, by year and
+by month. A day or an hour two of their identities were present counts once,
+so being online from a computer and a phone at once doesn't count twice.
+Heard and share are left out there: identities present together heard the
+same lines, and how many they shared isn't kept.
+
 ## Activity score
 
 The activity score, 0 to 100, sums up a person's channel activity, or an

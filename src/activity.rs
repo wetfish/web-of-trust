@@ -26,6 +26,7 @@ use chrono::{NaiveDate, NaiveDateTime};
 use rusqlite::{Connection, params};
 
 use crate::db::Result;
+use crate::history::Day;
 use crate::lookup;
 
 /// The channel of the rows for all channels together. Channel names never
@@ -181,6 +182,36 @@ fn minutes_by_day(start: NaiveDateTime, end: NaiveDateTime) -> Vec<(NaiveDate, i
         }
     }
     days
+}
+
+/// The activity of several identities together, such as a person's, by
+/// month, oldest first: from the days they were in channels and the lines
+/// they said each day, and from when their channel sessions started and
+/// ended. A day or a minute two of them were present counts once, so a
+/// computer and a phone online together are not counted twice. Lines heard
+/// are left at 0: identities present together heard the same lines, and how
+/// many they shared is not stored. Time only counts on the days in `days`.
+pub fn combined_months(
+    days: &BTreeMap<NaiveDate, Day>,
+    spans: &[(NaiveDateTime, NaiveDateTime)],
+) -> Vec<(String, Totals)> {
+    let mut months: BTreeMap<String, Totals> = BTreeMap::new();
+    for (day, totals) in days {
+        let month = months.entry(month_of(*day)).or_default();
+        month.days_present += 1;
+        month.spoken += totals.spoken;
+        if totals.spoken > 0 {
+            month.active_days += 1;
+        }
+    }
+    for (start, end) in merge(spans) {
+        for (day, minutes) in minutes_by_day(start, end) {
+            if days.contains_key(&day) {
+                months.entry(month_of(day)).or_default().minutes += minutes;
+            }
+        }
+    }
+    months.into_iter().collect()
 }
 
 /// Replaces all activity with the activity of these sessions.
@@ -590,5 +621,58 @@ mod tests {
         assert_eq!(years, ["2026"]);
         assert_eq!(channels, [("wetfish".to_string(), "#analysis".to_string())]);
         assert_eq!(super::years(&months)[0].0, "2026");
+    }
+
+    #[test]
+    fn combines_identities_counting_shared_days_and_time_once() {
+        let day = |day: u32, spoken: i64| {
+            (
+                NaiveDate::from_ymd_opt(2026, 11, day).unwrap(),
+                Day {
+                    spoken,
+                    ..Day::default()
+                },
+            )
+        };
+        // Two identities, a computer and a phone, on the 1st at once and
+        // on the 2nd one after the other, then silent on the 30th of
+        // October.
+        let days = BTreeMap::from([
+            day(1, 7),
+            day(2, 0),
+            (
+                NaiveDate::from_ymd_opt(2026, 10, 30).unwrap(),
+                Day::default(),
+            ),
+        ]);
+        let spans = [
+            (at(1, 10, 0), at(1, 12, 0)),
+            (at(1, 11, 0), at(1, 13, 0)),
+            (at(2, 9, 0), at(2, 9, 30)),
+            (at(2, 9, 30), at(2, 10, 0)),
+        ];
+        let months = combined_months(&days, &spans);
+        assert_eq!(
+            months,
+            [
+                (
+                    "2026-10".to_string(),
+                    Totals {
+                        days_present: 1,
+                        ..Totals::default()
+                    }
+                ),
+                (
+                    "2026-11".to_string(),
+                    Totals {
+                        days_present: 2,
+                        active_days: 1,
+                        minutes: 240,
+                        heard: 0,
+                        spoken: 7,
+                    }
+                ),
+            ]
+        );
     }
 }
