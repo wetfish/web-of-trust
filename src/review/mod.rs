@@ -3,11 +3,13 @@
 //! from the log folders already imported, as `wot analyze` does; a folder
 //! never imported needs `wot analyze` once.
 //!
-//! Pages are built on the server with maud and use plain HTML forms, with no
-//! JavaScript. A form posts to an action, which changes the database and
-//! redirects back to a page with a notice or an error in the address, so
-//! reloading a page never repeats an action. Each request opens the database
-//! on a blocking thread, since SQLite calls block.
+//! Pages are built on the server with maud and use plain HTML forms. The
+//! only JavaScript is `copy.js`, which copies text such as a lurker line to
+//! the clipboard; everything else works without it. A form posts to an
+//! action, which changes the database and redirects back to a page with a
+//! notice or an error in the address, so reloading a page never repeats an
+//! action. Each request opens the database on a blocking thread, since
+//! SQLite calls block.
 
 mod activity;
 mod analyze;
@@ -39,6 +41,7 @@ use crate::identity::{self, RebuildSummary};
 use crate::progress::Progress;
 
 const STYLE: &str = include_str!("style.css");
+const COPY_SCRIPT: &str = include_str!("copy.js");
 
 #[derive(Clone)]
 struct App {
@@ -72,6 +75,7 @@ pub fn run(db_path: &Path, port: u16) -> db::Result<()> {
         .merge(networks::routes())
         .merge(analyze::routes())
         .route("/style.css", get(style))
+        .route("/copy.js", get(copy_script))
         .fallback(not_found)
         .with_state(app);
 
@@ -238,6 +242,13 @@ fn rebuild_text(summary: &RebuildSummary) -> String {
 
 async fn style() -> impl IntoResponse {
     ([(header::CONTENT_TYPE, "text/css; charset=utf-8")], STYLE)
+}
+
+async fn copy_script() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        COPY_SCRIPT,
+    )
 }
 
 async fn not_found() -> PageError {

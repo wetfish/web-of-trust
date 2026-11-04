@@ -8,6 +8,7 @@ mod identity;
 mod irssi;
 mod lines;
 mod lookup;
+mod lurker;
 mod progress;
 mod report;
 mod review;

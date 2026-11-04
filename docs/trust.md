@@ -119,3 +119,45 @@ Then they are sorted into lists:
 Each pasted list is kept, so real names from it show on identity and person
 pages. **Mark reviewed** records that you went through a channel's users; a
 review stays valid for six months.
+
+## Lines for lurker
+
+[lurker](https://github.com/wetfish/lurkers) is the Wetfish bot that moves
+people who only watch into one of two rooms until they speak. The summary
+at the top of each person's page, and of each identity's, has the command
+that marks them, in a box to check and change, with a **Copy** button.
+Paste it into irssi, which sends it to lurker in a private message, so
+channels don't see who is being marked:
+
+```text
+/msg lurker untrusted quokka grace=5m silent=2024-03-11
+/msg lurker trusted marlowe grace=5m silent=2025-08-04 activity=daily year=2024
+```
+
+- **Room:** `trusted`, for #purgatory, when rated vouched or known;
+  `untrusted`, for #FBI_watchlist, for everyone else, including identities
+  that belong to no one. Bots get no line. An identity that belongs to a
+  person gets the person's line, from all their identities.
+- **Nick:** the nick they used most recently.
+- **grace:** always `5m`. Change it before sending if they should have
+  longer.
+- **silent:** the last day they spoke in a channel, or the first day they
+  were seen if they never spoke.
+- **activity** and **year**, for trusted lurkers only: how often they
+  chatted in the year they were most active.
+
+Activity comes from the days they spoke, month by month, so two busy months
+count even in an otherwise quiet year. A month is:
+
+- **daily** with lines on at least half its days,
+- **weekly** with lines in at least 3 of its weeks: days 1 to 7, 8 to 14,
+  15 to 21, and 22 to the end,
+- **monthly** with any line.
+
+`activity` is the highest of these reached in at least 2 months of one
+year, and `year` is the year with the most months at it or higher. A tie
+goes to the year with more days spoken, then to the later year. Someone who
+never spoke in 2 months of the same year gets neither.
+
+Dates are in the logs' time zone, while lurker counts days in UTC, so
+`silent` can be a day off from lurker's count.

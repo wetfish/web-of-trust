@@ -7,20 +7,23 @@ use axum::Router;
 use axum::extract::{Query, State};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::get;
+use chrono::NaiveDate;
 use maud::{Markup, html};
 use serde::Deserialize;
 
 use super::activity::identity_section;
 use super::history::identity_history_href;
 use super::layout::{
-    self, back_field, channel_href, day, duration, identity_href, lapse_flag, number, person_href,
-    search_href, silent_flag,
+    self, back_field, channel_href, day, duration, identity_href, lapse_flag, lurker_field, number,
+    person_href, search_href, silent_flag,
 };
 use super::people::record_options;
 use super::{App, Flash, PageError, PageResult, filled, internal, with_db};
 use crate::activity::{self, Totals};
+use crate::history::{self, Day};
 use crate::lookup::{self, Filter, IdentityView, SessionRow};
-use crate::stats::{self, Kind, MatchingHost, NickChange};
+use crate::lurker::Lurker;
+use crate::stats::{self, Kind, MatchingHost, NickChange, Rating};
 use crate::trust::{self, ActivityScore};
 
 /// Search results show at most this many identities.
@@ -439,6 +442,9 @@ struct Context {
     real_names: Vec<(String, String)>,
     /// The person or bot it belongs to.
     record: Option<trust::Record>,
+    /// The command marking it for lurker: its person's, across all their
+    /// identities, or its own when it belongs to no one.
+    lurker: Option<Lurker>,
 }
 
 async fn identity_page(
@@ -479,6 +485,33 @@ async fn identity_page(
                 changes.push((index, lines));
             }
         }
+        let record = trust::records(conn)
+            .map_err(internal)?
+            .of_identity(&view.id)
+            .cloned();
+        // A person's line is the same as on their page, from all their
+        // identities, since lurker wants when they last spoke anywhere.
+        let lurker = match &record {
+            Some(record) if record.kind == Kind::Bot => None,
+            Some(record) => {
+                let filter = Filter {
+                    person: Some(record.name.clone()),
+                    ..Filter::default()
+                };
+                let views = lookup::find(conn, &filter).map_err(internal)?;
+                let days = history::days(conn, &record.identities).map_err(internal)?;
+                lurker_of(
+                    record.kind,
+                    record.rating,
+                    views.iter().flat_map(|view| &view.sessions),
+                    &days,
+                )
+            }
+            None => {
+                let days = history::days(conn, std::slice::from_ref(&view.id)).map_err(internal)?;
+                lurker_of(Kind::Person, Rating::Neutral, &view.sessions, &days)
+            }
+        };
         let context = Context {
             people: stats::people_names(conn).map_err(internal)?,
             groups: stats::group_of_hosts(conn).map_err(internal)?,
@@ -493,10 +526,8 @@ async fn identity_page(
             )
             .map_err(internal)?,
             real_names: trust::real_names(conn, &view.id).map_err(internal)?,
-            record: trust::records(conn)
-                .map_err(internal)?
-                .of_identity(&view.id)
-                .cloned(),
+            record,
+            lurker,
         };
         let title = format!("{} (identity {})", main_nick(&view), view.id);
         Ok(layout::page(&title, &flash, identity(&view, &context)).into_response())
@@ -569,6 +600,18 @@ fn identity(view: &IdentityView, context: &Context) -> Markup {
                 (number(count("nick_only"))) " known by nick only"
                 @if count("cut") > 0 { ", " (number(count("cut"))) " started by a cut" }
                 @if logger > 0 { ", " (number(logger)) " as the logging client" }
+            }
+            @if let Some(lurker) = &context.lurker {
+                dt { "Lurker" }
+                dd {
+                    (lurker_field(lurker))
+                    @if let Some(record) = &context.record {
+                        span.muted {
+                            "For " a href=(person_href(&record.name)) { (record.name) }
+                            ", across all their identities"
+                        }
+                    }
+                }
             }
         }
 
@@ -733,6 +776,21 @@ pub(super) fn nick_rows<'a>(
     let mut nicks: Vec<NickRow> = nicks.into_values().collect();
     nicks.sort_by(|a, b| b.last.cmp(a.last).then(b.order.cmp(&a.order)));
     nicks
+}
+
+/// The command marking someone for lurker, by the nick of `sessions` used
+/// most recently. None for bots, and when no nick was seen.
+pub(super) fn lurker_of<'a>(
+    kind: Kind,
+    rating: Rating,
+    sessions: impl IntoIterator<Item = &'a SessionRow>,
+    days: &BTreeMap<NaiveDate, Day>,
+) -> Option<Lurker> {
+    if kind == Kind::Bot {
+        return None;
+    }
+    let nick = nick_rows(sessions).into_iter().next()?.nick;
+    Some(Lurker::new(&nick, rating, days))
 }
 
 /// The nick the identity used most recently, which names it on its page.
@@ -1059,6 +1117,13 @@ pub(super) mod tests {
                 Some("bridge.example.net"),
             )],
         };
+        let spoke = BTreeMap::from([(
+            NaiveDate::from_ymd_opt(2026, 11, 1).unwrap(),
+            Day {
+                spoken: 3,
+                ..Day::default()
+            },
+        )]);
         let context = Context {
             people: vec![("rachel".into(), Kind::Person), ("relay".into(), Kind::Bot)],
             groups: HashMap::new(),
@@ -1068,6 +1133,7 @@ pub(super) mod tests {
             score: ActivityScore::default(),
             real_names: vec![("Quokka Wet".into(), "2026-11-03 07:00:00".into())],
             record: None,
+            lurker: lurker_of(Kind::Person, Rating::Neutral, &view.sessions, &spoke),
             changes: vec![(
                 0,
                 vec![NickChange {
@@ -1096,6 +1162,23 @@ pub(super) mod tests {
         assert!(at("Connects from") < at(r#"<section class="decision" id="person">"#));
         assert!(page.contains(r#"href="/identities?nick=quokka">quokka</a>"#));
         assert!(page.contains(r##"<a href="#person">Nobody yet</a>"##));
+
+        // Belonging to no one, it is marked untrusted by its latest nick,
+        // with a copy button the script shows.
+        assert!(
+            page.contains(r#"value="/msg lurker untrusted rachelaway grace=5m silent=2026-11-01""#)
+        );
+        assert!(page.contains(r#"<button type="button" data-copy="lurker-line" hidden>Copy"#));
+        assert!(!page.contains("across all their identities"));
+        assert_eq!(
+            lurker_of(Kind::Bot, Rating::Neutral, &view.sessions, &spoke),
+            None
+        );
+        let no_sessions = std::iter::empty::<&SessionRow>();
+        assert_eq!(
+            lurker_of(Kind::Person, Rating::Neutral, no_sessions, &spoke),
+            None
+        );
     }
 
     #[test]

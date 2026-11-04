@@ -14,11 +14,12 @@ use serde::Deserialize;
 use super::activity::activity_breakdown;
 use super::history::{person_history_href, said};
 use super::identities::{
-    Ticks, identity_table, nick_rows, recent_connections, summary_connections, summary_nicks,
-    summary_real_names,
+    Ticks, identity_table, lurker_of, nick_rows, recent_connections, summary_connections,
+    summary_nicks, summary_real_names,
 };
 use super::layout::{
-    self, back_field, day, duration, lapse_flag, number, person_href, silent_flag, url_encode,
+    self, back_field, day, duration, lapse_flag, lurker_field, number, person_href, silent_flag,
+    url_encode,
 };
 use super::{App, Flash, PageError, PageResult, back_to, done, failed, filled, internal, with_db};
 use crate::decide;
@@ -339,6 +340,7 @@ fn summary(person: &Person, views: &[lookup::IdentityView], context: &PersonCont
     let channels = top_channels(days);
     let silent =
         person.kind == Kind::Person && !person.rating.trusted() && trust::silent(present, spoken);
+    let lurker = lurker_of(person.kind, person.rating, sessions(), days);
     let history = person_history_href(&person.name);
     html! {
         dl.summary {
@@ -430,6 +432,10 @@ fn summary(person: &Person, views: &[lookup::IdentityView], context: &PersonCont
                         " and " (channels.len() - MAX_SUMMARY_CHANNELS) " more"
                     }
                 }
+            }
+            @if let Some(lurker) = &lurker {
+                dt { "Lurker" }
+                dd { (lurker_field(lurker)) }
             }
         }
     }
@@ -1102,6 +1108,13 @@ mod tests {
         assert!(at(r#"id="trust""#) < at(r#"id="manage""#));
         assert!(at(r#"id="manage""#) < at(r#"name="kind" value="bot""#));
         assert!(!page.contains("Silent"));
+
+        // The command for lurker, by their latest nick, in the summary.
+        assert!(page.contains(r#"value="/msg lurker trusted quokka grace=5m silent=2026-10-01""#));
+        assert!(at(r#"id="lurker-line""#) < at(r#"<section id="said">"#));
+        // Bots are not lurkers.
+        let bot = self::page(&record("relay", Kind::Bot), &views, &context).into_string();
+        assert!(!bot.contains("lurker-line"));
     }
 
     #[test]
@@ -1116,6 +1129,8 @@ mod tests {
         let page = page(&record("marlowe", Kind::Person), &[], &silent).into_string();
         assert!(page.contains("Silent 40 days"));
         assert!(page.contains("Nothing said in channels."));
+        // With no nick seen, there is no line for lurker.
+        assert!(!page.contains("lurker-line"));
 
         // Someone who used to talk is inactive, not a silent watcher, and
         // the cut is explained.

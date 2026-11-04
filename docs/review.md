@@ -7,8 +7,10 @@ wot review --port 8080 --db /path/to/other.sqlite
 
 `wot review` serves the review pages at <http://127.0.0.1:7171/> until you
 press Ctrl+C. It only listens on 127.0.0.1, so only this computer can open
-it, and it has no login. Pages are plain HTML with no JavaScript, in your
-system's light or dark mode.
+it, and it has no login. Pages are plain HTML, in your system's light or
+dark mode. The only script is a small one for copy buttons, such as the one
+beside a [lurker line](trust.md#lines-for-lurker); without it, the text can
+still be selected and copied by hand.
 
 Decisions are made with ordinary forms and do the same as the matching
 command. Reloading a page never repeats one. Decisions that change
@@ -36,13 +38,14 @@ identities rebuild them, which the terminal shows step by step.
 - **Identities:** search by nick, ident, host or person. Tick results to
   make them a person or bot, or add them to one. A search by host also lists
   the matching hosts, to group them.
-- **Identity:** one identity: who it is, its activity by month, its nicks,
-  hosts, channels and nick changes, where a [cut](identities.md#cuts) can be
-  made.
+- **Identity:** one identity: who it is, the line marking it for lurker,
+  its activity by month, its nicks, hosts, channels and nick changes, where a
+  [cut](identities.md#cuts) can be made. An identity that belongs to a person
+  gets the person's line.
 - **People and bots:** everyone you recorded, most trusted first.
 - **Person:** who they are across all their identities, when they were last
-  active, the last lines they said, their trust score, rating, notes and
-  identities.
+  active, the line marking them for lurker, the last lines they said, their
+  trust score, rating, notes and identities.
 - **History:** everything an identity or person said in channels, newest
   first, with filters for a channel, a day and text, and the days they were
   present.
@@ -55,7 +58,8 @@ identities rebuild them, which the terminal shows step by step.
 ## Code
 
 The pages are in `src/review/`: `mod.rs` sets up the server, `layout.rs` has
-the page frame, and each area has its own module. They read data through
-`src/stats.rs`, `src/lookup.rs`, `src/activity.rs`, `src/trust.rs` and
-`src/history.rs`, and make decisions through `src/decide.rs`, the same as the
-commands.
+the page frame, `copy.js` is the copy button script, and each area has its
+own module. They read data through `src/stats.rs`, `src/lookup.rs`,
+`src/activity.rs`, `src/trust.rs` and `src/history.rs`, and make decisions
+through `src/decide.rs`, the same as the commands. Lurker lines are built in
+`src/lurker.rs`.

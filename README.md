@@ -13,8 +13,10 @@ your computer can open.
 
 Early development, working as a proof of concept. It imports logs, groups
 them into identities, tracks each identity's activity, records what you know
-about people, and checks a channel's current users against all of it. Next is
-the social graph of who talks to whom.
+about people, checks a channel's current users against all of it, and writes
+the commands that mark lurkers for the
+[lurker](https://github.com/wetfish/lurkers) bot. Next is the social graph of
+who talks to whom.
 
 ## Install
 
@@ -56,6 +58,8 @@ From there:
    untrusted and undecided.
 3. **Look into the red flags**: silent watchers, present for weeks without
    saying a line.
+4. **Mark lurkers**: copy the line for lurker from a person's page, check
+   it, and paste it into irssi to send it to lurker privately.
 
 ## How it works
 

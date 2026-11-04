@@ -4,6 +4,7 @@
 use maud::{DOCTYPE, Markup, html};
 
 use super::Flash;
+use crate::lurker::Lurker;
 use crate::trust::{ActivityScore, Lapse};
 
 /// A complete page with the site navigation and any notice or error.
@@ -29,6 +30,7 @@ fn frame(title: &str, flash: &Flash, body: Markup, reload: Option<u32>) -> Marku
                 }
                 title { (title) " · wot review" }
                 link rel="stylesheet" href="/style.css";
+                script src="/copy.js" defer {}
             }
             body {
                 header {
@@ -62,6 +64,19 @@ fn frame(title: &str, flash: &Flash, body: Markup, reload: Option<u32>) -> Marku
                     (body)
                 }
             }
+        }
+    }
+}
+
+/// The command marking someone for lurker, in a text input to change and
+/// copy, with a button that copies it. The button stays hidden until the
+/// copy script runs; without it, the text is copied by hand.
+pub fn lurker_field(lurker: &Lurker) -> Markup {
+    html! {
+        span.copy-field {
+            input type="text" id="lurker-line" value=(lurker.line())
+                aria-label="Command for lurker" spellcheck="false" autocomplete="off";
+            button type="button" data-copy="lurker-line" hidden { "Copy" }
         }
     }
 }

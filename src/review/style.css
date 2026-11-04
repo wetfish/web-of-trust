@@ -581,6 +581,23 @@ dl.summary dd {
     overflow-wrap: anywhere;
 }
 
+/* A command to copy, such as a lurker line: the whole line in an input,
+   with the copy button beside it. */
+.copy-field {
+    display: flex;
+    gap: 0.5rem;
+    align-items: center;
+    max-width: 48rem;
+    margin-bottom: 0.2rem;
+}
+
+.copy-field input[type="text"] {
+    flex: 1;
+    min-width: 0;
+    font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+    font-size: 0.9em;
+}
+
 /* Links to the sections of a long page. */
 nav.on-page {
     display: flex;
