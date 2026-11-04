@@ -8,12 +8,25 @@ use crate::trust::{ActivityScore, Lapse};
 
 /// A complete page with the site navigation and any notice or error.
 pub fn page(title: &str, flash: &Flash, body: Markup) -> Markup {
+    frame(title, flash, body, None)
+}
+
+/// A page that reloads itself every `seconds`, to follow work under way
+/// with no script.
+pub fn reloading_page(title: &str, flash: &Flash, body: Markup, seconds: u32) -> Markup {
+    frame(title, flash, body, Some(seconds))
+}
+
+fn frame(title: &str, flash: &Flash, body: Markup, reload: Option<u32>) -> Markup {
     html! {
         (DOCTYPE)
         html lang="en" {
             head {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
+                @if let Some(seconds) = reload {
+                    meta http-equiv="refresh" content=(seconds);
+                }
                 title { (title) " · wot review" }
                 link rel="stylesheet" href="/style.css";
             }
@@ -29,9 +42,17 @@ pub fn page(title: &str, flash: &Flash, body: Markup) -> Markup {
                         a href="/hosts" { "Host groups" }
                         a href="/cuts" { "Cuts" }
                         a href="/networks" { "Networks" }
+                        a href="/analyze" { "Analyze" }
                     }
                 }
                 main {
+                    @if super::analyze::running() {
+                        p.analysis-banner role="status" {
+                            "An analysis is running. Pages show the data from before it until it "
+                            "finishes, and decisions can wait until then. "
+                            a href="/analyze" { "See how far it has come" }
+                        }
+                    }
                     @if let Some(notice) = &flash.notice {
                         p.flash.notice role="status" { (notice) }
                     }

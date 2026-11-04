@@ -226,6 +226,13 @@ By default this is `wot.sqlite` in the repository folder, which `.gitignore`
 excludes. `--db FILE` uses another file. The database is created when it does
 not exist. You can open it with any SQLite client, such as `sqlite3 wot.sqlite`.
 
+The database uses SQLite's write-ahead log, so `wot review` keeps showing pages
+while an analysis writes for minutes, with what was there before until the
+analysis is done. While it is open, `wot.sqlite-wal` and `wot.sqlite-shm` sit
+next to it; copy all three to back it up while `wot` runs, or only
+`wot.sqlite` once it has stopped. A write waits up to 5 seconds for another one
+to finish before it fails.
+
 ### Importing
 
 The first run imports everything. Later runs only read what changed:
@@ -530,10 +537,10 @@ wot review --port 8080 --db /path/to/other.sqlite
 ```
 
 It only listens on 127.0.0.1, so it can only be opened from the same
-computer, and it has no login. It reads the database and never the log files,
-so import new lines with `wot analyze` first; reloading a page then shows
-them. Importing stays on the command line. The pages are built on the server
-as plain HTML with no JavaScript, and follow the system's light or dark mode.
+computer, and it has no login. The pages read the database; new lines are
+read from the log files by **Analyze now**, on the Overview and the Analyze
+page, or by `wot analyze`. The pages are built on the server as plain HTML
+with no JavaScript, and follow the system's light or dark mode.
 
 Decisions are made with ordinary forms. Each action changes the database the
 same way as the matching `wot hosts`, `wot people` or `wot cuts` command, then
@@ -551,6 +558,19 @@ ticked.
   that said anything; Silent is the share that never did; Merged counts the
   lines logged twice that were counted once, see [Lines logged
   twice](#lines-logged-twice). Private messages are summarized in one line.
+  **Analyze now** reads new lines, see the Analyze page below.
+- **Analyze** (`/analyze`): the log folders the imported files came from,
+  each the folder holding `<network tag>/<channel or nick>.log`, and
+  **Analyze now**, which does what `wot analyze` does with them, with a box to
+  rebuild even when no log file changed, as `--rebuild` does. New network tags
+  inside the folders are found too, and a folder that is no longer there is
+  skipped; a folder never imported needs `wot analyze FOLDER` once. The
+  analysis runs in the background, one at a time, while the page reloads
+  itself every 2 seconds with each stage that ended, what it did and how long
+  it took, and the stage under way with a progress bar and the line the
+  terminal shows. Then it says what the analysis did, or why it failed. Every
+  page shows a banner while it runs; decisions made meanwhile wait up to 5
+  seconds for it and then fail, so make them once it is done.
 - **Channels** (`/channels`): every channel with activity, the busiest over
   the last six months first, with its recent spoken lines and identities,
   the last month anyone was present, its review status and when a user list

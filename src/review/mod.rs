@@ -1,6 +1,7 @@
 //! `wot review`: a web interface for reviewing the imported data and making
-//! decisions about it, served on this computer only. Importing stays with
-//! `wot analyze`.
+//! decisions about it, served on this computer only. New lines can be read
+//! from the log folders already imported, as `wot analyze` does; a folder
+//! never imported needs `wot analyze` once.
 //!
 //! Pages are built on the server with maud and use plain HTML forms, with no
 //! JavaScript. A form posts to an action, which changes the database and
@@ -9,6 +10,7 @@
 //! on a blocking thread, since SQLite calls block.
 
 mod activity;
+mod analyze;
 mod channels;
 mod cuts;
 mod history;
@@ -68,6 +70,7 @@ pub fn run(db_path: &Path, port: u16) -> db::Result<()> {
         .merge(channels::routes())
         .merge(history::routes())
         .merge(networks::routes())
+        .merge(analyze::routes())
         .route("/style.css", get(style))
         .fallback(not_found)
         .with_state(app);

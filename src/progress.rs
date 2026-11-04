@@ -2,9 +2,11 @@
 //! looks stuck. In a terminal, one line is redrawn in place a few times a
 //! second; otherwise, such as when output goes to a file, a line is printed
 //! every few seconds. Each stage ends with a line saying what it did and how
-//! long it took.
+//! long it took. The same can be kept in a shared report, for the review
+//! page of an analysis started in the browser.
 
 use std::io::{self, IsTerminal, Write};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use crate::report::thousands;
@@ -13,6 +15,39 @@ use crate::report::thousands;
 const TERMINAL_INTERVAL: Duration = Duration::from_millis(200);
 /// How often a line is printed when standard error is not a terminal.
 const LOG_INTERVAL: Duration = Duration::from_secs(10);
+/// How often a shared report is brought up to date.
+const SHARED_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Progress as another thread reads it: the stages that ended, the one
+/// under way, and the notes in between.
+#[derive(Clone, Debug, Default)]
+pub struct Report {
+    pub done: Vec<Done>,
+    pub current: Option<Current>,
+    /// Lines outside any stage, such as how many log files were found.
+    pub notes: Vec<String>,
+}
+
+pub type SharedReport = Arc<Mutex<Report>>;
+
+/// A stage that ended: what it was, what it did and how long it took.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Done {
+    pub label: String,
+    pub summary: String,
+    pub took: String,
+}
+
+/// The stage under way.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Current {
+    pub label: String,
+    /// How far it has come out of `total`, or with no total when 0.
+    pub done: u64,
+    pub total: u64,
+    /// The line a terminal shows, such as `Reading events: 25% (...)`.
+    pub line: String,
+}
 
 /// What a stage counts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -33,11 +68,15 @@ struct Stage {
 
 /// Reports stages of work and their progress.
 pub struct Progress {
+    /// Whether to write to standard error.
     enabled: bool,
     terminal: bool,
     stage: Option<Stage>,
     /// Whether a redrawn line is on screen and has to be cleared.
     drawn: bool,
+    /// A report kept up to date for another thread, and when it last was.
+    shared: Option<SharedReport>,
+    shared_at: Option<Instant>,
 }
 
 impl Progress {
@@ -48,7 +87,16 @@ impl Progress {
             terminal: io::stderr().is_terminal(),
             stage: None,
             drawn: false,
+            shared: None,
+            shared_at: None,
         }
+    }
+
+    /// Reports on standard error, and in `report` for another thread to show.
+    pub fn to_stderr_and(report: SharedReport) -> Self {
+        let mut progress = Progress::to_stderr();
+        progress.shared = Some(report);
+        progress
     }
 
     /// Reports nothing, for tests.
@@ -59,6 +107,23 @@ impl Progress {
             terminal: false,
             stage: None,
             drawn: false,
+            shared: None,
+            shared_at: None,
+        }
+    }
+
+    /// Reports only in `report`, for tests.
+    #[cfg(test)]
+    pub fn quiet_and(report: SharedReport) -> Self {
+        let mut progress = Progress::quiet();
+        progress.shared = Some(report);
+        progress
+    }
+
+    /// Changes the shared report, if there is one.
+    fn share(&self, change: impl FnOnce(&mut Report)) {
+        if let Some(shared) = &self.shared {
+            change(&mut shared.lock().unwrap_or_else(PoisonError::into_inner));
         }
     }
 
@@ -71,6 +136,15 @@ impl Progress {
             unit,
             started: Instant::now(),
             shown: None,
+        });
+        self.shared_at = None;
+        self.share(|report| {
+            report.current = Some(Current {
+                label: label.to_string(),
+                done: 0,
+                total,
+                line: format!("{label}..."),
+            });
         });
         if !self.enabled {
             return;
@@ -90,9 +164,6 @@ impl Progress {
     /// Reports how far the stage has come. `detail` is only built when the
     /// line is shown, so calling this often costs little.
     pub fn update(&mut self, done: u64, detail: impl FnOnce() -> String) {
-        if !self.enabled {
-            return;
-        }
         let Some(stage) = self.stage.as_mut() else {
             return;
         };
@@ -102,16 +173,38 @@ impl Progress {
         } else {
             LOG_INTERVAL
         };
-        let due = match stage.shown {
-            Some(shown) => now.duration_since(shown) >= interval,
-            // The first line waits a moment, so quick stages stay quiet.
-            None => now.duration_since(stage.started) >= interval,
-        };
-        if !due {
+        let print = self.enabled
+            && match stage.shown {
+                Some(shown) => now.duration_since(shown) >= interval,
+                // The first line waits a moment, so quick stages stay quiet.
+                None => now.duration_since(stage.started) >= interval,
+            };
+        let share = self.shared.is_some()
+            && self
+                .shared_at
+                .is_none_or(|at| now.duration_since(at) >= SHARED_INTERVAL);
+        if !print && !share {
             return;
         }
-        stage.shown = Some(now);
+        if print {
+            stage.shown = Some(now);
+        }
         let line = progress_line(stage, done, &detail(), now);
+        let (label, total) = (stage.label.clone(), stage.total);
+        if share {
+            self.shared_at = Some(now);
+            self.share(|report| {
+                report.current = Some(Current {
+                    label,
+                    done,
+                    total,
+                    line: line.clone(),
+                });
+            });
+        }
+        if !print {
+            return;
+        }
         let mut err = io::stderr().lock();
         if self.terminal {
             // Back to the start of the line, and clear it.
@@ -126,15 +219,21 @@ impl Progress {
     /// Ends the stage with what it did, and how long it took.
     pub fn done(&mut self, summary: &str) {
         self.clear();
-        if let Some(stage) = self.stage.take()
-            && self.enabled
-        {
-            eprintln!(
-                "{}: {summary} ({})",
-                stage.label,
-                elapsed(stage.started.elapsed())
-            );
+        let Some(stage) = self.stage.take() else {
+            return;
+        };
+        let took = elapsed(stage.started.elapsed());
+        if self.enabled {
+            eprintln!("{}: {summary} ({took})", stage.label);
         }
+        self.share(|report| {
+            report.current = None;
+            report.done.push(Done {
+                label: stage.label,
+                summary: summary.to_string(),
+                took,
+            });
+        });
     }
 
     /// Prints a line of its own, outside any stage's progress.
@@ -143,6 +242,7 @@ impl Progress {
         if self.enabled {
             eprintln!("{message}");
         }
+        self.share(|report| report.notes.push(message.to_string()));
     }
 
     /// Removes a redrawn line from the terminal.
@@ -259,6 +359,39 @@ mod tests {
         );
         let line = progress_line(&stage(0, Unit::Bytes), 2048, "", started);
         assert_eq!(line, "Reading events: 2.0 KB, 0.0s");
+    }
+
+    #[test]
+    fn keeps_a_shared_report_for_another_thread() {
+        let report: SharedReport = Arc::default();
+        let mut progress = Progress::quiet_and(Arc::clone(&report));
+        progress.note("Found 2 log files");
+        progress.stage("Importing", 100, Unit::Bytes);
+        assert_eq!(report.lock().unwrap().current.as_ref().unwrap().total, 100);
+        progress.update(40, || "a.log".into());
+        let current = report.lock().unwrap().current.clone().unwrap();
+        assert_eq!((current.label.as_str(), current.done), ("Importing", 40));
+        assert!(
+            current
+                .line
+                .starts_with("Importing: 40% (40 B of 100 B), a.log")
+        );
+        // Updates in quick succession are not all shared.
+        progress.update(50, || "b.log".into());
+        assert_eq!(report.lock().unwrap().current.as_ref().unwrap().done, 40);
+        progress.done("2 files");
+
+        let report = report.lock().unwrap();
+        assert_eq!(report.current, None);
+        assert_eq!(report.notes, ["Found 2 log files"]);
+        assert_eq!(report.done.len(), 1);
+        assert_eq!(
+            (
+                report.done[0].label.as_str(),
+                report.done[0].summary.as_str()
+            ),
+            ("Importing", "2 files")
+        );
     }
 
     #[test]

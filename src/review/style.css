@@ -240,6 +240,25 @@ td.wrap {
     color: var(--danger);
 }
 
+/* On every page while an analysis started in the browser runs. */
+.analysis-banner {
+    padding: 0.6rem 0.8rem;
+    border: 1px solid var(--accent);
+    border-radius: 4px;
+    background: var(--notice-background);
+}
+
+/* The stage of an analysis under way, with a bar of how far it has come. */
+.current-stage progress {
+    width: 100%;
+    height: 1.2rem;
+    accent-color: var(--accent);
+}
+
+.current-stage p {
+    margin: 0.3rem 0;
+}
+
 section.decision,
 section.group {
     margin-bottom: 1.5rem;

@@ -23,6 +23,7 @@ use std::error::Error;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use chrono::NaiveDate;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -33,6 +34,9 @@ use crate::progress::{Progress, Unit};
 use crate::report::thousands;
 
 pub type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
+
+/// How long a write waits for another one to finish before failing.
+const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How many bytes from the start of each file are kept to recognize it.
 const HEAD_LEN: u64 = 1024;
@@ -503,6 +507,12 @@ pub fn open(path: &Path) -> Result<Connection> {
             "BEGIN; {sql} PRAGMA user_version = {version}; COMMIT;"
         ))?;
     }
+    // Write-ahead logging, so pages keep reading what was there before while
+    // an analysis writes for minutes, and see its changes once it commits.
+    // It stays set in the file. Writers wait for each other a while rather
+    // than failing at once.
+    let _mode: String = conn.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))?;
+    conn.busy_timeout(BUSY_TIMEOUT)?;
     Ok(conn)
 }
 

@@ -86,7 +86,15 @@ pub fn overview(overview: &Overview) -> Markup {
             @if let Some(at) = &overview.last_import {
                 " Last import " (at) " UTC."
             }
-            " Run " code { "wot analyze" } " to import new lines."
+        }
+        @if overview.files > 0 {
+            form.inline method="post" action="/analyze" {
+                button type="submit" { "Analyze now" }
+                span.muted {
+                    " Reads new lines from the log folders and rebuilds. "
+                    a href="/analyze" { "Folders and progress" }
+                }
+            }
         }
         @if overview.tags.is_empty() {
             p { "Nothing has been imported yet." }
@@ -292,6 +300,7 @@ mod tests {
         assert!(page.contains(r#"href="/channel?tag=wetfish&amp;name=%23dry%20fish""#));
         assert!(page.contains("50%"));
         assert!(page.contains("<code>wot tags ignore wetfish</code>"));
+        assert!(page.contains(r#"<form class="inline" method="post" action="/analyze">"#));
     }
 
     #[test]
